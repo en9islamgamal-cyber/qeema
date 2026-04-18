@@ -5,7 +5,6 @@ import requests
 import subprocess
 import datetime
 from PIL import Image, ImageDraw, ImageFont
-import google.generativeai as genai
 from elevenlabs import generate, save, set_api_key
 from supabase import create_client, Client
 from google.oauth2.credentials import Credentials
@@ -22,9 +21,8 @@ YOUTUBE_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID")
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET")
 YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN")
 
-# ضبط المفاتيح
+# ضبط مفتاح الصوت
 set_api_key(ELEVENLABS_API_KEY)
-genai.configure(api_key=GEMINI_API_KEY)
 
 OUTPUT_DIR = "./qeema_output"
 LOGO_PATH = "./qeema_logo.png"
@@ -55,35 +53,40 @@ def generate_script(surah_name, start, end):
     prompt = f"المطلوب: تفسير سورة {surah_name} | الآيات: {start} إلى {end}."
     full_prompt = f"{SYSTEM_PROMPT}\n\n{prompt}"
     
-    # قائمة بموديلات جيميناي لتجربتها بالترتيب (تم التعديل لتفادي خطأ 404)
-    models_to_try = ["gemini-1.5-pro-latest", "gemini-1.5-flash-latest", "gemini-pro"]
-    
-    for model_name in models_to_try:
-        print(f"🤖 جاري محاولة التفسير عبر Gemini ({model_name})...")
-        try:
-            model = genai.GenerativeModel(model_name)
-            res = model.generate_content(
-                full_prompt, 
-                generation_config={
-                    "response_mime_type": "application/json", 
-                    "temperature": 0.3
-                }
-            )
-            
-            # تنظيف النص (Cleaning) لضمان عدم وجود أكواد Markdown تكسر الـ JSON
-            response_text = res.text.strip()
-            if response_text.startswith("```json"):
-                response_text = response_text[7:-3].strip()
-            elif response_text.startswith("```"):
-                response_text = response_text[3:-3].strip()
-                
-            return json.loads(response_text)
-            
-        except Exception as e:
-            print(f"⚠️ فشل الموديل {model_name} في توليد التفسير: {e}")
+    # استخدام الاتصال المباشر بخوادم جوجل (REST API) لتجاوز مشاكل المكتبة القديمة
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    headers = {'Content-Type': 'application/json'}
+    payload = {
+        "contents": [{"parts": [{"text": full_prompt}]}],
+        "generationConfig": {
+            "temperature": 0.3,
+            "responseMimeType": "application/json"
+        }
+    }
 
-    # إذا فشلت كل الموديلات
-    raise Exception("❌ فشل Gemini تماماً في توليد التفسير بصيغة JSON صحيحة.")
+    print("🤖 جاري محاولة التفسير عبر Gemini (Direct REST API)...")
+    try:
+        response = requests.post(api_url, headers=headers, json=payload)
+        
+        # التحقق من وجود أخطاء في الاتصال
+        if response.status_code != 200:
+            print(f"تفاصيل خطأ الخادم: {response.text}")
+            response.raise_for_status()
+
+        data = response.json()
+        response_text = data['candidates'][0]['content']['parts'][0]['text'].strip()
+        
+        # تنظيف النص (Cleaning) لضمان عدم وجود أكواد Markdown تكسر الـ JSON
+        if response_text.startswith("```json"):
+            response_text = response_text[7:-3].strip()
+        elif response_text.startswith("```"):
+            response_text = response_text[3:-3].strip()
+            
+        return json.loads(response_text)
+        
+    except Exception as e:
+        print(f"⚠️ فشل الاتصال المباشر بـ Gemini: {e}")
+        raise Exception("❌ فشل Gemini تماماً في توليد التفسير بصيغة JSON صحيحة.")
 
 # --- باقي الدوال بدون تغيير ---
 def load_state():
