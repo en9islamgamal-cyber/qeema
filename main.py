@@ -55,8 +55,8 @@ def generate_script(surah_name, start, end):
     prompt = f"المطلوب: تفسير سورة {surah_name} | الآيات: {start} إلى {end}."
     full_prompt = f"{SYSTEM_PROMPT}\n\n{prompt}"
     
-    # قائمة بموديلات جيميناي لتجربتها بالترتيب
-    models_to_try = ["gemini-1.5-pro", "gemini-1.5-flash"]
+    # قائمة بموديلات جيميناي لتجربتها بالترتيب (تم التعديل لتفادي خطأ 404)
+    models_to_try = ["gemini-1.5-pro-latest", "gemini-1.5-flash-latest", "gemini-pro"]
     
     for model_name in models_to_try:
         print(f"🤖 جاري محاولة التفسير عبر Gemini ({model_name})...")
