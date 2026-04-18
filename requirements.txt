@@ -1,9 +1,6 @@
-Pillow
-google-generativeai>=0.7.2
-anthropic
-elevenlabs==0.2.27
-supabase
-google-api-python-client
-google-auth-oauthlib
-google-auth-httplib2
-requests
+requests>=2.31.0
+supabase>=2.5.0
+elevenlabs>=1.5.0
+google-auth>=2.30.0
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.130.0
