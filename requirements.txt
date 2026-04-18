@@ -1,10 +1,8 @@
+Pillow
 google-generativeai
 elevenlabs
-requests
-ffmpeg-python
-Pillow
 supabase
+google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
-google-api-python-client
-python-dotenv
+requests
