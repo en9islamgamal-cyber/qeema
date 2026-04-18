@@ -26,7 +26,7 @@ YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN")
 
 # ضبط المفاتيح
 set_api_key(ELEVENLABS_API_KEY)
-genai.configure(api_key=GEMINI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY) # يمكنك تركها إذا كنت ستستخدم جيميناي في دوال أخرى مستقبلاً
 
 OUTPUT_DIR = "./qeema_output"
 LOGO_PATH = "./qeema_logo.png"
@@ -54,38 +54,27 @@ def generate_script(surah_name, start, end):
     prompt = f"سورة: {surah_name} | الآيات: {start} إلى {end}. طبق القواعد بدقة."
     full_prompt = f"{SYSTEM_PROMPT}\n\n{prompt}"
     
-    # 1️⃣ الخطة أ: Gemini (بأسماء موديلات مختلفة لتجنب الـ 404)
-    for model_name in ["gemini-1.5-flash", "gemini-1.5-pro"]:
-        print(f"🤖 محاولة عبر Gemini ({model_name})...")
-        try:
-            model = genai.GenerativeModel(model_name)
-            res = model.generate_content(
-                full_prompt, 
-                generation_config={"response_mime_type": "application/json", "temperature": 0.2}
-            )
-            return json.loads(res.text)
-        except Exception as e:
-            print(f"⚠️ {model_name} فشل: {e}")
+    # الاعتماد الأساسي والإجباري على Claude
+    if not ANTHROPIC_API_KEY:
+        raise ValueError("🚨 خطأ قاتل: مفتاح ANTHROPIC_API_KEY مفقود من متغيرات البيئة!")
 
-    # 2️⃣ الخطة ب: Claude (المنقذ في الأزمات)
-    if ANTHROPIC_API_KEY:
-        print("🧠 تحويل المهمة إلى Claude (البديل الإستراتيجي)...")
-        try:
-            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            message = client.messages.create(
-                model="claude-3-5-sonnet-20240620", 
-                max_tokens=2000,
-                temperature=0.2,
-                system="أنت شيخ أزهري، أجب بصيغة JSON فقط.",
-                messages=[{"role": "user", "content": full_prompt}]
-            )
-            return json.loads(message.content[0].text)
-        except Exception as ce:
-            print(f"❌ حتى Claude فشل: {ce}")
-            
-    raise Exception("فشلت كل المحاولات لتوليد التفسير.")
+    print("🧠 جاري إرسال المهمة إلى Claude لتوليد التفسير...")
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        message = client.messages.create(
+            model="claude-3-5-sonnet-20240620", 
+            max_tokens=2000,
+            temperature=0.2,
+            system="أنت شيخ أزهري، أجب بصيغة JSON فقط.",
+            messages=[{"role": "user", "content": full_prompt}]
+        )
+        return json.loads(message.content[0].text)
+    except Exception as ce:
+        # إيقاف التنفيذ فوراً في حال فشل Claude بدلاً من التمرير الصامت
+        print(f"❌ فشل Claude في إنجاز المهمة: {ce}")
+        raise ce
 
-# --- باقي الدوال (توليد الصور والمونتاج والرفع) كما هي ---
+# --- باقي الدوال كما هي بدون تغيير ---
 def load_state():
     res = supabase.table("pipeline_state").select("*").execute()
     return res.data[0] if res.data else {"ayah_start": 1}
