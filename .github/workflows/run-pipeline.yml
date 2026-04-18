@@ -6,37 +6,37 @@ on:
     # (ما يعادل 9:00 ص و 5:00 م بتوقيت مكة المكرمة)
     - cron: '0 6,14 * * 1,4'
   
-  # يسمح لك بتشغيل الجدول يدوياً من تبويب Actions في GitHub عند الحاجة
-  workflow_dispatch:
+  workflow_dispatch: # يسمح لك بتشغيل الجدول يدوياً من تبويب Actions في GitHub عند الحاجة
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    env:
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
-      LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
-      YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-      YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-      YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-
     steps:
-      - name: 📥 جلب الكود من المستودع
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: 🐍 إعداد بيئة Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
-      - name: 📦 تثبيت FFmpeg والمكتبات
+      - name: Install dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 🚀 تشغيل البايثون
+      - name: Run Pipeline Script
+        env:
+          # بيانات Supabase
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          
+          # مفاتيح الذكاء الاصطناعي (هذه الإضافة تضمن عمل Claude)
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          
+          # مفتاح ElevenLabs للتعليق الصوتي
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
         run: python main.py
