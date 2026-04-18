@@ -6,7 +6,6 @@ import subprocess
 import datetime
 from PIL import Image, ImageDraw, ImageFont
 import google.generativeai as genai
-import anthropic 
 from elevenlabs import generate, save, set_api_key
 from supabase import create_client, Client
 from google.oauth2.credentials import Credentials
@@ -17,7 +16,6 @@ from googleapiclient.http import MediaFileUpload
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY") 
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 LEONARDO_API_KEY = os.environ.get("LEONARDO_API_KEY")
 YOUTUBE_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID")
@@ -26,7 +24,7 @@ YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN")
 
 # ضبط المفاتيح
 set_api_key(ELEVENLABS_API_KEY)
-genai.configure(api_key=GEMINI_API_KEY) # يمكنك تركها إذا كنت ستستخدم جيميناي في دوال أخرى مستقبلاً
+genai.configure(api_key=GEMINI_API_KEY)
 
 OUTPUT_DIR = "./qeema_output"
 LOGO_PATH = "./qeema_logo.png"
@@ -36,45 +34,58 @@ VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# 📜 الـ Prompt الأساسي (الدستور الأزهري)
-SYSTEM_PROMPT = """أنت شيخ أزهري متخصص في تبسيط القرآن لأطفال 5-6 سنوات.
-استخدم لغة مصرية بسيطة جداً وقصصية. اذكر نص الآية أولاً ثم الشرح.
-المخرجات يجب أن تكون بصيغة JSON فقط:
+# 📜 الـ Prompt الأساسي (الدستور الأزهري القوي)
+SYSTEM_PROMPT = """أنت شيخ أزهري جليل في قسم التفسير. تجتمع بأحفادك (أطفال 5-6 سنوات) لتفسر لهم آيات القرآن الكريم.
+يجب أن يكون أسلوبك حنوناً، قصصياً، وبسيطاً جداً، كأنك جد يحكي قصة لأحفاده.
+اذكر نص الآية أولاً، ثم قدم الشرح على لسان الشيخ الجد.
+
+تحذير هام: المخرجات يجب أن تكون بتنسيق JSON صالح فقط (Valid JSON) بدون أي مقدمات أو نصوص قبله أو بعده.
+الهيكل المطلوب حصراً:
 {
   "scenes": [
     {
-      "verse_text": "نص الآية",
-      "narration": "الشرح المبسط",
-      "image_prompt": "وصف دقيق للصورة بأسلوب كتب أطفال، بدون وجوه"
+      "verse_text": "النص القرآني للآية",
+      "narration": "شرح الشيخ الجد بأسلوب طفولي",
+      "image_prompt": "وصف بالإنجليزية لصورة تناسب الشرح، بأسلوب كتب أطفال إسلامية، ألوان هادئة، بدون إظهار أي وجوه (no faces)"
     }
   ]
 }"""
 
 def generate_script(surah_name, start, end):
-    prompt = f"سورة: {surah_name} | الآيات: {start} إلى {end}. طبق القواعد بدقة."
+    prompt = f"المطلوب: تفسير سورة {surah_name} | الآيات: {start} إلى {end}."
     full_prompt = f"{SYSTEM_PROMPT}\n\n{prompt}"
     
-    # الاعتماد الأساسي والإجباري على Claude
-    if not ANTHROPIC_API_KEY:
-        raise ValueError("🚨 خطأ قاتل: مفتاح ANTHROPIC_API_KEY مفقود من متغيرات البيئة!")
+    # قائمة بموديلات جيميناي لتجربتها بالترتيب
+    models_to_try = ["gemini-1.5-pro", "gemini-1.5-flash"]
+    
+    for model_name in models_to_try:
+        print(f"🤖 جاري محاولة التفسير عبر Gemini ({model_name})...")
+        try:
+            model = genai.GenerativeModel(model_name)
+            res = model.generate_content(
+                full_prompt, 
+                generation_config={
+                    "response_mime_type": "application/json", 
+                    "temperature": 0.3
+                }
+            )
+            
+            # تنظيف النص (Cleaning) لضمان عدم وجود أكواد Markdown تكسر الـ JSON
+            response_text = res.text.strip()
+            if response_text.startswith("```json"):
+                response_text = response_text[7:-3].strip()
+            elif response_text.startswith("```"):
+                response_text = response_text[3:-3].strip()
+                
+            return json.loads(response_text)
+            
+        except Exception as e:
+            print(f"⚠️ فشل الموديل {model_name} في توليد التفسير: {e}")
 
-    print("🧠 جاري إرسال المهمة إلى Claude لتوليد التفسير...")
-    try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        message = client.messages.create(
-            model="claude-3-5-sonnet-20240620", 
-            max_tokens=2000,
-            temperature=0.2,
-            system="أنت شيخ أزهري، أجب بصيغة JSON فقط.",
-            messages=[{"role": "user", "content": full_prompt}]
-        )
-        return json.loads(message.content[0].text)
-    except Exception as ce:
-        # إيقاف التنفيذ فوراً في حال فشل Claude بدلاً من التمرير الصامت
-        print(f"❌ فشل Claude في إنجاز المهمة: {ce}")
-        raise ce
+    # إذا فشلت كل الموديلات
+    raise Exception("❌ فشل Gemini تماماً في توليد التفسير بصيغة JSON صحيحة.")
 
-# --- باقي الدوال كما هي بدون تغيير ---
+# --- باقي الدوال بدون تغيير ---
 def load_state():
     res = supabase.table("pipeline_state").select("*").execute()
     return res.data[0] if res.data else {"ayah_start": 1}
@@ -129,7 +140,6 @@ def run_pipeline():
             assemble_video(audio_p, img_p, vid_p)
             scene_files.append(vid_p)
         
-        # دمج بسيط للنتائج (تجاوزاً للوقت)
         final_vid = os.path.join(OUTPUT_DIR, f"qeema_{start}.mp4")
         with open("list.txt", "w") as f:
             for s in scene_files: f.write(f"file '{os.path.abspath(s)}'\n")
