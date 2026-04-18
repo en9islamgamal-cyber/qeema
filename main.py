@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 import google.generativeai as genai
-from elevenlabs import generate, save
+from elevenlabs import generate, save, set_api_key
 from supabase import create_client, Client
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
