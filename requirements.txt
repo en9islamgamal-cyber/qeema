@@ -1,5 +1,6 @@
 Pillow
-google-generativeai>=0.5.4
+google-generativeai>=0.7.2
+anthropic
 elevenlabs==0.2.27
 supabase
 google-api-python-client
