@@ -27,13 +27,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Write Google Cloud credentials file
+        run: |
+          echo '${{ secrets.GCP_SA_KEY }}' > /tmp/gcp-sa-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-sa-key.json" >> $GITHUB_ENV
+
       - name: Run Pipeline Script
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
@@ -48,3 +51,7 @@ jobs:
           path: qeema_output/**/*.mp4
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f /tmp/gcp-sa-key.json
