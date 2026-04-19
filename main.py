@@ -1,15 +1,12 @@
 """
-QEEMA / VALUE — Automated Qur'anic Tafseer Video Pipeline
-=========================================================
-Production-ready pipeline:
-  1) Gemini 2.5  → generates scene script (verse + child-friendly narration + image prompt)
-  2) ElevenLabs  → Arabic voiceover
-  3) Leonardo.ai → illustration per scene
-  4) FFmpeg      → assembles scenes into final video
-  5) YouTube API → uploads as unlisted
-  6) Supabase    → tracks progress (ayah_start)
-
-Author: Faramawy's / QEEMA
+QEEMA / VALUE — Automated Qur'anic Tafseer Video Pipeline (Google Cloud TTS Edition)
+====================================================================================
+  1) Gemini 2.5          → scene script
+  2) Google Cloud TTS    → Arabic voiceover (WaveNet)
+  3) Leonardo.ai         → illustration per scene
+  4) FFmpeg              → assembles scenes into final video
+  5) YouTube API         → uploads as unlisted
+  6) Supabase            → tracks progress
 """
 
 import os
@@ -24,17 +21,14 @@ from typing import Optional
 import requests
 from supabase import create_client, Client
 from google.oauth2.credentials import Credentials
+from google.cloud import texttospeech
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-
-# ElevenLabs — NEW SDK (v1.x+). The old `from elevenlabs import generate` API is deprecated.
-from elevenlabs.client import ElevenLabs
 
 # =============================================================================
 # 1. CONFIGURATION
 # =============================================================================
 
-# --- Logging ---------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
@@ -42,56 +36,57 @@ logging.basicConfig(
 )
 log = logging.getLogger("qeema")
 
-# --- Secrets ---------------------------------------------------------------
-SUPABASE_URL        = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY        = os.environ.get("SUPABASE_KEY")
-GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY")
-ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY")
-LEONARDO_API_KEY    = os.environ.get("LEONARDO_API_KEY")
-YOUTUBE_CLIENT_ID   = os.environ.get("YOUTUBE_CLIENT_ID")
+# --- Secrets ---
+SUPABASE_URL          = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY          = os.environ.get("SUPABASE_KEY")
+GEMINI_API_KEY        = os.environ.get("GEMINI_API_KEY")
+LEONARDO_API_KEY      = os.environ.get("LEONARDO_API_KEY")
+YOUTUBE_CLIENT_ID     = os.environ.get("YOUTUBE_CLIENT_ID")
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET")
 YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN")
+# GOOGLE_APPLICATION_CREDENTIALS يُقرأ تلقائياً من Google SDK
 
-# --- Models / IDs (override via env if needed) -----------------------------
-GEMINI_MODEL     = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-#   ↑ Use "gemini-2.5-pro" for highest quality on religious content (more expensive).
-#   1.5 models are FULLY RETIRED by Google as of 2025 — do NOT use them.
+# --- Models / IDs ---
+GEMINI_MODEL      = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-ELEVEN_MODEL     = os.environ.get("ELEVEN_MODEL", "eleven_multilingual_v2")
-VOICE_ID         = os.environ.get("ELEVEN_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
-#   ↑ Default is Rachel (English origin, works OK with multilingual_v2).
-#   For authentic Arabic recitation tone, pick an Arabic voice from ElevenLabs voice library.
+# Google TTS — أصوات عربية بجودة عالية
+# الذكور: ar-XA-Wavenet-B (مناسب لشيخ جد) / ar-XA-Wavenet-C
+# الإناث: ar-XA-Wavenet-A / ar-XA-Wavenet-D
+TTS_VOICE_NAME    = os.environ.get("TTS_VOICE_NAME", "ar-XA-Wavenet-B")
+TTS_SPEAKING_RATE = float(os.environ.get("TTS_SPEAKING_RATE", "0.9"))
+TTS_PITCH         = float(os.environ.get("TTS_PITCH", "-2.0"))
 
 LEONARDO_MODEL_ID = os.environ.get(
     "LEONARDO_MODEL_ID",
-    "6b645e3a-d64f-4341-a6d8-7a3690fbf042"  # Phoenix 1.0 UUID
+    "6b645e3a-d64f-4341-a6d8-7a3690fbf042"
 )
 
-# --- Pipeline settings -----------------------------------------------------
-OUTPUT_DIR   = Path("./qeema_output")
-MAX_VERSES   = 5
+# --- Pipeline settings ---
+OUTPUT_DIR       = Path("./qeema_output")
+MAX_VERSES       = 5
 IMAGE_W, IMAGE_H = 1280, 720
-LEONARDO_POLL_TRIES = 18   # 18 × 10s = 3 minutes max per image
+LEONARDO_POLL_TRIES = 18
 LEONARDO_POLL_DELAY = 10
-GEMINI_RETRIES = 3
-ELEVEN_RETRIES = 3
+GEMINI_RETRIES   = 3
+TTS_RETRIES      = 3
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Validate critical secrets early --------------------------------------
+# --- Validate secrets ---
 _REQUIRED = {
     "SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY,
-    "GEMINI_API_KEY": GEMINI_API_KEY, "ELEVENLABS_API_KEY": ELEVENLABS_API_KEY,
+    "GEMINI_API_KEY": GEMINI_API_KEY,
     "LEONARDO_API_KEY": LEONARDO_API_KEY,
+    "GOOGLE_APPLICATION_CREDENTIALS": os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
 }
 _missing = [k for k, v in _REQUIRED.items() if not v]
 if _missing:
     log.error("❌ متغيرات بيئة ناقصة: %s", ", ".join(_missing))
     sys.exit(1)
 
-# --- Clients ---------------------------------------------------------------
+# --- Clients ---
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+tts_client = texttospeech.TextToSpeechClient()
 
 
 # =============================================================================
@@ -116,19 +111,15 @@ SYSTEM_PROMPT = """أنت شيخ أزهري جليل في قسم التفسير.
 
 
 def _clean_json_text(text: str) -> str:
-    """Remove markdown fences that Gemini sometimes wraps JSON in."""
     t = text.strip()
     if t.startswith("```"):
-        # drop first fence line
         t = t.split("\n", 1)[1] if "\n" in t else t[3:]
-        # drop trailing fence
         if t.endswith("```"):
             t = t[:-3]
     return t.strip()
 
 
 def _validate_script(script: dict) -> None:
-    """Raise if structure is not usable for the pipeline."""
     if not isinstance(script, dict) or "scenes" not in script:
         raise ValueError("JSON بدون مفتاح 'scenes'")
     scenes = script["scenes"]
@@ -141,7 +132,6 @@ def _validate_script(script: dict) -> None:
 
 
 def generate_script(surah_name: str, start: int, end: int) -> dict:
-    """Call Gemini REST API and return validated scenes dict."""
     user_prompt = f"المطلوب: تفسير سورة {surah_name} | الآيات: {start} إلى {end}."
     full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
 
@@ -151,10 +141,7 @@ def generate_script(surah_name: str, start: int, end: int) -> dict:
     )
     payload = {
         "contents": [{"parts": [{"text": full_prompt}]}],
-        "generationConfig": {
-            "temperature": 0.3,
-            "responseMimeType": "application/json",
-        },
+        "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"},
     }
 
     last_err: Optional[Exception] = None
@@ -165,27 +152,23 @@ def generate_script(surah_name: str, start: int, end: int) -> dict:
             if r.status_code != 200:
                 log.warning("Gemini HTTP %s: %s", r.status_code, r.text[:500])
                 r.raise_for_status()
-
             data = r.json()
             candidates = data.get("candidates") or []
             if not candidates:
-                raise ValueError(f"لا توجد candidates في رد Gemini: {data}")
+                raise ValueError(f"لا توجد candidates: {data}")
             parts = candidates[0].get("content", {}).get("parts") or []
             if not parts:
                 raise ValueError(f"رد Gemini بدون parts: {data}")
-
             raw = parts[0].get("text", "")
-            cleaned = _clean_json_text(raw)
-            script = json.loads(cleaned)
+            script = json.loads(_clean_json_text(raw))
             _validate_script(script)
             log.info("✅ تم توليد السيناريو — %d مشاهد", len(script["scenes"]))
             return script
-
         except Exception as e:
             last_err = e
             log.warning("⚠️ فشل محاولة %d: %s", attempt, e)
             if attempt < GEMINI_RETRIES:
-                time.sleep(3 * attempt)  # backoff
+                time.sleep(3 * attempt)
 
     raise RuntimeError(f"❌ فشل Gemini بعد {GEMINI_RETRIES} محاولات: {last_err}")
 
@@ -198,7 +181,6 @@ def load_state() -> dict:
     res = supabase.table("pipeline_state").select("*").eq("id", 1).execute()
     if res.data:
         return res.data[0]
-    # Initialize row if missing
     default = {"id": 1, "ayah_start": 1}
     supabase.table("pipeline_state").insert(default).execute()
     return default
@@ -209,32 +191,44 @@ def save_state(state: dict) -> None:
 
 
 # =============================================================================
-# 4. VOICEOVER (ElevenLabs — new SDK)
+# 4. VOICEOVER (Google Cloud TTS — WaveNet)
 # =============================================================================
 
 def generate_voice(text: str, filename: Path) -> None:
+    """Generate Arabic voiceover using Google Cloud Text-to-Speech."""
+    synthesis_input = texttospeech.SynthesisInput(text=text)
+    voice = texttospeech.VoiceSelectionParams(
+        language_code="ar-XA",
+        name=TTS_VOICE_NAME,
+    )
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MP3,
+        speaking_rate=TTS_SPEAKING_RATE,
+        pitch=TTS_PITCH,
+        sample_rate_hertz=44100,
+    )
+
     last_err: Optional[Exception] = None
-    for attempt in range(1, ELEVEN_RETRIES + 1):
+    for attempt in range(1, TTS_RETRIES + 1):
         try:
-            audio_iter = eleven_client.text_to_speech.convert(
-                voice_id=VOICE_ID,
-                model_id=ELEVEN_MODEL,
-                text=text,
-                output_format="mp3_44100_128",
+            response = tts_client.synthesize_speech(
+                input=synthesis_input,
+                voice=voice,
+                audio_config=audio_config,
             )
             with open(filename, "wb") as f:
-                for chunk in audio_iter:
-                    if chunk:
-                        f.write(chunk)
-            if filename.stat().st_size < 1000:
-                raise RuntimeError("ملف الصوت الناتج فاضي/صغير جداً")
+                f.write(response.audio_content)
+            size_kb = filename.stat().st_size / 1024
+            if size_kb < 1:
+                raise RuntimeError("ملف الصوت صغير جداً / فاضي")
+            log.info("   🔊 تم إنشاء الصوت (%.1f KB)", size_kb)
             return
         except Exception as e:
             last_err = e
-            log.warning("⚠️ فشل ElevenLabs محاولة %d: %s", attempt, e)
-            if attempt < ELEVEN_RETRIES:
+            log.warning("⚠️ فشل TTS محاولة %d: %s", attempt, e)
+            if attempt < TTS_RETRIES:
                 time.sleep(3 * attempt)
-    raise RuntimeError(f"❌ فشل ElevenLabs: {last_err}")
+    raise RuntimeError(f"❌ فشل Google TTS: {last_err}")
 
 
 # =============================================================================
@@ -258,7 +252,6 @@ def generate_image(prompt: str, filename: Path) -> None:
         "num_images": 1,
     }
 
-    # 1. Trigger generation
     r = requests.post(
         "https://cloud.leonardo.ai/api/rest/v1/generations",
         json=body, headers=headers, timeout=60,
@@ -269,9 +262,8 @@ def generate_image(prompt: str, filename: Path) -> None:
     gen_id = r.json().get("sdGenerationJob", {}).get("generationId") \
              or r.json().get("generations_by_pk", {}).get("id")
     if not gen_id:
-        raise RuntimeError(f"لم يتم الحصول على generationId من Leonardo: {r.text[:500]}")
+        raise RuntimeError(f"لم يتم الحصول على generationId: {r.text[:500]}")
 
-    # 2. Poll for completion
     poll_url = f"https://cloud.leonardo.ai/api/rest/v1/generations/{gen_id}"
     for i in range(LEONARDO_POLL_TRIES):
         time.sleep(LEONARDO_POLL_DELAY)
@@ -286,8 +278,7 @@ def generate_image(prompt: str, filename: Path) -> None:
             images = job.get("generated_images") or []
             if not images:
                 raise RuntimeError("Leonardo COMPLETE لكن بدون صور")
-            img_url = images[0]["url"]
-            img = requests.get(img_url, timeout=60)
+            img = requests.get(images[0]["url"], timeout=60)
             img.raise_for_status()
             with open(filename, "wb") as f:
                 f.write(img.content)
@@ -303,7 +294,6 @@ def generate_image(prompt: str, filename: Path) -> None:
 # =============================================================================
 
 def _run_ffmpeg(cmd: list) -> None:
-    """Run ffmpeg, surface stderr if it fails."""
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         log.error("FFmpeg فشل:\nCMD: %s\nSTDERR:\n%s", " ".join(cmd), proc.stderr[-2000:])
@@ -356,7 +346,7 @@ def upload_to_youtube(video_path: Path, title: str, description: str) -> str:
             "snippet": {
                 "title": title[:100],
                 "description": description,
-                "categoryId": "27",  # Education
+                "categoryId": "27",
                 "defaultLanguage": "ar",
                 "defaultAudioLanguage": "ar",
             },
@@ -364,8 +354,7 @@ def upload_to_youtube(video_path: Path, title: str, description: str) -> str:
         },
         media_body=MediaFileUpload(str(video_path), chunksize=-1, resumable=True),
     )
-    resp = req.execute()
-    return resp["id"]
+    return req.execute()["id"]
 
 
 # =============================================================================
@@ -380,10 +369,8 @@ def run_pipeline():
     log.info("🎬 بدء المعالجة: سورة %s — الآيات %d إلى %d", surah, start, end)
 
     try:
-        # 1) Script
         script = generate_script(surah, start, end)
 
-        # 2) Per-scene assets
         chunk_dir = OUTPUT_DIR / f"chunk_{start}"
         chunk_dir.mkdir(parents=True, exist_ok=True)
         scene_files = []
@@ -400,12 +387,10 @@ def run_pipeline():
             assemble_scene(audio_p, img_p, vid_p)
             scene_files.append(vid_p)
 
-        # 3) Concat into final video
         final_vid = OUTPUT_DIR / f"qeema_{surah}_{start}.mp4"
         concat_scenes(scene_files, final_vid, chunk_dir)
         log.info("🎞️ الفيديو النهائي جاهز: %s", final_vid)
 
-        # 4) Upload
         title = f"سورة {surah} للأطفال — من الآية {start} إلى {end}"
         desc  = (
             f"تفسير مبسط لسورة {surah} (الآيات {start}-{end}) بأسلوب قصصي للأطفال.\n"
@@ -417,10 +402,9 @@ def run_pipeline():
         except Exception as e:
             log.error("⚠️ فشل الرفع على يوتيوب (الفيديو محفوظ محلياً): %s", e)
 
-        # 5) Advance state
         next_start = 1 if end >= 7 else end + 1
         save_state({"ayah_start": next_start})
-        log.info("✅ تم بنجاح — الآية التالية ستبدأ من: %d", next_start)
+        log.info("✅ تم بنجاح — الآية التالية: %d", next_start)
 
     except Exception as e:
         log.exception("❌ فشل تماماً: %s", e)
