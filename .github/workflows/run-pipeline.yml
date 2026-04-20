@@ -26,7 +26,6 @@ jobs:
             fonts-noto-color-emoji libass9 libass-dev fontconfig
           fc-cache -fv
           ffmpeg -version | head -n 1
-          ffmpeg -filters 2>/dev/null | grep -E "zoompan|xfade|drawtext|ass" | head
 
       - name: Install Python dependencies
         run: |
@@ -43,6 +42,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
@@ -61,4 +61,3 @@ jobs:
       - name: Cleanup credentials
         if: always()
         run: rm -f /tmp/gcp-sa-key.json
-        
