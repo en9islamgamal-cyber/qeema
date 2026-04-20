@@ -61,3 +61,4 @@ jobs:
       - name: Cleanup credentials
         if: always()
         run: rm -f /tmp/gcp-sa-key.json
+        
