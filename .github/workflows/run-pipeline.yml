@@ -8,7 +8,7 @@ on:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -19,10 +19,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install FFmpeg with full filters support
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-cjk \
+            fonts-noto-color-emoji libass9 libass-dev fontconfig
+          fc-cache -fv
+          ffmpeg -version | head -n 1
+          ffmpeg -filters 2>/dev/null | grep -E "zoompan|xfade|drawtext|ass" | head
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
