@@ -1,29 +1,7 @@
 """
-QEEMA / VALUE — Professional Qur'anic Tafseer Video Pipeline (v4.0)
+QEEMA / VALUE — Professional Qur'anic Tafseer Video Pipeline (v4.1)
 ====================================================================
-Production-grade automated pipeline for generating broadcast-quality
-Arabic Qur'anic educational videos for children.
-
-Video Enhancements:
-  - 1080p Full HD output
-  - Ken Burns effect (smooth zoom/pan on images)
-  - Hard-burned Arabic subtitles (synced with audio)
-  - Fade transitions between scenes
-  - Background music with audio ducking
-  - Intro/Outro sequences
-  - Channel branding/watermark
-  - High-quality image generation (Leonardo Phoenix 1024x1024 upscaled)
-
-Architecture:
-  1) Supabase           -> State management
-  2) Smart Chunking     -> Intelligent verse splitting
-  3) Gemini 2.5 Flash   -> AI scene scripts
-  4) Google Cloud TTS   -> Arabic WaveNet voiceover
-  5) Leonardo.ai        -> High-quality illustrations
-  6) FFmpeg (advanced)  -> Cinematic video assembly
-  7) YouTube Data API   -> Automated upload
-
-Author: Faramawy's / QEEMA VALUE
+Production-grade automated pipeline with Gemini + Claude fallback.
 """
 
 import os
@@ -59,6 +37,7 @@ log = logging.getLogger("qeema")
 SUPABASE_URL          = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY          = os.environ.get("SUPABASE_KEY")
 GEMINI_API_KEY        = os.environ.get("GEMINI_API_KEY")
+ANTHROPIC_API_KEY     = os.environ.get("ANTHROPIC_API_KEY")
 LEONARDO_API_KEY      = os.environ.get("LEONARDO_API_KEY")
 YOUTUBE_CLIENT_ID     = os.environ.get("YOUTUBE_CLIENT_ID")
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET")
@@ -66,12 +45,13 @@ YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN")
 
 # --- AI Models ---
 GEMINI_MODEL      = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
 TTS_VOICE_NAME    = os.environ.get("TTS_VOICE_NAME", "ar-XA-Wavenet-B")
 TTS_SPEAKING_RATE = float(os.environ.get("TTS_SPEAKING_RATE", "0.88"))
 TTS_PITCH         = float(os.environ.get("TTS_PITCH", "-2.0"))
 LEONARDO_MODEL_ID = os.environ.get(
     "LEONARDO_MODEL_ID",
-    "6b645e3a-d64f-4341-a6d8-7a3690fbf042"  # Phoenix 1.0
+    "6b645e3a-d64f-4341-a6d8-7a3690fbf042"
 )
 
 # --- Smart Chunking ---
@@ -82,24 +62,25 @@ CHUNK_LONG             = 7
 TAIL_MERGE_THRESHOLD   = 3
 
 # --- Video Production Settings ---
-VIDEO_W, VIDEO_H    = 1920, 1080        # Full HD
-IMAGE_W, IMAGE_H    = 1472, 832         # Leonardo (will be scaled up by ffmpeg)
+VIDEO_W, VIDEO_H    = 1920, 1080
+IMAGE_W, IMAGE_H    = 1472, 832
 FPS                 = 30
 VIDEO_BITRATE       = "4M"
 AUDIO_BITRATE       = "192k"
 INTRO_DURATION      = 3.0
 OUTRO_DURATION      = 3.0
 TRANSITION_DURATION = 0.6
-BG_MUSIC_VOLUME     = 0.12              # 12% of voiceover volume (ducking)
+BG_MUSIC_VOLUME     = 0.12
 SUBTITLE_FONT_SIZE  = 42
-SUBTITLE_MAX_CHARS  = 45                # per line
+SUBTITLE_MAX_CHARS  = 45
 
 # --- Pipeline ---
 OUTPUT_DIR          = Path("./qeema_output")
-ASSETS_DIR          = Path("./assets")   # For bg music, logo, fonts
+ASSETS_DIR          = Path("./assets")
 LEONARDO_POLL_TRIES = 18
 LEONARDO_POLL_DELAY = 10
 GEMINI_RETRIES      = 3
+CLAUDE_RETRIES      = 3
 TTS_RETRIES         = 3
 YOUTUBE_RETRIES     = 3
 
@@ -109,12 +90,16 @@ ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 # --- Validate secrets ---
 _REQUIRED = {
     "SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY,
-    "GEMINI_API_KEY": GEMINI_API_KEY, "LEONARDO_API_KEY": LEONARDO_API_KEY,
+    "LEONARDO_API_KEY": LEONARDO_API_KEY,
     "GOOGLE_APPLICATION_CREDENTIALS": os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
 }
 _missing = [k for k, v in _REQUIRED.items() if not v]
 if _missing:
     log.error("❌ متغيرات بيئة ناقصة: %s", ", ".join(_missing))
+    sys.exit(1)
+
+if not GEMINI_API_KEY and not ANTHROPIC_API_KEY:
+    log.error("❌ لازم يكون عندك GEMINI_API_KEY أو ANTHROPIC_API_KEY على الأقل")
     sys.exit(1)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -185,18 +170,17 @@ def calculate_chunk(surah_num: int, ayah_start: int) -> Tuple[int, bool]:
 
 
 # =============================================================================
-# 3. ASSET MANAGEMENT (Fonts, BG Music, Logo)
+# 3. ASSET MANAGEMENT
 # =============================================================================
 
 ARABIC_FONT_URL = "https://github.com/google/fonts/raw/main/ofl/amiri/Amiri-Bold.ttf"
-BG_MUSIC_URL = "https://cdn.pixabay.com/download/audio/2022/03/15/audio_c8e9a7e5d4.mp3"
 
 FONT_PATH = ASSETS_DIR / "Amiri-Bold.ttf"
 BG_MUSIC_PATH = ASSETS_DIR / "bg_music.mp3"
+LOGO_PATH = ASSETS_DIR / "logo.png"
 
 
 def ensure_asset(url: str, path: Path, name: str) -> bool:
-    """Download an asset if missing. Returns True on success."""
     if path.exists() and path.stat().st_size > 1000:
         return True
     try:
@@ -214,15 +198,19 @@ def ensure_asset(url: str, path: Path, name: str) -> bool:
 
 
 def setup_assets() -> dict:
-    """Download fonts & bg music. Returns dict of availability flags."""
+    has_logo = LOGO_PATH.exists() and LOGO_PATH.stat().st_size > 1000
+    if has_logo:
+        log.info("✅ اللوجو موجود: %s", LOGO_PATH)
+    has_bg = BG_MUSIC_PATH.exists() and BG_MUSIC_PATH.stat().st_size > 1000
+    if has_bg:
+        log.info("✅ الموسيقى الخلفية موجودة: %s", BG_MUSIC_PATH)
     return {
         "font": ensure_asset(ARABIC_FONT_URL, FONT_PATH, "الخط العربي"),
-        "bg_music": ensure_asset(BG_MUSIC_URL, BG_MUSIC_PATH, "الموسيقى الخلفية"),
+        "bg_music": has_bg,
+        "logo": has_logo,
     }
-
-
 # =============================================================================
-# 4. SCRIPT GENERATION (Gemini)
+# 4. SCRIPT GENERATION (Gemini + Claude Fallback)
 # =============================================================================
 
 SYSTEM_PROMPT = """أنت شيخ أزهري جليل في قسم التفسير. تجتمع بأحفادك (أطفال 5-6 سنوات) لتفسر لهم آيات القرآن الكريم.
@@ -263,9 +251,11 @@ def _validate_script(script: dict) -> None:
                 raise ValueError(f"المشهد {i} ناقص: {key}")
 
 
-def generate_script(surah_name: str, start: int, end: int) -> dict:
-    user_prompt = f"المطلوب: تفسير سورة {surah_name} | الآيات: {start} إلى {end}."
-    full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
+def _call_gemini(full_prompt: str) -> dict:
+    """Try generating via Gemini API. Raises on failure."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY غير متوفر")
+
     api_url = (
         f"https://generativelanguage.googleapis.com/v1beta/"
         f"models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -280,26 +270,97 @@ def generate_script(surah_name: str, start: int, end: int) -> dict:
         try:
             r = requests.post(api_url, json=payload, timeout=120)
             if r.status_code != 200:
-                log.warning("Gemini HTTP %s: %s", r.status_code, r.text[:500])
+                log.warning("Gemini HTTP %s: %s", r.status_code, r.text[:300])
                 r.raise_for_status()
             data = r.json()
             candidates = data.get("candidates") or []
             if not candidates:
-                raise ValueError(f"لا توجد candidates")
+                raise ValueError("لا توجد candidates")
             parts = candidates[0].get("content", {}).get("parts") or []
             if not parts:
                 raise ValueError("رد Gemini بدون parts")
             raw = parts[0].get("text", "")
             script = json.loads(_clean_json_text(raw))
             _validate_script(script)
-            log.info("✅ تم توليد السيناريو — %d مشاهد", len(script["scenes"]))
+            log.info("✅ Gemini نجح — %d مشاهد", len(script["scenes"]))
             return script
         except Exception as e:
             last_err = e
-            log.warning("⚠️ فشل محاولة %d: %s", attempt, e)
+            log.warning("⚠️ فشل Gemini محاولة %d: %s", attempt, e)
             if attempt < GEMINI_RETRIES:
                 time.sleep(3 * attempt)
-    raise RuntimeError(f"❌ فشل Gemini: {last_err}")
+    raise RuntimeError(f"Gemini exhausted: {last_err}")
+
+
+def _call_claude(full_prompt: str) -> dict:
+    """Fallback: generate via Anthropic Claude API."""
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY غير متوفر")
+
+    log.info("🟠 التحويل إلى Claude (fallback)...")
+    api_url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 4096,
+        "temperature": 0.3,
+        "messages": [{"role": "user", "content": full_prompt}],
+    }
+
+    last_err: Optional[Exception] = None
+    for attempt in range(1, CLAUDE_RETRIES + 1):
+        log.info("🟠 Claude (%s) — محاولة %d/%d", CLAUDE_MODEL, attempt, CLAUDE_RETRIES)
+        try:
+            r = requests.post(api_url, json=payload, headers=headers, timeout=120)
+            if r.status_code != 200:
+                log.warning("Claude HTTP %s: %s", r.status_code, r.text[:300])
+                r.raise_for_status()
+            data = r.json()
+            content = data.get("content") or []
+            if not content:
+                raise ValueError("رد Claude بدون content")
+            raw = content[0].get("text", "")
+            script = json.loads(_clean_json_text(raw))
+            _validate_script(script)
+            log.info("✅ Claude نجح — %d مشاهد", len(script["scenes"]))
+            return script
+        except Exception as e:
+            last_err = e
+            log.warning("⚠️ فشل Claude محاولة %d: %s", attempt, e)
+            if attempt < CLAUDE_RETRIES:
+                time.sleep(3 * attempt)
+    raise RuntimeError(f"Claude exhausted: {last_err}")
+
+
+def generate_script(surah_name: str, start: int, end: int) -> dict:
+    """
+    Generate scene script with Gemini first, fallback to Claude if Gemini fails.
+    """
+    user_prompt = f"المطلوب: تفسير سورة {surah_name} | الآيات: {start} إلى {end}."
+    full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
+
+    # 1) Try Gemini first
+    if GEMINI_API_KEY:
+        try:
+            return _call_gemini(full_prompt)
+        except Exception as gemini_err:
+            log.warning("⚠️ Gemini فشل تماماً: %s", gemini_err)
+    else:
+        log.info("ℹ️ GEMINI_API_KEY غير متوفر، التحويل مباشرة لـ Claude")
+
+    # 2) Fallback to Claude
+    if ANTHROPIC_API_KEY:
+        try:
+            return _call_claude(full_prompt)
+        except Exception as claude_err:
+            log.error("❌ Claude أيضاً فشل: %s", claude_err)
+            raise RuntimeError("❌ فشل توليد السيناريو من Gemini و Claude")
+    else:
+        raise RuntimeError("❌ فشل Gemini ولا يوجد ANTHROPIC_API_KEY كبديل")
 
 
 # =============================================================================
@@ -372,7 +433,6 @@ def generate_voice(text: str, filename: Path) -> None:
 
 
 def get_audio_duration(path: Path) -> float:
-    """Get duration in seconds using ffprobe."""
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
@@ -399,7 +459,7 @@ def generate_image(prompt: str, filename: Path) -> None:
         "modelId": LEONARDO_MODEL_ID,
         "width": IMAGE_W, "height": IMAGE_H,
         "num_images": 1,
-        "alchemy": True,              # Higher quality
+        "alchemy": True,
         "photoReal": False,
         "presetStyle": "CINEMATIC",
     }
@@ -408,7 +468,6 @@ def generate_image(prompt: str, filename: Path) -> None:
         json=body, headers=headers, timeout=60,
     )
     if r.status_code not in (200, 201):
-        # Retry without alchemy if it failed (some models don't support it)
         body.pop("alchemy", None)
         body.pop("presetStyle", None)
         r = requests.post(
@@ -447,11 +506,10 @@ def generate_image(prompt: str, filename: Path) -> None:
 
 
 # =============================================================================
-# 8. SUBTITLE GENERATION (ASS format for Arabic RTL)
+# 8. SUBTITLES (ASS format for Arabic RTL)
 # =============================================================================
 
 def _split_arabic_text(text: str, max_chars: int = SUBTITLE_MAX_CHARS) -> List[str]:
-    """Split Arabic text into lines of max_chars."""
     words = text.split()
     lines = []
     current = ""
@@ -468,7 +526,6 @@ def _split_arabic_text(text: str, max_chars: int = SUBTITLE_MAX_CHARS) -> List[s
 
 
 def _seconds_to_ass_time(t: float) -> str:
-    """Convert seconds to ASS timestamp (H:MM:SS.cs)."""
     h = int(t // 3600)
     m = int((t % 3600) // 60)
     s = t % 60
@@ -476,10 +533,7 @@ def _seconds_to_ass_time(t: float) -> str:
 
 
 def generate_subtitle_ass(text: str, audio_duration: float, ass_path: Path) -> None:
-    """Generate an ASS subtitle file for a single scene."""
     lines = _split_arabic_text(text)
-
-    # ASS header
     header = f"""[Script Info]
 Title: QEEMA Subtitle
 ScriptType: v4.00+
@@ -494,29 +548,21 @@ Style: Default,Amiri,{SUBTITLE_FONT_SIZE},&H00FFFFFF,&H000000FF,&H00000000,&H960
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-
-    # Distribute text evenly across audio duration
-    # Allow 0.3s lead-in for first line
     lead_in = 0.2
     effective_duration = audio_duration - lead_in
     per_line = effective_duration / max(1, len(lines))
-
     events = []
     for i, line in enumerate(lines):
         t_start = lead_in + (i * per_line)
         t_end = lead_in + ((i + 1) * per_line)
-        # Escape special chars & add Arabic RLM for RTL
         safe_line = line.replace("\n", " ").replace(",", "،")
         events.append(
             f"Dialogue: 0,{_seconds_to_ass_time(t_start)},{_seconds_to_ass_time(t_end)},"
             f"Default,,0,0,0,,{safe_line}"
         )
-
     ass_path.write_text(header + "\n".join(events), encoding="utf-8")
-
-
 # =============================================================================
-# 9. CINEMATIC SCENE ASSEMBLY (Ken Burns + Subtitles)
+# 9. CINEMATIC SCENE ASSEMBLY (Ken Burns + Subtitles + Logo)
 # =============================================================================
 
 def _run_ffmpeg(cmd: list, description: str = "") -> None:
@@ -528,29 +574,18 @@ def _run_ffmpeg(cmd: list, description: str = "") -> None:
 
 
 def assemble_scene_cinematic(
-    audio_path: Path,
-    img_path: Path,
-    subtitle_text: str,
-    out_path: Path,
-    work_dir: Path,
-    use_subtitles: bool = True,
-    ken_burns_direction: str = "in",  # "in", "out", "left", "right"
+    audio_path: Path, img_path: Path, subtitle_text: str,
+    out_path: Path, work_dir: Path,
+    use_subtitles: bool = True, use_logo: bool = True,
+    ken_burns_direction: str = "in",
 ) -> None:
-    """
-    Assemble a cinematic scene with Ken Burns effect + subtitles.
-
-    Uses FFmpeg zoompan filter for smooth zoom/pan on still images.
-    """
     duration = get_audio_duration(audio_path)
     total_frames = int(duration * FPS) + 1
 
-    # Generate subtitles
     ass_path = work_dir / f"{out_path.stem}.ass"
     if use_subtitles and FONT_PATH.exists():
         generate_subtitle_ass(subtitle_text, duration, ass_path)
 
-    # Ken Burns zoom expression
-    # zoom from 1.0 to 1.12 over the scene duration
     if ken_burns_direction == "in":
         zoom_expr = f"zoom='min(zoom+0.0008,1.15)'"
         x_expr = "x='iw/2-(iw/zoom/2)'"
@@ -563,129 +598,196 @@ def assemble_scene_cinematic(
         zoom_expr = f"zoom='1.15'"
         x_expr = f"x='if(eq(on,1),0,x+2)'"
         y_expr = "y='ih/2-(ih/zoom/2)'"
-    else:  # right
+    else:
         zoom_expr = f"zoom='1.15'"
         x_expr = f"x='if(eq(on,1),iw-iw/zoom,x-2)'"
         y_expr = "y='ih/2-(ih/zoom/2)'"
 
-    # Build filter chain
-    vf_parts = [
-        f"scale={VIDEO_W*2}:{VIDEO_H*2}:force_original_aspect_ratio=increase",
-        f"crop={VIDEO_W*2}:{VIDEO_H*2}",
-        f"zoompan={zoom_expr}:{x_expr}:{y_expr}:d={total_frames}:s={VIDEO_W}x{VIDEO_H}:fps={FPS}",
-        f"format=yuv420p",
-    ]
+    has_logo = use_logo and LOGO_PATH.exists() and LOGO_PATH.stat().st_size > 1000
 
-    # Add subtitles if available
-    if use_subtitles and ass_path.exists() and FONT_PATH.exists():
-        # fontsdir is the directory containing the Arabic font
-        ass_filter_arg = str(ass_path).replace('\\', '/').replace(':', '\\:')
-        fontsdir = str(ASSETS_DIR.resolve()).replace('\\', '/').replace(':', '\\:')
-        vf_parts.append(f"ass='{ass_filter_arg}':fontsdir='{fontsdir}'")
+    if has_logo:
+        chain = (
+            f"[0:v]scale={VIDEO_W*2}:{VIDEO_H*2}:force_original_aspect_ratio=increase"
+            f",crop={VIDEO_W*2}:{VIDEO_H*2}"
+            f",zoompan={zoom_expr}:{x_expr}:{y_expr}:d={total_frames}:s={VIDEO_W}x{VIDEO_H}:fps={FPS}"
+            f",format=yuv420p[bg];"
+            f"[2:v]scale=140:140,format=rgba,colorchannelmixer=aa=0.85[wm];"
+            f"[bg][wm]overlay=W-w-30:30[v1]"
+        )
+        if use_subtitles and ass_path.exists() and FONT_PATH.exists():
+            ass_filter_arg = str(ass_path).replace('\\', '/').replace(':', '\\:')
+            fontsdir = str(ASSETS_DIR.resolve()).replace('\\', '/').replace(':', '\\:')
+            chain += f";[v1]ass='{ass_filter_arg}':fontsdir='{fontsdir}'[vout]"
+            final_map = "[vout]"
+        else:
+            final_map = "[v1]"
 
-    vf = ",".join(vf_parts)
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-framerate", str(FPS), "-i", str(img_path),
+            "-i", str(audio_path),
+            "-loop", "1", "-framerate", str(FPS), "-i", str(LOGO_PATH),
+            "-filter_complex", chain,
+            "-map", final_map, "-map", "1:a",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-b:v", VIDEO_BITRATE, "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", AUDIO_BITRATE,
+            "-shortest", "-movflags", "+faststart",
+            str(out_path),
+        ]
+    else:
+        vf_parts = [
+            f"scale={VIDEO_W*2}:{VIDEO_H*2}:force_original_aspect_ratio=increase",
+            f"crop={VIDEO_W*2}:{VIDEO_H*2}",
+            f"zoompan={zoom_expr}:{x_expr}:{y_expr}:d={total_frames}:s={VIDEO_W}x{VIDEO_H}:fps={FPS}",
+            f"format=yuv420p",
+        ]
+        if use_subtitles and ass_path.exists() and FONT_PATH.exists():
+            ass_filter_arg = str(ass_path).replace('\\', '/').replace(':', '\\:')
+            fontsdir = str(ASSETS_DIR.resolve()).replace('\\', '/').replace(':', '\\:')
+            vf_parts.append(f"ass='{ass_filter_arg}':fontsdir='{fontsdir}'")
+        vf = ",".join(vf_parts)
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-loop", "1", "-framerate", str(FPS), "-i", str(img_path),
-        "-i", str(audio_path),
-        "-vf", vf,
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-        "-b:v", VIDEO_BITRATE, "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", AUDIO_BITRATE,
-        "-shortest", "-movflags", "+faststart",
-        str(out_path),
-    ]
-    _run_ffmpeg(cmd, f"scene ({duration:.1f}s, Ken Burns {ken_burns_direction})")
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-framerate", str(FPS), "-i", str(img_path),
+            "-i", str(audio_path),
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-b:v", VIDEO_BITRATE, "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", AUDIO_BITRATE,
+            "-shortest", "-movflags", "+faststart",
+            str(out_path),
+        ]
+    _run_ffmpeg(cmd, f"scene ({duration:.1f}s, logo={has_logo})")
 
 
 def create_intro(surah_name: str, start: int, end: int, is_complete: bool,
                  out_path: Path, work_dir: Path) -> None:
-    """Create a branded intro screen."""
     title_line = f"سورة {surah_name}"
-    if is_complete:
-        subtitle = "تفسير مبسّط للأطفال"
-    else:
-        subtitle = f"الآيات {start} إلى {end}"
-
-    # Create solid color background with text using drawtext
+    subtitle = "تفسير مبسّط للأطفال" if is_complete else f"الآيات {start} إلى {end}"
     font_arg = ""
     if FONT_PATH.exists():
         font_path_escaped = str(FONT_PATH.resolve()).replace('\\', '/').replace(':', '\\:')
         font_arg = f":fontfile='{font_path_escaped}'"
 
-    # Gradient background + title + subtitle
-    vf = (
-        f"[0:v]scale={VIDEO_W}:{VIDEO_H},format=yuv420p"
-        f",drawtext=text='{title_line}'{font_arg}:fontsize=110:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2-60:borderw=3:bordercolor=black@0.6"
-        f",drawtext=text='{subtitle}'{font_arg}:fontsize=60:fontcolor=white@0.9:x=(w-text_w)/2:y=(h-text_h)/2+80:borderw=2:bordercolor=black@0.6"
-        f",drawtext=text='قناة قيمة | VALUE'{font_arg}:fontsize=40:fontcolor=white@0.7:x=(w-text_w)/2:y=h-100"
-        f",fade=t=in:st=0:d=0.5,fade=t=out:st={INTRO_DURATION-0.5}:d=0.5"
-    )
+    has_logo = LOGO_PATH.exists() and LOGO_PATH.stat().st_size > 1000
 
-    # Solid dark blue gradient background via color filter
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi", "-i", f"color=c=0x1a2a4f:s={VIDEO_W}x{VIDEO_H}:d={INTRO_DURATION}:r={FPS}",
-        "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:d={INTRO_DURATION}",
-        "-vf", vf.replace("[0:v]", ""),
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", AUDIO_BITRATE,
-        "-t", str(INTRO_DURATION),
-        str(out_path),
-    ]
+    if has_logo:
+        logo_size = 380
+        chain = (
+            f"[0:v]format=yuv420p[bg];"
+            f"[1:v]scale={logo_size}:{logo_size},format=rgba[logo];"
+            f"[bg][logo]overlay=(W-w)/2:140:enable='gte(t,0)'[v1];"
+            f"[v1]drawtext=text='{title_line}'{font_arg}:fontsize=110:fontcolor=white:"
+            f"x=(w-text_w)/2:y=h/2+120:borderw=3:bordercolor=black@0.6,"
+            f"drawtext=text='{subtitle}'{font_arg}:fontsize=60:fontcolor=white@0.9:"
+            f"x=(w-text_w)/2:y=h/2+250:borderw=2:bordercolor=black@0.6,"
+            f"drawtext=text='قناة قيمة | VALUE'{font_arg}:fontsize=40:fontcolor=0xffd700:"
+            f"x=(w-text_w)/2:y=h-80,"
+            f"fade=t=in:st=0:d=0.5,fade=t=out:st={INTRO_DURATION-0.5}:d=0.5[vout]"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"color=c=0x1a2a4f:s={VIDEO_W}x{VIDEO_H}:d={INTRO_DURATION}:r={FPS}",
+            "-loop", "1", "-framerate", str(FPS), "-t", str(INTRO_DURATION), "-i", str(LOGO_PATH),
+            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:d={INTRO_DURATION}",
+            "-filter_complex", chain,
+            "-map", "[vout]", "-map", "2:a",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", AUDIO_BITRATE,
+            "-t", str(INTRO_DURATION),
+            str(out_path),
+        ]
+    else:
+        vf = (
+            f"format=yuv420p"
+            f",drawtext=text='{title_line}'{font_arg}:fontsize=110:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2-60:borderw=3:bordercolor=black@0.6"
+            f",drawtext=text='{subtitle}'{font_arg}:fontsize=60:fontcolor=white@0.9:x=(w-text_w)/2:y=(h-text_h)/2+80:borderw=2:bordercolor=black@0.6"
+            f",drawtext=text='قناة قيمة | VALUE'{font_arg}:fontsize=40:fontcolor=white@0.7:x=(w-text_w)/2:y=h-100"
+            f",fade=t=in:st=0:d=0.5,fade=t=out:st={INTRO_DURATION-0.5}:d=0.5"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"color=c=0x1a2a4f:s={VIDEO_W}x{VIDEO_H}:d={INTRO_DURATION}:r={FPS}",
+            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:d={INTRO_DURATION}",
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", AUDIO_BITRATE,
+            "-t", str(INTRO_DURATION),
+            str(out_path),
+        ]
     _run_ffmpeg(cmd, "intro")
 
 
 def create_outro(out_path: Path, work_dir: Path) -> None:
-    """Create a branded outro screen."""
     font_arg = ""
     if FONT_PATH.exists():
         font_path_escaped = str(FONT_PATH.resolve()).replace('\\', '/').replace(':', '\\:')
         font_arg = f":fontfile='{font_path_escaped}'"
 
-    vf = (
-        f"drawtext=text='جزاكم الله خيراً'{font_arg}:fontsize=100:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2-40:borderw=3:bordercolor=black@0.6"
-        f",drawtext=text='لا تنسوا الاشتراك والتعليق'{font_arg}:fontsize=55:fontcolor=white@0.9:x=(w-text_w)/2:y=(h-text_h)/2+70:borderw=2:bordercolor=black@0.6"
-        f",drawtext=text='قناة قيمة | VALUE'{font_arg}:fontsize=45:fontcolor=0xffd700:x=(w-text_w)/2:y=h-100"
-        f",fade=t=in:st=0:d=0.5,fade=t=out:st={OUTRO_DURATION-0.8}:d=0.8"
-    )
+    has_logo = LOGO_PATH.exists() and LOGO_PATH.stat().st_size > 1000
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi", "-i", f"color=c=0x0a1a3f:s={VIDEO_W}x{VIDEO_H}:d={OUTRO_DURATION}:r={FPS}",
-        "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:d={OUTRO_DURATION}",
-        "-vf", vf,
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", AUDIO_BITRATE,
-        "-t", str(OUTRO_DURATION),
-        str(out_path),
-    ]
+    if has_logo:
+        logo_size = 300
+        chain = (
+            f"[0:v]format=yuv420p[bg];"
+            f"[1:v]scale={logo_size}:{logo_size},format=rgba[logo];"
+            f"[bg][logo]overlay=(W-w)/2:120[v1];"
+            f"[v1]drawtext=text='جزاكم الله خيراً'{font_arg}:fontsize=100:fontcolor=white:"
+            f"x=(w-text_w)/2:y=h/2+100:borderw=3:bordercolor=black@0.6,"
+            f"drawtext=text='لا تنسوا الاشتراك والتعليق'{font_arg}:fontsize=55:fontcolor=white@0.9:"
+            f"x=(w-text_w)/2:y=h/2+220:borderw=2:bordercolor=black@0.6,"
+            f"drawtext=text='قناة قيمة | VALUE'{font_arg}:fontsize=45:fontcolor=0xffd700:"
+            f"x=(w-text_w)/2:y=h-80,"
+            f"fade=t=in:st=0:d=0.5,fade=t=out:st={OUTRO_DURATION-0.8}:d=0.8[vout]"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"color=c=0x0a1a3f:s={VIDEO_W}x{VIDEO_H}:d={OUTRO_DURATION}:r={FPS}",
+            "-loop", "1", "-framerate", str(FPS), "-t", str(OUTRO_DURATION), "-i", str(LOGO_PATH),
+            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:d={OUTRO_DURATION}",
+            "-filter_complex", chain,
+            "-map", "[vout]", "-map", "2:a",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", AUDIO_BITRATE,
+            "-t", str(OUTRO_DURATION),
+            str(out_path),
+        ]
+    else:
+        vf = (
+            f"drawtext=text='جزاكم الله خيراً'{font_arg}:fontsize=100:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2-40:borderw=3:bordercolor=black@0.6"
+            f",drawtext=text='لا تنسوا الاشتراك والتعليق'{font_arg}:fontsize=55:fontcolor=white@0.9:x=(w-text_w)/2:y=(h-text_h)/2+70:borderw=2:bordercolor=black@0.6"
+            f",drawtext=text='قناة قيمة | VALUE'{font_arg}:fontsize=45:fontcolor=0xffd700:x=(w-text_w)/2:y=h-100"
+            f",fade=t=in:st=0:d=0.5,fade=t=out:st={OUTRO_DURATION-0.8}:d=0.8"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"color=c=0x0a1a3f:s={VIDEO_W}x{VIDEO_H}:d={OUTRO_DURATION}:r={FPS}",
+            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:d={OUTRO_DURATION}",
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", AUDIO_BITRATE,
+            "-t", str(OUTRO_DURATION),
+            str(out_path),
+        ]
     _run_ffmpeg(cmd, "outro")
 
 
 def concat_with_crossfade(scene_files: List[Path], out_path: Path, work_dir: Path) -> None:
-    """
-    Concatenate scenes with crossfade transitions.
-    Falls back to simple concat if crossfade fails.
-    """
     if len(scene_files) < 2:
-        # Single scene, just copy
         subprocess.run(["cp", str(scene_files[0]), str(out_path)], check=True)
         return
 
-    # Build xfade filter chain
-    # For N clips: [0:v][1:v] xfade -> [v1]; [v1][2:v] xfade -> [v2]; ...
     inputs = []
     for s in scene_files:
         inputs.extend(["-i", str(s)])
-
-    # Get durations for offset calculation
     durations = [get_audio_duration(s) for s in scene_files]
 
-    # Build video filter chain
     v_filters = []
     a_filters = []
     offset = 0.0
@@ -708,8 +810,7 @@ def concat_with_crossfade(scene_files: List[Path], out_path: Path, work_dir: Pat
     filter_complex = ";".join(v_filters + a_filters)
 
     cmd = [
-        "ffmpeg", "-y",
-        *inputs,
+        "ffmpeg", "-y", *inputs,
         "-filter_complex", filter_complex,
         "-map", current_v, "-map", current_a,
         "-c:v", "libx264", "-preset", "medium", "-crf", "20",
@@ -718,16 +819,14 @@ def concat_with_crossfade(scene_files: List[Path], out_path: Path, work_dir: Pat
         "-movflags", "+faststart",
         str(out_path),
     ]
-
     try:
-        _run_ffmpeg(cmd, f"crossfade concat of {len(scene_files)} scenes")
+        _run_ffmpeg(cmd, f"crossfade {len(scene_files)} scenes")
     except Exception as e:
-        log.warning("⚠️ فشل crossfade، استخدام concat عادي: %s", e)
+        log.warning("⚠️ فشل crossfade، fallback: %s", e)
         _simple_concat(scene_files, out_path, work_dir)
 
 
 def _simple_concat(scene_files: List[Path], out_path: Path, work_dir: Path) -> None:
-    """Fallback: simple concat without crossfade."""
     list_file = work_dir / "concat_list.txt"
     with open(list_file, "w", encoding="utf-8") as f:
         for s in scene_files:
@@ -742,37 +841,30 @@ def _simple_concat(scene_files: List[Path], out_path: Path, work_dir: Path) -> N
 
 
 def mix_background_music(video_path: Path, out_path: Path, work_dir: Path) -> None:
-    """Mix background music under the video's voiceover with ducking."""
     if not BG_MUSIC_PATH.exists():
         log.info("⏭️ لا توجد موسيقى خلفية، تخطي الـ mixing")
         subprocess.run(["cp", str(video_path), str(out_path)], check=True)
         return
 
     video_duration = get_audio_duration(video_path)
-
-    # Loop bg music to match video duration, reduce volume, and mix
     filter_complex = (
         f"[1:a]aloop=loop=-1:size=2e+09,atrim=0:{video_duration},"
         f"volume={BG_MUSIC_VOLUME},afade=t=in:st=0:d=1,afade=t=out:st={video_duration-1}:d=1[bg];"
         f"[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]"
     )
-
     cmd = [
         "ffmpeg", "-y",
-        "-i", str(video_path),
-        "-i", str(BG_MUSIC_PATH),
+        "-i", str(video_path), "-i", str(BG_MUSIC_PATH),
         "-filter_complex", filter_complex,
         "-map", "0:v", "-map", "[aout]",
-        "-c:v", "copy",
-        "-c:a", "aac", "-b:a", AUDIO_BITRATE,
+        "-c:v", "copy", "-c:a", "aac", "-b:a", AUDIO_BITRATE,
         "-shortest", "-movflags", "+faststart",
         str(out_path),
     ]
-
     try:
         _run_ffmpeg(cmd, "bg music mix")
     except Exception as e:
-        log.warning("⚠️ فشل mix الموسيقى: %s", e)
+        log.warning("⚠️ فشل mix: %s", e)
         subprocess.run(["cp", str(video_path), str(out_path)], check=True)
 
 
@@ -823,11 +915,10 @@ def upload_to_youtube(video_path: Path, title: str, description: str) -> str:
 # =============================================================================
 
 def run_pipeline() -> None:
-    # Setup
     assets = setup_assets()
-    log.info("🎨 الأصول: font=%s, bg_music=%s", assets["font"], assets["bg_music"])
+    log.info("🎨 الأصول: font=%s, bg_music=%s, logo=%s",
+             assets["font"], assets["bg_music"], assets["logo"])
 
-    # Load state
     state = load_state()
     surah_num = int(state.get("surah_index", 1))
     start = int(state.get("ayah_start", 1))
@@ -841,15 +932,11 @@ def run_pipeline() -> None:
     log.info("=" * 60)
 
     try:
-        # 1. Generate script
         script = generate_script(surah_name, start, end)
 
-        # 2. Per-scene assets + cinematic assembly
         chunk_dir = OUTPUT_DIR / f"surah_{surah_num:03d}_{start}-{end}"
         chunk_dir.mkdir(parents=True, exist_ok=True)
         scene_files = []
-
-        # Ken Burns direction rotation for variety
         kb_directions = ["in", "out", "left", "right"]
 
         for i, sc in enumerate(script["scenes"]):
@@ -864,30 +951,25 @@ def run_pipeline() -> None:
             generate_voice(narration, audio_p)
             generate_image(sc["image_prompt"], img_p)
             assemble_scene_cinematic(
-                audio_path=audio_p,
-                img_path=img_p,
-                subtitle_text=subtitle_text,
-                out_path=vid_p,
+                audio_path=audio_p, img_path=img_p,
+                subtitle_text=subtitle_text, out_path=vid_p,
                 work_dir=chunk_dir,
-                use_subtitles=assets["font"],
+                use_subtitles=assets["font"], use_logo=assets["logo"],
                 ken_burns_direction=kb_directions[i % len(kb_directions)],
             )
             scene_files.append(vid_p)
 
-        # 3. Create intro & outro
         log.info("🎬 إنشاء الـ Intro والـ Outro...")
         intro_p = chunk_dir / "intro.mp4"
         outro_p = chunk_dir / "outro.mp4"
         create_intro(surah_name, start, end, is_complete, intro_p, chunk_dir)
         create_outro(outro_p, chunk_dir)
 
-        # 4. Concatenate: intro + scenes + outro
         all_scenes = [intro_p] + scene_files + [outro_p]
         combined_vid = chunk_dir / "combined.mp4"
-        log.info("🎞️ دمج كل المشاهد مع transitions...")
+        log.info("🎞️ دمج كل المشاهد...")
         concat_with_crossfade(all_scenes, combined_vid, chunk_dir)
 
-        # 5. Mix background music
         final_vid = OUTPUT_DIR / f"qeema_{surah_num:03d}_{surah_name}_{start}-{end}.mp4"
         log.info("🎵 إضافة الموسيقى الخلفية...")
         mix_background_music(combined_vid, final_vid, chunk_dir)
@@ -896,7 +978,6 @@ def run_pipeline() -> None:
         final_size_mb = final_vid.stat().st_size / (1024 * 1024)
         log.info("📦 حجم الفيديو: %.1f MB", final_size_mb)
 
-        # 6. Metadata
         if is_complete and total_verses <= SHORT_SURAH_THRESHOLD:
             title = f"تفسير سورة {surah_name} للأطفال | قصة بأسلوب الجد"
             desc = (
@@ -907,7 +988,7 @@ def run_pipeline() -> None:
                 f"🎨 رسوم فنية إسلامية\n"
                 f"🎤 سرد صوتي بالفصحى\n\n"
                 f"لا تنسوا الاشتراك والتعليق وتفعيل الجرس 🔔\n\n"
-                f"#قرآن #تفسير_للأطفال #{surah_name} #قيمة #QEEMA #VALUE #Islamic_Kids"
+                f"#قرآن #تفسير_للأطفال #{surah_name} #قيمة #QEEMA #VALUE"
             )
         else:
             title = f"سورة {surah_name} الآيات {start}-{end} | تفسير للأطفال"
@@ -922,7 +1003,6 @@ def run_pipeline() -> None:
                 f"#قرآن #تفسير_للأطفال #{surah_name} #قيمة #QEEMA #VALUE"
             )
 
-        # 7. Upload to YouTube
         upload_success = False
         try:
             vid_id = upload_to_youtube(final_vid, title, desc)
@@ -931,7 +1011,6 @@ def run_pipeline() -> None:
         except Exception as e:
             log.error("⚠️ فشل الرفع (الفيديو محفوظ محلياً): %s", e)
 
-        # 8. Advance state
         if is_complete:
             next_surah = surah_num + 1 if surah_num < 114 else 1
             next_ayah = 1
