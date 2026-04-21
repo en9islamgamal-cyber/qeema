@@ -37,7 +37,7 @@ jobs:
       - name: "Install FFmpeg"
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg fonts-arabeyes fonts-noto-core python3-bidi
+          sudo apt-get install -y ffmpeg fonts-arabeyes fonts-noto-core libfreetype6-dev
 
       - name: "Install Python packages"
         run: |
@@ -45,7 +45,7 @@ jobs:
           pip install -r requirements.txt -q
 
       - name: "Verify imports"
-        run: python3 -c "import config, models, script_engine, voice_engine_v2, visual_engine, sfx_engine, video_engine, thumbnail_engine, gamification_engine, orchestrator; print('OK')"
+        run: python3 -c "import config, models, script_engine, voice_engine_v2, visual_engine, sfx_engine, video_engine, thumbnail_engine, gamification_engine, orchestrator; print('All imports OK')"
 
       - name: "Restore cache"
         uses: actions/cache@v4
@@ -102,6 +102,6 @@ jobs:
             logs/pipeline.log
           retention-days: 21
 
-      - name: "Cleanup secrets"
+      - name: "Cleanup"
         if: always()
         run: rm -f /tmp/gcp_sa.json
