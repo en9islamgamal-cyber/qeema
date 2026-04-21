@@ -45,17 +45,7 @@ jobs:
           pip install -r requirements.txt -q
 
       - name: "Verify imports"
-        run: python3 -c "import config, models, script_engine, voice_engine_v2, visual_engine, sfx_engine, video_engine, thumbnail_engine, gamification_engine, orchestrator; print('All imports OK')"
-
-      - name: "Restore cache"
-        uses: actions/cache@v4
-        with:
-          path: |
-            temp/episodes/tts_cache
-            temp/episodes/quran_audio_cache
-            assets/thumbnails
-          key: cache-${{ github.run_number }}
-          restore-keys: cache-
+        run: python3 -c "import config, models, script_engine, voice_engine_v2, visual_engine, sfx_engine, video_engine, thumbnail_engine, gamification_engine, orchestrator; print('✅ All imports OK')"
 
       - name: "Create directories"
         run: |
@@ -70,6 +60,16 @@ jobs:
             echo "$GCP_SA_KEY" > /tmp/gcp_sa.json
             echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_sa.json" >> $GITHUB_ENV
           fi
+
+      - name: "Restore cache"
+        uses: actions/cache@v4
+        with:
+          path: |
+            temp/episodes/tts_cache
+            temp/episodes/quran_audio_cache
+            assets/thumbnails
+          key: cache-${{ github.run_number }}
+          restore-keys: cache-
 
       - name: "Run pipeline"
         env:
