@@ -1,30 +1,21 @@
 """
 Script & Director Engine - QEEMA Pipeline
-Uses Google AI Studio (google-generativeai) to generate a highly structured, 
-director-level script including pacing, visual prompts, and SSML instructions.
+Uses Google's NEW AI SDK (google-genai) to generate a highly structured script.
 """
 
 import os
 import json
 import logging
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from typing import Dict, Any
 
 log = logging.getLogger("qeema_script")
 
 # =============================================================================
-# 1. AI STUDIO CONFIGURATION
+# 1. DIRECTOR SYSTEM PROMPT
 # =============================================================================
 
-def setup_ai_studio(api_key: str):
-    """Configures the Google AI Studio client."""
-    genai.configure(api_key=api_key)
-
-# =============================================================================
-# 2. DIRECTOR SYSTEM PROMPT
-# =============================================================================
-
-# هذا الموجه (Prompt) مصمم ليعمل كمخرج سينمائي وكاتب محتوى أطفال في نفس الوقت
 DIRECTOR_PROMPT = """
 أنت مخرج سينمائي وراوي قصص أطفال محترف (جد حنون)، متخصص في تبسيط القرآن الكريم للأطفال (5-9 سنوات).
 مهمتك ليست فقط تفسير الآيات، بل تصميم "تجربة بصرية وصوتية" كاملة.
@@ -51,34 +42,31 @@ DIRECTOR_PROMPT = """
 """
 
 # =============================================================================
-# 3. SCRIPT GENERATION FUNCTION
+# 2. SCRIPT GENERATION FUNCTION
 # =============================================================================
 
 def generate_cinematic_script(surah_name: str, ayah_start: int, ayah_end: int, api_key: str) -> Dict[str, Any]:
     """
-    Generates the complete script and director notes using Gemini via AI Studio.
+    Generates the script using the new google-genai library.
     """
-    setup_ai_studio(api_key)
-    
-    # استخدام موديل Gemini 1.5 لدقته العالية في اتباع تعليمات JSON
-    model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
-        system_instruction=DIRECTOR_PROMPT,
-        generation_config=genai.GenerationConfig(
-            response_mime_type="application/json",
-            temperature=0.4 # درجة حرارة منخفضة لضمان استقرار المخرجات
-        )
-    )
-    
+    client = genai.Client(api_key=api_key)
     user_prompt = f"قم بإعداد سيناريو الإخراج وتفسير سورة {surah_name}، الآيات من {ayah_start} إلى {ayah_end}."
     
     log.info(f"🎬 يكتب الآن سيناريو سورة {surah_name} (الآيات {ayah_start}-{ayah_end})...")
     
     try:
-        response = model.generate_content(user_prompt)
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.4,
+                system_instruction=DIRECTOR_PROMPT,
+            )
+        )
+        
         script_data = json.loads(response.text)
         
-        # تحقق بسيط من الهيكلية
         if "scenes" not in script_data:
             raise ValueError("The generated JSON does not contain 'scenes'.")
             
@@ -88,17 +76,3 @@ def generate_cinematic_script(surah_name: str, ayah_start: int, ayah_end: int, a
     except Exception as e:
         log.error(f"❌ فشل توليد السيناريو: {e}")
         raise
-
-# =============================================================================
-# FOR TESTING LOCALLY
-# =============================================================================
-if __name__ == "__main__":
-    # ضع مفتاح Google AI Studio الخاص بك هنا لتجربة الكود
-    TEST_API_KEY = "YOUR_GOOGLE_AI_STUDIO_API_KEY" 
-    
-    if TEST_API_KEY != "YOUR_GOOGLE_AI_STUDIO_API_KEY":
-        logging.basicConfig(level=logging.INFO)
-        test_script = generate_cinematic_script("الفيل", 1, 5, TEST_API_KEY)
-        print(json.dumps(test_script, indent=2, ensure_ascii=False))
-    else:
-        print("⚠️ برجاء وضع مفتاح API الخاص بك لتجربة الكود.")
