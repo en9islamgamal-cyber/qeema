@@ -2,6 +2,9 @@
 Thumbnail Engine - QEEMA Pipeline
 Generates high-impact YouTube thumbnails with text overlays.
 """
+import subprocess
+from pathlib import Path
+
 def create_pro_thumbnail(image_p: Path, title: str, output_p: Path):
     """
     يأخذ أفضل صورة من لقطات الفيديو ويضع عليها نصاً ضخماً وجذاباً.
