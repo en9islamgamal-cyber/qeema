@@ -1,63 +1,192 @@
-name: QEEMA Auto Pipeline
+name: "🌙 VALUE/QEEMA — خط الإنتاج القرآني v2"
 
 on:
   schedule:
-    - cron: '0 6,14 * * 1,4'
+    - cron: "0 3 * * 1,4"
+
   workflow_dispatch:
+    inputs:
+      episode_number:
+        description: "رقم الحلقة"
+        required: false
+        type: string
+      dry_run:
+        description: "وضع اختبار"
+        required: false
+        type: boolean
+        default: false
+      action:
+        description: "الإجراء"
+        required: false
+        type: choice
+        options: [run, seed, status]
+        default: run
+
+concurrency:
+  group: qeema-pipeline
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.11"
+  TZ: "Asia/Kuwait"
 
 jobs:
-  run-pipeline:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-
+  validate-secrets:
+    name: "تحقق من الـ Secrets"
+    runs-on: ubuntu-22.04
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install FFmpeg with full filters support
+      - name: "فحص المفاتيح"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-cjk \
-            fonts-noto-color-emoji libass9 libass-dev fontconfig
-          fc-cache -fv
-          ffmpeg -version | head -n 1
-          ffmpeg -filters 2>/dev/null | grep -E "zoompan|xfade|drawtext|ass" | head
-
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Write Google Cloud credentials file
-        run: |
-          echo '${{ secrets.GCP_SA_KEY }}' > /tmp/gcp-sa-key.json
-          echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-sa-key.json" >> $GITHUB_ENV
-
-      - name: Run Pipeline Script
+          required_secrets=(
+            "GEMINI_API_KEY"
+            "LEONARDO_API_KEY"
+            "SUPABASE_URL"
+            "SUPABASE_KEY"
+            "YOUTUBE_CLIENT_ID"
+            "YOUTUBE_CLIENT_SECRET"
+            "YOUTUBE_REFRESH_TOKEN"
+          )
+          
+          missing=0
+          for secret in "${required_secrets[@]}"; do
+            if [ -z "${!secret}" ]; then
+              echo "❌ مفقود: $secret"
+              ((missing++))
+            else
+              echo "✅ موجود: $secret"
+            fi
+          done
+          
+          if [ $missing -gt 0 ]; then
+            echo "❌ فشل: $missing مفاتيح مفقودة"
+            exit 1
+          fi
+          
+          echo "✅ جميع المفاتيح موجودة"
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-        run: python main.py
 
-      - name: Upload generated video (backup artifact)
-        if: always()
-        uses: actions/upload-artifact@v4
+  produce:
+    name: "إنتاج الحلقة"
+    runs-on: ubuntu-22.04
+    needs: validate-secrets
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          name: qeema-output
-          path: qeema_output/**/*.mp4
-          if-no-files-found: ignore
-          retention-days: 7
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
-      - name: Cleanup credentials
+      - name: "Install FFmpeg + Fonts"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg fonts-arabeyes fonts-noto-core fonts-hosny-amiri \
+            python3-bidi libfreetype6-dev
+          echo "✅ FFmpeg وضعت"
+
+      - name: "Install Python Packages"
+        run: |
+          python -m pip install --upgrade pip -q
+          pip install -r requirements.txt -q
+          echo "✅ المكتبات تمام"
+
+      - name: "Verify Imports"
+        run: |
+          python3 -c "
+          modules = ['config','models','script_engine','voice_engine_v2','visual_engine','sfx_engine','video_engine','thumbnail_engine','gamification_engine','orchestrator']
+          for m in modules:
+            try:
+              __import__(m)
+              print(f'✅ {m}')
+            except Exception as e:
+              print(f'❌ {m}')
+              exit(1)
+          "
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            temp/episodes/tts_cache
+            temp/episodes/quran_audio_cache
+            assets/thumbnails
+          key: qeema-cache-${{ github.run_number }}
+          restore-keys: qeema-cache-
+
+      - name: "GCP Setup"
+        if: secrets.GCP_SA_KEY != ''
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          echo "$GCP_SA_KEY" > /tmp/gcp_sa.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_sa.json" >> $GITHUB_ENV
+
+      - name: "Create Dirs"
+        run: |
+          mkdir -p logs temp/episodes/{tts_cache,quran_audio_cache} temp/assembly
+          mkdir -p output/{videos,shorts} assets/{fonts,music,sfx,overlays,thumbnails}
+
+      - name: "Seed"
+        if: github.event.inputs.action == 'seed'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: python main.py --seed
+
+      - name: "Status"
+        if: github.event.inputs.action == 'status'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: python main.py --status
+
+      - name: "Run"
+        if: github.event.inputs.action != 'seed' && github.event.inputs.action != 'status'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          ARGS=""
+          [ -n "${{ github.event.inputs.episode_number }}" ] && ARGS="--episode ${{ github.event.inputs.episode_number }}"
+          [ "${{ github.event.inputs.dry_run }}" = "true" ] && ARGS="$ARGS --dry-run"
+          python main.py $ARGS
+
+      - uses: actions/upload-artifact@v4
         if: always()
-        run: rm -f /tmp/gcp-sa-key.json
+        with:
+          name: episode-${{ github.run_number }}
+          path: |
+            output/videos/*.mp4
+            assets/thumbnails/*.jpg
+            temp/episodes/*/audio/
+            logs/pipeline.log
+          retention-days: 21
+
+      - name: "Cleanup"
+        if: always()
+        run: rm -f /tmp/gcp_sa.json
