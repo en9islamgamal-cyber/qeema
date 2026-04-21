@@ -31,7 +31,7 @@ from tenacity import (
     before_sleep_log,
 )
 
-import google.generativeai as genai
+import google.genai as genai
 
 from config import APIKeys, Paths, VoiceConfig
 from models import AyahScene, EpisodeScript, NarratorScene
