@@ -1,0 +1,32 @@
+# VALUE / QEEMA v2 — Dependencies
+# ─────────────────────────────────────────
+
+# Google AI Studio (Gemini TTS + Script)
+google-generativeai>=0.8.0
+
+# Google Cloud (GCP TTS fallback + YouTube)
+google-api-python-client>=2.130.0
+google-auth>=2.29.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+google-cloud-texttospeech>=2.16.0
+
+# Supabase
+supabase>=2.4.0
+
+# HTTP
+requests>=2.31.0
+httpx>=0.27.0
+tenacity>=8.3.0
+
+# Data validation
+pydantic>=2.7.0
+
+# Image generation & processing
+Pillow>=10.3.0
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
+
+# Utilities
+python-dotenv>=1.0.0
+aiohttp>=3.9.5
