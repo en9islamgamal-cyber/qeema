@@ -20,7 +20,7 @@ from typing import Optional
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-import google.genai as genai
+import google.generativeai as genai
 
 from config import APIKeys, CURRICULUM, Paths
 from models import (
