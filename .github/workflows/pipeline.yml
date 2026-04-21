@@ -1,1 +1,108 @@
 
+name: "VALUE QEEMA Pipeline"
+
+on:
+  schedule:
+    - cron: "0 3 * * 1,4"
+  
+  workflow_dispatch:
+    inputs:
+      episode_number:
+        description: "Episode number (leave empty)"
+        required: false
+        type: string
+      dry_run:
+        description: "Test mode"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  PYTHON_VERSION: "3.11"
+  TZ: "Asia/Kuwait"
+
+jobs:
+  pipeline:
+    name: "Produce Episode"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: "Install FFmpeg"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg fonts-arabeyes fonts-noto-core libfreetype6-dev
+
+      - name: "Install Python packages"
+        run: |
+          pip install --upgrade pip -q
+          pip install -r requirements.txt -q
+
+      - name: "Verify imports"
+        run: python3 -c "import config, models, script_engine, voice_engine_v2, visual_engine, sfx_engine, video_engine, thumbnail_engine, gamification_engine, orchestrator; print('✅ All imports OK')"
+
+      - name: "Create directories"
+        run: |
+          mkdir -p logs temp/episodes/{tts_cache,quran_audio_cache} temp/assembly
+          mkdir -p output/{videos,shorts} assets/{fonts,music,sfx,overlays,thumbnails}
+
+      - name: "Setup GCP"
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          if [ -n "$GCP_SA_KEY" ]; then
+            echo "$GCP_SA_KEY" > /tmp/gcp_sa.json
+            echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_sa.json" >> $GITHUB_ENV
+          fi
+
+      - name: "Restore cache"
+        uses: actions/cache@v4
+        with:
+          path: |
+            temp/episodes/tts_cache
+            temp/episodes/quran_audio_cache
+            assets/thumbnails
+          key: cache-${{ github.run_number }}
+          restore-keys: cache-
+
+      - name: "Run pipeline"
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.episode_number }}" ]; then
+            ARGS="--episode ${{ github.event.inputs.episode_number }}"
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python main.py $ARGS
+
+      - name: "Upload artifacts"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: episode-${{ github.run_number }}
+          path: |
+            output/videos/*.mp4
+            assets/thumbnails/*.jpg
+            logs/pipeline.log
+          retention-days: 21
+
+      - name: "Cleanup"
+        if: always()
+        run: rm -f /tmp/gcp_sa.json
