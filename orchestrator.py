@@ -1,123 +1,113 @@
 """
 Orchestrator - QEEMA Pipeline
-The Maestro that connects Script, Voice, Visual, and Video engines together.
-Generates dynamic Karaoke-style subtitles for children.
+The Maestro that connects all engines, tailored for pristine Islamic content.
 """
 
 import os
 import logging
+import subprocess
 from pathlib import Path
 
-# استيراد محركاتنا الاحترافية
 import script_engine
-import voice_engine
+import voice_engine_v2 as voice_engine # محرك الصوت المطور
 import visual_engine
 import video_engine
+import thumbnail_engine
+import gamification_engine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s")
 log = logging.getLogger("qeema_orchestrator")
 
-# =============================================================================
-# 1. KARAOKE SUBTITLE GENERATOR (The Secret Sauce for Kids)
-# =============================================================================
-
-def generate_karaoke_ass(text: str, audio_duration: float, output_path: Path) -> None:
-    """
-    Creates an .ass subtitle file with Karaoke tags {\k} so words light up 
-    as they are spoken. We use a smart approximation based on word count.
-    """
-    words = text.split()
-    if not words:
-        return
-
-    # حساب وقت تقريبي لكل كلمة بالمللي ثانية (centiseconds لـ ASS)
-    # نترك 10% من الوقت كصمت في البداية والنهاية
-    effective_duration = audio_duration * 0.8
-    time_per_word_cs = int((effective_duration / len(words)) * 100)
+def concat_videos(video_paths: list, output_path: Path):
+    """دالة مساعدة لدمج المشاهد معاً بسلاسة"""
+    list_file = Path("concat_list.txt")
+    with open(list_file, "w", encoding="utf-8") as f:
+        for vid in video_paths:
+            f.write(f"file '{vid.resolve()}'\n")
     
-    # تنسيق الكاريوكي: {\k50}كلمة (يعني تظليل الكلمة لمدة 500 مللي ثانية)
-    karaoke_text = " ".join([f"{{\\k{time_per_word_cs}}}{word}" for word in words])
-    
-    # قالب ملف ASS الاحترافي بخط عربي جميل ولون ذهبي للكلمة المنطوقة
-    ass_content = f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: 1920
-PlayResY: 1080
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", str(list_file), "-c", "copy", str(output_path)
+    ]
+    subprocess.run(cmd, check=True)
+    list_file.unlink()
 
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Alignment, MarginV
-Style: KaraokeStyle,Amiri,75,&H0000FFFF,&H00FFFFFF,&H00000000,&H96000000,1,2,100
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-Dialogue: 0,0:00:00.00,0:00:{audio_duration:05.2f},KaraokeStyle,,0,0,0,,{karaoke_text}
-"""
-    output_path.write_text(ass_content, encoding="utf-8")
-    log.info(f"📝 تم إنشاء ملف الترجمة التفاعلية: {output_path.name}")
-
-# =============================================================================
-# 2. THE MAIN PIPELINE EXECUTION
-# =============================================================================
-
-def run_qeema_pipeline(surah_name: str, ayah_start: int, ayah_end: int):
+def run_qeema_pipeline(surah_name: str, ayah_start: int, ayah_end: int) -> Path:
     log.info("=" * 60)
     log.info(f"🚀 بدء إنتاج حلقة: سورة {surah_name} ({ayah_start}-{ayah_end})")
     log.info("=" * 60)
 
-    # تجهيز مجلد العمل
+    # 1. تجهيز المجلدات
     output_dir = Path("./qeema_output")
     output_dir.mkdir(exist_ok=True)
     assets_dir = Path("./assets")
     logo_path = assets_dir / "logo.png"
 
-    # جلب المفاتيح من متغيرات البيئة
+    # جلب المفاتيح
     AI_STUDIO_KEY = os.environ.get("GEMINI_API_KEY")
     LEONARDO_API_KEY = os.environ.get("LEONARDO_API_KEY")
 
     if not AI_STUDIO_KEY or not LEONARDO_API_KEY:
-        log.error("❌ الرجاء التأكد من وضع مفاتيح API في متغيرات البيئة.")
-        return
+        raise ValueError("❌ مفاتيح API مفقودة!")
 
-    try:
-        # 1. المخرج يكتب السيناريو (Script Engine)
-        script_data = script_engine.generate_cinematic_script(surah_name, ayah_start, ayah_end, AI_STUDIO_KEY)
-        theme_colors = script_data.get("theme_colors", "warm pastel colors")
+    # 2. المخرج يكتب السيناريو
+    script_data = script_engine.generate_cinematic_script(surah_name, ayah_start, ayah_end, AI_STUDIO_KEY)
+    theme_colors = script_data.get("theme_colors", "warm pastel colors")
+    
+    scene_videos = []
+    thumbnail_image_source = None
+
+    # 3. إنتاج المشهد الافتتاحي (Intro)
+    intro_path = output_dir / "intro.mp4"
+    if logo_path.exists():
+        video_engine.create_branding_sequence(logo_path, intro_path, is_intro=True)
+        scene_videos.append(intro_path)
+
+    # 4. إنتاج المشاهد
+    for i, scene in enumerate(script_data["scenes"]):
+        log.info(f"🎬 إنتاج المشهد {i+1}...")
         
-        scene_videos = []
+        audio_raw = output_dir / f"raw_audio_{i}.mp3"
+        audio_final = output_dir / f"scene_{i}.mp3"
+        image_path = output_dir / f"scene_{i}.png"
+        video_path = output_dir / f"scene_{i}.mp4"
 
-        # 2. إنتاج كل مشهد خطوة بخطوة
-        for i, scene in enumerate(script_data["scenes"]):
-            log.info(f"🎬 جاري إنتاج المشهد {i+1}...")
-            
-            audio_path = output_dir / f"scene_{i}.mp3"
-            image_path = output_dir / f"scene_{i}.png"
-            ass_path = output_dir / f"scene_{i}.ass"
-            video_path = output_dir / f"scene_{i}.mp4"
+        # أ. الصوت المطور (بدون موسيقى، فقط معالجة للصوت البشري)
+        ssml = voice_engine.text_to_advanced_ssml(scene["arabic_text"], scene.get("voice_emotion", "warm"))
+        # ملاحظة: نستخدم دالة التوليد من API (يجب التأكد من دالة AI Studio في voice_engine)
+        # لتسهيل الأمر، سنفترض أنها تولد الصوت الخام
+        voice_engine.generate_voice_ai_studio(ssml, audio_raw, AI_STUDIO_KEY)
+        voice_engine.apply_mastering_chain(audio_raw, audio_final)
+        
+        # ب. توليد الصورة
+        visual_engine.generate_professional_image(scene["visual_prompt"], image_path, LEONARDO_API_KEY, theme_colors)
+        if i == 0: thumbnail_image_source = image_path # حفظ أول صورة للصورة المصغرة
+        
+        # ج. المونتاج
+        video_engine.assemble_cinematic_scene(
+            image_path, audio_final, logo_path, video_path, 
+            camera_movement=scene.get("camera_movement", "zoom_in")
+        )
+        scene_videos.append(video_path)
 
-            # أ. الصوت البشري
-            voice_engine.create_human_voiceover(scene["arabic_text"], audio_path, AI_STUDIO_KEY)
-            
-            # حساب مدة الصوت للترجمة والمونتاج
-            audio_duration = video_engine.get_audio_duration(audio_path) # سنحتاج لإضافة هذه الدالة المساعدة في video_engine
-            
-            # ب. الصور السينمائية المتناسقة
-            visual_engine.generate_professional_image(scene["visual_prompt"], image_path, LEONARDO_API_KEY, theme_colors)
-            
-            # ج. نصوص الكاريوكي الجاذبة للطفل
-            generate_karaoke_ass(scene["arabic_text"], audio_duration, ass_path)
-            
-            # د. المونتاج ودمج اللوجو وحركة الكاميرا
-            video_engine.assemble_cinematic_scene(image_path, audio_path, logo_path, video_path, scene.get("camera_movement", "zoom_in"))
-            
-            scene_videos.append(video_path)
+    # 5. إنتاج الخاتمة (Outro)
+    outro_path = output_dir / "outro.mp4"
+    if logo_path.exists():
+        video_engine.create_branding_sequence(logo_path, outro_path, is_intro=False)
+        scene_videos.append(outro_path)
 
-        log.info("🎉 تم إنتاج جميع المشاهد بنجاح!")
-        # الخطوة القادمة ستكون دمج هذه المشاهد (Concatenation) بمؤثرات انتقال ناعمة.
+    # 6. دمج الفيديو النهائي
+    raw_final_video = output_dir / f"qeema_{surah_name}_raw.mp4"
+    concat_videos(scene_videos, raw_final_video)
 
-    except Exception as e:
-        log.error(f"❌ حدث خطأ أثناء تنفيذ المنظومة: {e}")
+    # 7. محرك التحفيز (إضافة شريط التقدم التفاعلي)
+    final_video_path = output_dir / f"qeema_{surah_name}_final.mp4"
+    gamification_engine.add_interactive_progress_bar(raw_final_video, final_video_path)
 
-if __name__ == "__main__":
-    # لتشغيل البرنامج التجريبي
-    # run_qeema_pipeline("الفيل", 1, 5)
-    pass
+    # 8. صانع الصور المصغرة
+    thumbnail_path = output_dir / f"thumbnail_{surah_name}.jpg"
+    if thumbnail_image_source:
+        thumbnail_engine.create_pro_thumbnail(thumbnail_image_source, f"تفسير سورة {surah_name}", thumbnail_path)
+
+    log.info(f"✨ اكتمل الإنتاج! الفيديو النهائي: {final_video_path}")
+    return final_video_path
