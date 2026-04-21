@@ -2,6 +2,9 @@
 Gamification Engine - QEEMA Pipeline
 Adds visual progress bars and interactive end-screens.
 """
+import subprocess
+from pathlib import Path
+
 def add_interactive_progress_bar(video_p: Path, output_p: Path):
     """
     يرسم شريط تقدم (Progress Bar) في أسفل الفيديو يتحرك مع الوقت.
