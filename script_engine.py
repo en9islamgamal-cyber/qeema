@@ -403,7 +403,8 @@ class ScriptEngine:
                 except Exception as e:
                     error_msg = str(e)
                     
-                    if "429" in error_msg or "Too Many Requests" in error_msg or "Quota" in error_msg:
+                    # 💡 إضافة الأخطاء 503 و 500 للمحاولة مرة أخرى بدلاً من التخطي الفوري
+                    if any(err in error_msg for err in ["429", "503", "500", "502", "Too Many Requests", "Quota"]):
                         if "quota" in error_msg.lower():
                             logger.error(f"❌ نفاذ الحصة لنموذج {model_name}. سيتم تخطيه.")
                             errors.append(f"{model_name}: Quota Exhausted")
@@ -411,12 +412,12 @@ class ScriptEngine:
                             
                         if attempt < max_retries - 1:
                             wait_time = base_wait * (2 ** attempt)
-                            logger.warning(f"⚠️ ضغط على خوادم {model_name}. ننتظر {wait_time}ث...")
+                            logger.warning(f"⚠️ مشكلة بالخوادم ({model_name}). ننتظر {wait_time}ث...")
                             time.sleep(wait_time)
                             continue
                         else:
                             logger.error(f"❌ استنفاد محاولات {model_name}.")
-                            errors.append(f"{model_name}: Rate Limit Exhausted")
+                            errors.append(f"{model_name}: Rate Limit / Server Error Exhausted")
                             break 
                             
                     elif "credit balance" in error_msg.lower() or "billing" in error_msg.lower():
