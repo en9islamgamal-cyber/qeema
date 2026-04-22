@@ -3,11 +3,10 @@ name: "VALUE QEEMA Pipeline"
 on:
   schedule:
     - cron: "0 3 * * 1,4"
-  
   workflow_dispatch:
     inputs:
       episode_number:
-        description: "Episode number (leave empty)"
+        description: "Episode number (leave empty for auto)"
         required: false
         type: string
       dry_run:
@@ -28,51 +27,59 @@ jobs:
     timeout-minutes: 180
     
     steps:
-      - uses: actions/checkout@v4
-      
-      - uses: actions/setup-python@v5
+      - name: "Checkout Code"
+        uses: actions/checkout@v4
+        
+      - name: "Setup Python"
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: "Install FFmpeg"
+      - name: "Install System Dependencies (FFmpeg & Fonts)"
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg fonts-arabeyes fonts-noto-core libfreetype6-dev
 
-      - name: "Install Python packages"
+      - name: "Install Python Packages"
         run: |
-          pip install --upgrade pip -q
+          python -m pip install --upgrade pip -q
           pip install -r requirements.txt -q
 
-      - name: "Verify imports"
+      - name: "Verify Imports (Sanity Check)"
         run: python3 -c "import config, models, script_engine, voice_engine_v2, visual_engine, sfx_engine, video_engine, thumbnail_engine, gamification_engine, orchestrator; print('✅ All imports OK')"
 
-      - name: "Create directories"
+      - name: "Create Required Directories"
         run: |
           mkdir -p logs temp/episodes/{tts_cache,quran_audio_cache} temp/assembly
           mkdir -p output/{videos,shorts} assets/{fonts,music,sfx,overlays,thumbnails}
 
-      - name: "Setup GCP"
+      - name: "Setup GCP Credentials"
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: |
           if [ -n "$GCP_SA_KEY" ]; then
             echo "$GCP_SA_KEY" > /tmp/gcp_sa.json
             echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_sa.json" >> $GITHUB_ENV
+            echo "✅ GCP credentials configured."
+          else
+            echo "⚠️ GCP_SA_KEY is not set."
           fi
 
-      - name: "Restore cache"
+      - name: "Smart Cache Management"
         uses: actions/cache@v4
         with:
           path: |
             temp/episodes/tts_cache
             temp/episodes/quran_audio_cache
             assets/thumbnails
-          key: cache-${{ github.run_number }}
-          restore-keys: cache-
+          # استخدمنا بادئة ثابتة مع رقم الرن الحالي كـ Key
+          key: qeema-assets-v1-${{ github.run_number }}
+          # هذا السطر العبقري يضمن سحب آخر كاش متوفر إذا لم نجد الكاش الخاص بالرن الحالي
+          restore-keys: |
+            qeema-assets-v1-
 
-      - name: "Run pipeline"
+      - name: "Run Pipeline with Auto-Retry (Anti-Failure Shield)"
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
@@ -82,6 +89,7 @@ jobs:
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }} # 👈 تم دمج مفتاح كوهير بنجاح
         run: |
           ARGS=""
           if [ -n "${{ github.event.inputs.episode_number }}" ]; then
@@ -90,19 +98,33 @@ jobs:
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
           fi
-          python main.py $ARGS
+          
+          # 💡 حلقة تكرار ذكية (Retry Loop):
+          # إذا انهار السكريبت بالكامل بسبب مشكلة شبكة أو سيرفر خارج التغطية، سيحاول GitHub 3 مرات
+          max_retries=3
+          attempt=1
+          until python main.py $ARGS; do
+            exit_code=$?
+            if [ $attempt -ge $max_retries ]; then
+              echo "❌ Pipeline failed permanently after $max_retries attempts."
+              exit $exit_code
+            fi
+            echo "⚠️ Pipeline crashed with exit code $exit_code. Retrying in 60 seconds... (Attempt $attempt/$max_retries)"
+            sleep 60
+            attempt=$((attempt + 1))
+          done
 
-      - name: "Upload artifacts"
+      - name: "Upload Artifacts"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: episode-${{ github.run_number }}
+          name: episode-results-${{ github.run_number }}
           path: |
             output/videos/*.mp4
             assets/thumbnails/*.jpg
-            logs/pipeline.log
+            logs/*.log
           retention-days: 21
 
-      - name: "Cleanup"
+      - name: "Cleanup Secrets"
         if: always()
         run: rm -f /tmp/gcp_sa.json
