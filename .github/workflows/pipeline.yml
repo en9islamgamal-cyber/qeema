@@ -6,45 +6,61 @@ on:
   workflow_dispatch:
     inputs:
       episode_number:
-        description: "Episode number"
+        description: "Episode number to produce (leave empty for auto)"
         required: false
         type: string
+
+env:
+  PYTHON_VERSION: "3.11"
+  TZ: "Asia/Kuwait"
 
 jobs:
   pipeline:
     name: "Produce Episode"
     runs-on: ubuntu-22.04
     timeout-minutes: 180
-    
+
     steps:
-      - name: "Checkout Code"
+      - name: "Step 1: Checkout Code"
         uses: actions/checkout@v4
-        
-      - name: "Setup Python"
+
+      - name: "Step 2: Setup Python"
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: pip
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip' # تسريع تثبيت المكتبات
 
-      - name: "Install System Dependencies"
+      - name: "Step 3: Install System Dependencies"
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg fonts-noto-core libfreetype6-dev
+          echo "✅ System dependencies installed."
 
-      - name: "Create Required Directories"
-        run: mkdir -p logs temp/episodes output/videos assets/thumbnails
+      - name: "Step 4: Create Required Directories"
+        run: |
+          # إنشاء كافة المسارات التي يحتاجها الكود لمنع خطأ FileNotFoundError
+          mkdir -p logs temp/episodes/tts_cache temp/assembly output/videos assets/thumbnails
+          echo "✅ Directories created."
 
-      - name: "Install Python Packages"
-        run: pip install -r requirements.txt -q
+      - name: "Step 5: Install Python Packages"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -q
+          echo "✅ Python packages installed."
 
-      - name: "Setup Google Cloud Credentials"
+      - name: "Step 6: Setup Google Cloud Credentials"
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: |
+          if [ -z "$GCP_SA_KEY" ]; then
+            echo "❌ Error: GCP_SA_KEY is missing in GitHub Secrets!"
+            exit 1
+          fi
           echo "$GCP_SA_KEY" > /tmp/gcp_sa.json
           echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_sa.json" >> $GITHUB_ENV
+          echo "✅ Google Cloud Credentials configured."
 
-      - name: "Run Pipeline"
+      - name: "Step 7: Run Pipeline with Intelligent Retry"
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
@@ -61,12 +77,37 @@ jobs:
             ARGS="--episode ${{ github.event.inputs.episode_number }}"
           fi
           
-          # المحاولة الأولى فقط، وإذا فشلت نخرج بكود خطأ حقيقي
-          python main.py $ARGS
+          # نظام إعادة المحاولة الذكي (3 محاولات)
+          max_retries=3
+          attempt=1
+          success=false
           
-      - name: "Upload Logs on Failure"
-        if: failure()
+          until [ $attempt -gt $max_retries ]; do
+            echo "🚀 Attempt $attempt of $max_retries..."
+            # نستخدم python -u للحصول على Logs فورية
+            if python -u main.py $ARGS; then
+              echo "✅ Pipeline finished successfully!"
+              success=true
+              break
+            else
+              echo "⚠️ Attempt $attempt failed. Retrying in 60 seconds..."
+              sleep 60
+              attempt=$((attempt + 1))
+            fi
+          done
+          
+          if [ "$success" = false ]; then
+            echo "❌ Pipeline failed after $max_retries attempts."
+            exit 1
+          fi
+
+      - name: "Step 8: Upload Artifacts"
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: failure-logs
-          path: logs/*.log
+          name: episode-results-${{ github.run_number }}
+          path: |
+            output/videos/*.mp4
+            assets/thumbnails/*.jpg
+            logs/*.log
+          retention-days: 21
