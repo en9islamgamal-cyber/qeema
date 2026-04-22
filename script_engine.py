@@ -2,7 +2,7 @@
 script_engine.py — VALUE / QEEMA v2.1
 ═══════════════════════════════════════════════════════
 محرك السكريبت — Production Hardened
-• Gemini 2.5 Pro (stable) → Gemini 3.1 Pro → Claude (fallback chain)
+• Gemini Pro → Gemini Flash → Cohere → Claude (fallback chain)
 • النص القرآني: مصدر موثوق فقط (qurancdn API + fallback dict)
 • 5 طبقات حماية من الهلوسة
 • Verse caching: الآيات تتجاب مرة واحدة فقط
@@ -33,6 +33,13 @@ try:
 except ImportError:
     _ANTHROPIC_AVAILABLE = False
 
+# ── Cohere fallback (اختياري) ──
+try:
+    import cohere
+    _COHERE_AVAILABLE = True
+except ImportError:
+    _COHERE_AVAILABLE = False
+
 from config import APIKeys, CURRICULUM, Paths
 from models import (
     AyahScene,
@@ -51,6 +58,10 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════
 PRIMARY_MODEL = os.getenv("QEEMA_PRIMARY_MODEL", "gemini-2.5-pro")
 FALLBACK_MODEL = os.getenv("QEEMA_FALLBACK_MODEL", "gemini-3.1-pro-preview")
+
+USE_COHERE_FALLBACK = os.getenv("QEEMA_USE_COHERE_FALLBACK", "true").lower() == "true"
+COHERE_MODEL = os.getenv("QEEMA_COHERE_MODEL", "command-r") # Command-R ممتاز للسكريبتات والـ JSON
+
 USE_CLAUDE_FALLBACK = os.getenv("QEEMA_USE_CLAUDE_FALLBACK", "true").lower() == "true"
 CLAUDE_MODEL = os.getenv("QEEMA_CLAUDE_MODEL", "claude-opus-4-7")
 
@@ -109,7 +120,7 @@ QURAN_FALLBACK: dict[tuple[int, int], str] = {
 class QuranTextFetcher:
     """يجلب النص القرآني من API موثوق — لا يُولَّد أبداً"""
 
-    API_URL = "[https://api.qurancdn.com/api/qdc/verses/by_key/](https://api.qurancdn.com/api/qdc/verses/by_key/){surah}:{ayah}?words=false&fields=text_uthmani"
+    API_URL = "https://api.qurancdn.com/api/qdc/verses/by_key/{surah}:{ayah}?words=false&fields=text_uthmani"
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
     def fetch(self, surah: int, ayah: int) -> str:
@@ -217,8 +228,7 @@ class QuranIntegrityGuard:
 class ScriptEngine:
     """
     يولد سكريبت الحلقة باستخدام chain من الموديلات:
-    Gemini 2.5 Pro → Gemini 3.1 Pro Preview → Claude
-    مع التزام كامل بأمانة النص القرآني ومعالجة ذكية للأخطاء
+    Gemini 2.5 Pro → Gemini 3.1 Pro Preview → Gemini Flash → Cohere → Claude
     """
 
     SYSTEM_PROMPT = """أنت كاتب محتوى متخصص في تعليم القرآن الكريم للأطفال من سن 5-6 سنوات.
@@ -234,10 +244,22 @@ class ScriptEngine:
         if not APIKeys.GEMINI:
             raise ValueError("GEMINI_API_KEY غير موجود")
 
-        # Gemini client (الـ SDK الجديد)
+        # Gemini client
         self.gemini_client = genai.Client(api_key=APIKeys.GEMINI)
 
-        # Claude client (اختياري — fallback نهائي)
+        # Cohere client
+        self.cohere_client: Optional["cohere.Client"] = None
+        if USE_COHERE_FALLBACK and _COHERE_AVAILABLE:
+            cohere_key = os.getenv("COHERE_API_KEY")
+            if cohere_key:
+                self.cohere_client = cohere.Client(api_key=cohere_key)
+                logger.info(f"✅ Cohere fallback جاهز ({COHERE_MODEL})")
+            else:
+                logger.warning("⚠️ COHERE_API_KEY غير متوفر — Cohere fallback معطّل")
+        elif USE_COHERE_FALLBACK and not _COHERE_AVAILABLE:
+            logger.warning("⚠️ مكتبة cohere غير مُثبّتة — نفّذ: pip install cohere")
+
+        # Claude client
         self.claude_client: Optional["anthropic.Anthropic"] = None
         if USE_CLAUDE_FALLBACK and _ANTHROPIC_AVAILABLE:
             anthropic_key = os.getenv("ANTHROPIC_API_KEY")
@@ -252,12 +274,6 @@ class ScriptEngine:
         self.text_fetcher = QuranTextFetcher()
         self.guard        = QuranIntegrityGuard()
 
-        logger.info(
-            f"🔧 Models — Primary: {PRIMARY_MODEL} | "
-            f"Fallback: {FALLBACK_MODEL} | "
-            f"Claude: {'ON' if self.claude_client else 'OFF'}"
-        )
-
     def generate(self, episode_num: int) -> EpisodeScript:
         """يولد سكريبت حلقة كاملة ومُحقَّق"""
         if episode_num not in CURRICULUM:
@@ -270,17 +286,16 @@ class ScriptEngine:
         s_end   = info["end"]
         n_ayahs = s_end - s_start + 1
 
-        # STEP 1: جلب الآيات من المصدر الموثوق (مرة واحدة فقط)
+        # STEP 1: جلب الآيات من المصدر الموثوق
         logger.info(f"📖 جلب {n_ayahs} آيات من سورة {sname}…")
         verified_ayahs = self.text_fetcher.fetch_surah(surah, s_start, s_end)
 
-        # تمرير معلومات الآيات بدون طلب توليد نصوص
         ayah_refs = "\n".join([
             f"[AYAH_{a.number}] — الآية رقم {a.number} (لا تكتب نصها)"
             for a in verified_ayahs
         ])
 
-        # STEP 2: توليد السكريبت (fallback chain)
+        # STEP 2: توليد السكريبت
         prompt = f"""اكتب سكريبت حلقة تعليمية كاملة عن سورة {sname} (سورة رقم {surah}).
 عدد الآيات: {n_ayahs} آيات.
 
@@ -347,20 +362,24 @@ class ScriptEngine:
     # Fallback chain (Smart Error Handling)
     # ──────────────────────────────────────
     def _call_ai_with_fallback(self, prompt: str) -> dict:
-        """
-        يجرّب الموديلات بالترتيب مع التراجع الأسي الذكي للأخطاء.
-        """
         models_queue = []
         
+        # 1. Primary
         if PRIMARY_MODEL:
             models_queue.append((PRIMARY_MODEL, self._call_gemini))
             
+        # 2. Fallback
         if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
             models_queue.append((FALLBACK_MODEL, self._call_gemini))
             
-        # 💡 [إضافة الطوارئ]: نموذج Flash يمتلك Limit مجاني عالي جداً (15 ضعف نماذج Pro)
+        # 3. Emergency Flash (High Limit)
         models_queue.append(("gemini-2.5-flash", self._call_gemini))
 
+        # 4. Cohere
+        if self.cohere_client is not None:
+            models_queue.append((COHERE_MODEL, self._call_cohere))
+
+        # 5. Claude
         if self.claude_client is not None:
             models_queue.append((CLAUDE_MODEL, self._call_claude))
 
@@ -369,9 +388,8 @@ class ScriptEngine:
         for model_name, call_func in models_queue:
             logger.info(f"🤖 جاري المحاولة باستخدام: {model_name}...")
             
-            # إعدادات التراجع الأسي لـ Rate Limits فقط
-            max_retries = 4
-            base_wait = 10 # الثواني: 10، 20، 40، 80
+            max_retries = 3
+            base_wait = 10 
 
             for attempt in range(max_retries):
                 try:
@@ -385,47 +403,37 @@ class ScriptEngine:
                 except Exception as e:
                     error_msg = str(e)
                     
-                    # 1. التحقق من أخطاء الـ Rate Limit (429)
                     if "429" in error_msg or "Too Many Requests" in error_msg or "Quota" in error_msg:
-                        
-                        # التفرقة الذكية: إذا نفدت الحصة اليومية فلا فائدة من الانتظار
                         if "quota" in error_msg.lower():
-                            logger.error(f"❌ نفاذ الحصة (Quota) لنموذج {model_name}. سيتم تخطيه فوراً.")
-                            errors.append(f"{model_name}: Daily Quota Exhausted")
+                            logger.error(f"❌ نفاذ الحصة لنموذج {model_name}. سيتم تخطيه.")
+                            errors.append(f"{model_name}: Quota Exhausted")
                             break
                             
                         if attempt < max_retries - 1:
                             wait_time = base_wait * (2 ** attempt)
-                            logger.warning(
-                                f"⚠️ ضغط على خوادم {model_name} (الخطأ 429). "
-                                f"المحاولة {attempt + 1}/{max_retries}. ننتظر {wait_time} ثانية..."
-                            )
+                            logger.warning(f"⚠️ ضغط على خوادم {model_name}. ننتظر {wait_time}ث...")
                             time.sleep(wait_time)
                             continue
                         else:
-                            logger.error(f"❌ استنفاد محاولات {model_name} بسبب الضغط (Rate Limit).")
-                            errors.append(f"{model_name}: Rate Limit (429) Exhausted")
-                            break # الخروج من المحاولات والانتقال للنموذج التالي
+                            logger.error(f"❌ استنفاد محاولات {model_name}.")
+                            errors.append(f"{model_name}: Rate Limit Exhausted")
+                            break 
                             
-                    # 2. التحقق من أخطاء الرصيد (مثل Claude)
-                    elif "credit balance is too low" in error_msg.lower() or "billing" in error_msg.lower():
-                        logger.error(f"❌ خطأ مالي في {model_name} (الرصيد غير كافٍ). سيتم تخطيه فوراً.")
-                        errors.append(f"{model_name}: Insufficient Credits/Billing")
-                        break # الخروج فوراً للنموذج التالي، لا حاجة للانتظار
+                    elif "credit balance" in error_msg.lower() or "billing" in error_msg.lower():
+                        logger.error(f"❌ خطأ مالي في {model_name}. سيتم تخطيه.")
+                        errors.append(f"{model_name}: Insufficient Credits")
+                        break 
                         
-                    # 3. أي أخطاء أخرى غير متوقعة (Bad Request, Server Error, etc)
                     else:
-                        logger.error(f"❌ خطأ غير متوقع في {model_name}: {error_msg}")
+                        logger.error(f"❌ خطأ في {model_name}: {error_msg}")
                         errors.append(f"{model_name}: {type(e).__name__} - {error_msg[:100]}")
-                        break # ننتقل للنموذج التالي
+                        break
 
         raise RuntimeError(
             "فشلت كل الموديلات في توليد السكريبت:\n  - " + "\n  - ".join(errors)
         )
 
-    # ⚠️ تمت إزالة @retry من هنا لأننا نعالج الأخطاء بذكاء داخل _call_ai_with_fallback
     def _call_gemini(self, model: str, prompt: str) -> str:
-        """استدعاء Gemini بالـ SDK الجديد."""
         config = genai_types.GenerateContentConfig(
             temperature=0.72,
             max_output_tokens=6000,
@@ -440,9 +448,22 @@ class ScriptEngine:
         if not text:
             raise RuntimeError(f"استجابة فارغة من {model}")
         return text
+        
+    def _call_cohere(self, prompt: str) -> str:
+        """استدعاء Cohere"""
+        assert self.cohere_client is not None
+        response = self.cohere_client.chat(
+            message=prompt,
+            preamble=self.SYSTEM_PROMPT, # Preamble = System Prompt في كوهير
+            model=COHERE_MODEL,
+            temperature=0.7
+        )
+        text = response.text.strip()
+        if not text:
+            raise RuntimeError(f"استجابة فارغة من {COHERE_MODEL}")
+        return text
 
     def _call_claude(self, prompt: str) -> str:
-        """استدعاء Claude كـ fallback نهائي."""
         assert self.claude_client is not None
         message = self.claude_client.messages.create(
             model=CLAUDE_MODEL,
@@ -457,18 +478,10 @@ class ScriptEngine:
 
     @staticmethod
     def _parse_json(raw: str) -> dict:
-        """ينضّف الكود من علامات التنسيق (backticks) ويحوّله لـ dict."""
-        # ⚠️ الحل النهائي لمشكلة SyntaxError:
-        # نستخدم الكود السداسي العشري الخاص بالـ backticks \x60 لتفادي أخطاء محررات النصوص
-        
         cleaned = re.sub(r"^\x60{3}(?:json)?\s*", "", raw, flags=re.MULTILINE)
         cleaned = re.sub(r"\s*\x60{3}$", "", cleaned, flags=re.MULTILINE)
-        
         return json.loads(cleaned)
 
-    # ──────────────────────────────────────
-    # Script builder (بدون تغيير)
-    # ──────────────────────────────────────
     def _build_script(
         self,
         ep_num: int,
@@ -476,10 +489,8 @@ class ScriptEngine:
         data: dict,
         verified_ayahs: list[VerifiedAyah],
     ) -> EpisodeScript:
-        """يبني نموذج EpisodeScript المُحقَّق"""
         ayah_map = {a.number: a for a in verified_ayahs}
 
-        # مشهد الافتتاح
         intro_raw = data["intro_scene"]
         intro = NarratorScene(
             scene_id=intro_raw["scene_id"],
@@ -491,7 +502,6 @@ class ScriptEngine:
             mood=AudioMood(intro_raw.get("mood", "intro")),
         )
 
-        # مشاهد الآيات — حقن النصوص المُحقَّقة
         ayah_scenes = []
         for i, raw in enumerate(data.get("ayah_scenes", [])):
             ayah_num = raw["ayah_number"]
@@ -500,7 +510,7 @@ class ScriptEngine:
 
             ayah_scenes.append(AyahScene(
                 scene_id=raw["scene_id"],
-                ayah=ayah_map[ayah_num],    # ← النص الموثوق فقط
+                ayah=ayah_map[ayah_num],
                 intro_text=raw["intro_text"],
                 explain_text=raw["explain_text"],
                 visual_prompt=raw["visual_prompt"],
@@ -508,7 +518,6 @@ class ScriptEngine:
                 duration_sec=float(raw.get("duration_sec", 35)),
             ))
 
-        # مشاهد وسطى (اختيارية)
         mid_scenes = []
         for raw in data.get("mid_scenes", []):
             mid_scenes.append(NarratorScene(
@@ -520,7 +529,6 @@ class ScriptEngine:
                 mood=AudioMood(raw.get("mood", "calm")),
             ))
 
-        # الخاتمة
         outro_raw = data["outro_scene"]
         outro = NarratorScene(
             scene_id=outro_raw["scene_id"],
@@ -549,7 +557,6 @@ class ScriptEngine:
         )
 
     def load_from_disk(self, episode_num: int) -> Optional[EpisodeScript]:
-        """يستأنف سكريبت محفوظ من القرص"""
         p = Paths.SCRIPT_DIR / f"episode_{episode_num:03d}.json"
         if p.exists():
             data = json.loads(p.read_text(encoding="utf-8"))
