@@ -1,8 +1,9 @@
-# VALUE / QEEMA v2 — Dependencies
+# VALUE / QEEMA v2.1 — Dependencies
 # ─────────────────────────────────────────
 
-# Google AI Studio (Gemini TTS + Script)
-google-generativeai>=0.8.0
+# AI SDKs — Gemini + Claude fallback
+google-genai>=1.17.0
+anthropic>=0.40.0
 
 # Google Cloud (GCP TTS fallback + YouTube)
 google-api-python-client>=2.130.0
@@ -30,4 +31,3 @@ python-bidi>=0.4.2
 # Utilities
 python-dotenv>=1.0.0
 aiohttp>=3.9.5
-
