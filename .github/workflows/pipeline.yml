@@ -73,9 +73,7 @@ jobs:
             temp/episodes/tts_cache
             temp/episodes/quran_audio_cache
             assets/thumbnails
-          # استخدمنا بادئة ثابتة مع رقم الرن الحالي كـ Key
           key: qeema-assets-v1-${{ github.run_number }}
-          # هذا السطر العبقري يضمن سحب آخر كاش متوفر إذا لم نجد الكاش الخاص بالرن الحالي
           restore-keys: |
             qeema-assets-v1-
 
@@ -89,7 +87,7 @@ jobs:
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }} # 👈 تم دمج مفتاح كوهير بنجاح
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
         run: |
           ARGS=""
           if [ -n "${{ github.event.inputs.episode_number }}" ]; then
@@ -99,8 +97,7 @@ jobs:
             ARGS="$ARGS --dry-run"
           fi
           
-          # 💡 حلقة تكرار ذكية (Retry Loop):
-          # إذا انهار السكريبت بالكامل بسبب مشكلة شبكة أو سيرفر خارج التغطية، سيحاول GitHub 3 مرات
+          # حلقة تكرار ذكية لتفادي الأعطال المفاجئة (مثل انقطاع الاتصال)
           max_retries=3
           attempt=1
           until python main.py $ARGS; do
