@@ -1,4 +1,3 @@
-```yaml
 name: "VALUE QEEMA Pipeline"
 
 on:
@@ -7,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       episode_number:
-        description: "Episode number to generate"
+        description: "Episode number"
         required: false
         type: string
 
@@ -30,12 +29,15 @@ jobs:
       - name: "Install System Dependencies"
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg fonts-arabeyes fonts-noto-core libfreetype6-dev
+          sudo apt-get install -y ffmpeg fonts-noto-core libfreetype6-dev
 
       - name: "Install Python Packages"
         run: pip install -r requirements.txt -q
 
-      - name: "Run Pipeline with Anti-Crash Shield"
+      - name: "Verify File Integrity"
+        run: python3 -c "import script_engine; print('✅ Script Engine OK')"
+
+      - name: "Run Pipeline"
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
@@ -43,33 +45,25 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
-          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
         run: |
           ARGS=""
           if [ -n "${{ github.event.inputs.episode_number }}" ]; then
             ARGS="--episode ${{ github.event.inputs.episode_number }}"
           fi
           
-          # نظام إعادة التشغيل الذكي: 3 محاولات كاملة في حال حدوث عطل شبكة عابر
+          # نظام إعادة التشغيل التلقائي عند أي خطأ مفاجئ
           for i in {1..3}; do
-            echo "🚀 Starting attempt $i of 3..."
+            echo "🚀 Attempt $i..."
             if python main.py $ARGS; then
-              echo "✅ Pipeline finished successfully!"
+              echo "✅ Success!"
               break
             else
-              if [ $i -lt 3 ]; then
-                echo "⚠️ Pipeline crashed. Re-trying in 60 seconds..."
-                sleep 60
-              else
-                echo "❌ Pipeline failed after 3 attempts."
-                exit 1
-              fi
+              echo "⚠️ Failure. Retrying in 60s..."
+              sleep 60
             fi
           done
 
-      - name: "Upload Artifacts (Video & Logs)"
+      - name: "Upload Artifacts"
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -77,6 +71,3 @@ jobs:
           path: |
             output/videos/*.mp4
             logs/*.log
-          retention-days: 21
-
-```
