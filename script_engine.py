@@ -1,4 +1,3 @@
-```python
 """
 script_engine.py — VALUE / QEEMA v2.1
 ═══════════════════════════════════════════════════════
@@ -450,8 +449,7 @@ class ScriptEngine:
     def _parse_json(raw: str) -> dict:
         """ينضّف الكود من علامات التنسيق (backticks) ويحوّله لـ dict."""
         # ⚠️ الحل النهائي لمشكلة SyntaxError:
-        # بدلاً من كتابة علامات (backticks) بشكل صريح والتي تكسر الكود عند نسخه
-        # نستخدم الكود السداسي العشري الخاص بها \x60 لتفادي أخطاء محررات النصوص و GitHub Actions
+        # نستخدم الكود السداسي العشري الخاص بالـ backticks \x60 لتفادي أخطاء محررات النصوص
         
         cleaned = re.sub(r"^\x60{3}(?:json)?\s*", "", raw, flags=re.MULTILINE)
         cleaned = re.sub(r"\s*\x60{3}$", "", cleaned, flags=re.MULTILINE)
@@ -548,5 +546,3 @@ class ScriptEngine:
             logger.info(f"♻️ استئناف سكريبت: {p.name}")
             return EpisodeScript.model_validate(data)
         return None
-
-```
