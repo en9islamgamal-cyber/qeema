@@ -1,4 +1,3 @@
-```python
 import logging
 import os
 import json
@@ -75,5 +74,3 @@ class AnthropicAdapter(BaseModelAdapter):
             messages=[{"role": "user", "content": prompt}], temperature=0.7
         )
         return extract_json(response.content[0].text)
-
-```
