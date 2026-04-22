@@ -1,11 +1,10 @@
 """
-script_engine.py — VALUE / QEEMA v2.2 (FIXED)
+script_engine.py — VALUE / QEEMA v2.1
 ═══════════════════════════════════════════════════════
-إصلاحات أساسية:
-✅ Smart rate limiting مع adaptive backoff
-✅ Better fallback strategy (Cohere أولاً بدل Gemini)
-✅ Robust JSON parsing من جميع الـ models
-✅ Proper error messages وـ retries
+محرك السكريبت المطور - نظام السرد القصصي الشامل
+• Strategy: Holistic Prompting (تفسير شامل للسورة لتقليل الكوتة)
+• Persona: الجد أبو زياد (عالم أزهري، حنون، دافئ)
+• Visuals: Pixar 3D Cinematic Style (English Prompts)
 ═══════════════════════════════════════════════════════
 """
 
@@ -49,21 +48,9 @@ from models import (
 
 logger = logging.getLogger(__name__)
 
-# Model configuration with priority order
-MODELS_PRIORITY = [
-    # First priority: Cohere (most reliable JSON, best rate limits)
-    ("command-r-plus-08-2024", "cohere", 120),
-    ("command-r-08-2024", "cohere", 120),
-    # Second: Gemini Flash (more rate limit tokens)
-    ("gemini-2.5-flash", "gemini", 60),
-    # Third: Gemini Pro (better quality but lower rate limit)
-    ("gemini-2.5-pro", "gemini", 90),
-    ("gemini-3.1-pro-preview", "gemini", 90),
-    # Last resort: Claude
-    ("claude-opus-4-6", "claude", 60),
-    ("claude-sonnet-4-6", "claude", 60),
-]
-
+PRIMARY_MODEL = os.getenv("QEEMA_PRIMARY_MODEL", "gemini-2.5-pro")
+FALLBACK_MODEL = os.getenv("QEEMA_FALLBACK_MODEL", "gemini-3.1-pro-preview")
+CLAUDE_MODEL = os.getenv("QEEMA_CLAUDE_MODEL", "claude-opus-4-7")
 
 class QuranTextFetcher:
     API_URL = "https://api.qurancdn.com/api/qdc/verses/by_key/{surah}:{ayah}?words=false&fields=text_uthmani"
@@ -74,14 +61,12 @@ class QuranTextFetcher:
             resp = requests.get(self.API_URL.format(surah=surah, ayah=ayah), timeout=10)
             resp.raise_for_status()
             return resp.json()["verse"]["text_uthmani"]
-        except Exception as e:
-            logger.warning(f"⚠️ Quran API فشل: {e}")
+        except Exception:
             return "نص قرآني موثق"
 
     def fetch_surah(self, surah: int, start: int, end: int) -> list[VerifiedAyah]:
         return [VerifiedAyah(surah=surah, number=n, text=self.fetch(surah, n), source="quran_api") 
                 for n in range(start, end + 1)]
-
 
 class ScriptEngine:
     SYSTEM_PROMPT = """أنت "الجد أبو زياد"، عالم جليل من علماء الأزهر الشريف، تمتاز بوجه بشوش وقلب حنون وصوت دافئ.
@@ -92,226 +77,109 @@ class ScriptEngine:
 2. اللهجة: عامية مصرية بسيطة ودافئة (يا حبايبي، يا أبطال، سبحان الله العظيم).
 3. هندسة الصور: Prompts بالإنجليزية بأسلوب (Cute 3D Pixar style, Disney animation, highly detailed, Islamic friendly).
 4. المنع الصارم: ممنوع كتابة نصوص الآيات. استخدم [AYAH_X] فقط.
-5. المخرجات: JSON نظيف فقط، بدون أي نصوص إضافية.
-
-JSON SCHEMA (الالتزام التام):
-{
-  "title": "string",
-  "youtube_description": "string",
-  "intro_scene": {"narrator_text": "string", "visual_prompt": "string"},
-  "ayah_scenes": [
-    {
-      "ayah_number": int,
-      "intro_text": "string",
-      "explain_text": "string",
-      "visual_prompt": "string"
-    }
-  ],
-  "outro_scene": {"narrator_text": "string", "visual_prompt": "string"}
-}"""
+5. المخرجات: JSON نظيف فقط."""
 
     def __init__(self):
-        if not APIKeys.GEMINI:
-            raise ValueError("GEMINI_API_KEY Missing")
+        if not APIKeys.GEMINI: raise ValueError("GEMINI_API_KEY Missing")
         self.gemini_client = genai.Client(api_key=APIKeys.GEMINI)
         self.cohere_client = cohere.Client(api_key=os.getenv("COHERE_API_KEY")) if os.getenv("COHERE_API_KEY") else None
         self.claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY")) if os.getenv("ANTHROPIC_API_KEY") else None
         self.text_fetcher = QuranTextFetcher()
-        self._rate_limit_backoff = 30  # Start with 30s backoff for 429s
 
     def generate(self, episode_num: int) -> EpisodeScript:
         info = CURRICULUM[episode_num]
         logger.info(f"📖 جلب آيات سورة {info['name']} لعمل سكريبت متصل...")
         verified_ayahs = self.text_fetcher.fetch_surah(info["surah"], info["start"], info["end"])
-
+        
         ayah_refs = "\n".join([f"[AYAH_{a.number}] - الآية {a.number}" for a in verified_ayahs])
-
+        
         prompt = f"""اكتب سكريبت حلقة عن سورة {info['name']} (من آية {info['start']} إلى {info['end']}).
 اجعل التفسير قصة واحدة يرويها الجد أبو زياد. 
 المراجع: {ayah_refs}
 
-أجب ONLY بـ JSON بدون أي نصوص إضافية:"""
+JSON structure:
+{{
+  "title": "string",
+  "youtube_title": "string",
+  "youtube_description": "string",
+  "intro_scene": {{"scene_id": 1, "duration_sec": 25, "narrator_text": "string", "visual_prompt": "string", "mood": "intro"}},
+  "ayah_scenes": [ {{"scene_id": 10, "ayah_number": int, "intro_text": "string", "explain_text": "string", "visual_prompt": "string"}} ],
+  "outro_scene": {{"scene_id": 99, "duration_sec": 25, "narrator_text": "string", "visual_prompt": "string", "mood": "outro"}}
+}}"""
 
         data = self._call_ai_with_fallback(prompt)
         script = self._build_script(episode_num, info, data, verified_ayahs)
-
+        
         save_path = Paths.SCRIPT_DIR / f"episode_{episode_num:03d}.json"
         save_path.parent.mkdir(parents=True, exist_ok=True)
         save_path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
         return script
 
     def _call_ai_with_fallback(self, prompt: str) -> dict:
-        """Call AI models with smart fallback strategy"""
+        models = [
+            (PRIMARY_MODEL, "gemini"), (FALLBACK_MODEL, "gemini"), 
+            ("gemini-2.5-flash", "gemini"), ("command-r-plus-08-2024", "cohere"),
+            ("command-r-08-2024", "cohere"), (CLAUDE_MODEL, "claude")
+        ]
         errors = []
-        attempt_count = 0
-
-        for model_name, model_type, min_backoff in MODELS_PRIORITY:
-            attempt_count += 1
-            logger.info(f"🤖 محاولة باستخدام {model_name} (محاولة #{attempt_count})...")
-            
-            # Exponential backoff for rate limiting
-            if attempt_count > 1:
-                wait_time = min(self._rate_limit_backoff * (2 ** (attempt_count - 2)), 300)
-                logger.info(f"⏳ الانتظار {wait_time}ث قبل المحاولة التالية...")
-                time.sleep(wait_time)
-
-            for retry_attempt in range(3):
+        for m_name, m_type in models:
+            logger.info(f"🤖 محاولة باستخدام {m_name}...")
+            for attempt in range(5):
                 try:
-                    if model_type == "gemini":
-                        response = self.gemini_client.models.generate_content(
-                            model=model_name,
-                            contents=prompt,
-                            config=genai_types.GenerateContentConfig(
-                                system_instruction=self.SYSTEM_PROMPT,
-                                temperature=0.7
-                            ),
-                        )
-                        raw = response.text
-                    elif model_type == "cohere":
-                        if not self.cohere_client:
-                            logger.warning(f"⚠️ Cohere client غير متاح، تخطي {model_name}")
-                            break
-                        response = self.cohere_client.chat(
-                            message=prompt,
-                            preamble=self.SYSTEM_PROMPT,
-                            model=model_name
-                        )
-                        raw = response.text
-                    else:  # claude
-                        if not self.claude_client:
-                            logger.warning(f"⚠️ Claude client غير متاح، تخطي {model_name}")
-                            break
-                        response = self.claude_client.messages.create(
-                            model=model_name,
-                            max_tokens=4000,
-                            system=self.SYSTEM_PROMPT,
-                            messages=[{"role": "user", "content": prompt}]
-                        )
-                        raw = response.content[0].text
-
-                    # Parse and validate JSON
-                    parsed = self._parse_json(raw)
-                    if self._validate_script_json(parsed):
-                        logger.info(f"✅ نجح {model_name}!")
-                        return parsed
+                    if m_type == "gemini":
+                        raw = self.gemini_client.models.generate_content(
+                            model=m_name, contents=prompt, config=genai_types.GenerateContentConfig(system_instruction=self.SYSTEM_PROMPT, temperature=0.7)
+                        ).text
+                    elif m_type == "cohere":
+                        if not self.cohere_client: break
+                        raw = self.cohere_client.chat(message=prompt, preamble=self.SYSTEM_PROMPT, model=m_name).text
                     else:
-                        raise ValueError("JSON structure غير صالح")
-
+                        if not self.claude_client: break
+                        raw = self.claude_client.messages.create(
+                            model=m_name, max_tokens=4000, system=self.SYSTEM_PROMPT,
+                            messages=[{"role": "user", "content": prompt}]
+                        ).content[0].text
+                    return self._parse_json(raw)
                 except Exception as e:
-                    error_str = str(e).lower()
-                    
-                    # Handle rate limiting
-                    if any(code in error_str for code in ["429", "quota", "rate limit"]):
-                        self._rate_limit_backoff = min(self._rate_limit_backoff * 1.5, 300)
-                        logger.warning(f"⚠️ Rate limiting على {model_name}, زيادة الانتظار")
-                        if retry_attempt < 2:
-                            time.sleep(min(30 * (2 ** retry_attempt), 120))
-                            continue
-                    
-                    # Handle timeout
-                    if "timeout" in error_str or "read operation timed out" in error_str:
-                        logger.warning(f"⚠️ Timeout على {model_name}")
-                        if retry_attempt < 2:
-                            time.sleep(15 * (2 ** retry_attempt))
-                            continue
-                    
-                    errors.append(f"{model_name}: {str(e)[:80]}")
+                    if any(x in str(e).lower() for x in ["429", "503", "quota"]):
+                        time.sleep(15 * (2 ** attempt)); continue
+                    errors.append(f"{m_name}: {str(e)[:50]}")
                     break
-
-        raise RuntimeError(f"❌ فشلت جميع الموديلات:\n" + "\n".join(errors))
+        raise RuntimeError("فشلت الموديلات:\n" + "\n".join(errors))
 
     @staticmethod
     def _parse_json(raw: str) -> dict:
-        """Robust JSON parsing with multiple cleaning strategies"""
-        # Try direct parsing first
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            pass
-
-        # Strategy 1: Remove markdown code blocks
-        cleaned = re.sub(r"^\s*```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-        cleaned = re.sub(r"\s*```\s*$", "", cleaned, flags=re.MULTILINE)
-        
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            pass
-
-        # Strategy 2: Extract JSON object
-        match = re.search(r'\{[\s\S]*\}', cleaned)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                pass
-
-        # Strategy 3: Fix common JSON issues
-        fixed = cleaned
-        # Fix unescaped quotes
-        fixed = re.sub(r'([^\\])"([^"]*)"([^"])', r'\1\"\2\"\3', fixed)
-        # Fix missing commas
-        fixed = re.sub(r'"\s*"', '", "', fixed)
-        
-        try:
-            return json.loads(fixed)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"JSON parsing فشل نهائياً: {str(e)}")
-
-    @staticmethod
-    def _validate_script_json(data: dict) -> bool:
-        """Validate script JSON structure"""
-        required_keys = ["title", "youtube_description", "intro_scene", "ayah_scenes", "outro_scene"]
-        if not all(key in data for key in required_keys):
-            return False
-        
-        if not isinstance(data["ayah_scenes"], list) or len(data["ayah_scenes"]) == 0:
-            return False
-        
-        return True
+        cleaned = re.sub(r"^\x60{3}(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        cleaned = re.sub(r"\s*\x60{3}$", "", cleaned, flags=re.MULTILINE)
+        return json.loads(cleaned)
 
     def _build_script(self, ep_num, info, data, verified):
         v_map = {a.number: a for a in verified}
-        ayah_scenes = []
+        ayah_scenes = [AyahScene(
+            scene_id=s.get("scene_id", 10 + i),
+            ayah=v_map[s["ayah_number"]],
+            intro_text=s["intro_text"], explain_text=s["explain_text"],
+            visual_prompt=s["visual_prompt"], repetitions=3, duration_sec=35
+        ) for i, s in enumerate(data["ayah_scenes"]) if s["ayah_number"] in v_map]
         
-        for i, s in enumerate(data.get("ayah_scenes", [])):
-            a_num = s.get("ayah_number")
-            if a_num in v_map:
-                ayah_scenes.append(AyahScene(
-                    scene_id=10 + i,
-                    ayah=v_map[a_num],
-                    intro_text=s.get("intro_text", ""),
-                    explain_text=s.get("explain_text", ""),
-                    visual_prompt=s.get("visual_prompt", ""),
-                    repetitions=3,
-                    duration_sec=35
-                ))
-
         return EpisodeScript(
-            episode_number=ep_num,
-            surah_name=info["name"],
-            surah_number=info["surah"],
-            title=data.get("title", ""),
-            youtube_title=data.get("title", ""),
-            youtube_description=data.get("youtube_description", ""),
-            youtube_tags=[],
-            total_duration_sec=300,
+            episode_number=ep_num, surah_name=info["name"], surah_number=info["surah"],
+            title=data["title"], youtube_title=data.get("youtube_title", data["title"]), 
+            youtube_description=data["youtube_description"],
+            youtube_tags=[], total_duration_sec=300,
             intro_scene=NarratorScene(
-                scene_id=1,
-                scene_type=SceneType.INTRO,
-                duration_sec=25,
-                narrator_text=data.get("intro_scene", {}).get("narrator_text", ""),
-                visual_prompt=data.get("intro_scene", {}).get("visual_prompt", ""),
+                scene_id=data["intro_scene"]["scene_id"], 
+                scene_type=SceneType.INTRO, duration_sec=25, 
+                narrator_text=data["intro_scene"]["narrator_text"], 
+                visual_prompt=data["intro_scene"]["visual_prompt"], 
                 mood=AudioMood.INTRO
             ),
-            ayah_scenes=ayah_scenes,
-            mid_scenes=[],
+            ayah_scenes=ayah_scenes, mid_scenes=[],
             outro_scene=NarratorScene(
-                scene_id=99,
-                scene_type=SceneType.OUTRO,
-                duration_sec=25,
-                narrator_text=data.get("outro_scene", {}).get("narrator_text", ""),
-                visual_prompt=data.get("outro_scene", {}).get("visual_prompt", ""),
+                scene_id=data["outro_scene"]["scene_id"], 
+                scene_type=SceneType.OUTRO, duration_sec=25,
+                narrator_text=data["outro_scene"]["narrator_text"], 
+                visual_prompt=data["outro_scene"]["visual_prompt"], 
                 mood=AudioMood.OUTRO
             )
         )
