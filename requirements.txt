@@ -1,5 +1,4 @@
-VALUE / QEEMA v2.1 — Dependencies
-​─────────────────────────────────────────
+
 ​AI SDKs
 ​google-genai>=1.17.0
 anthropic>=0.40.0
