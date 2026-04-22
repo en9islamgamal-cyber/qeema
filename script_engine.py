@@ -60,7 +60,8 @@ PRIMARY_MODEL = os.getenv("QEEMA_PRIMARY_MODEL", "gemini-2.5-pro")
 FALLBACK_MODEL = os.getenv("QEEMA_FALLBACK_MODEL", "gemini-3.1-pro-preview")
 
 USE_COHERE_FALLBACK = os.getenv("QEEMA_USE_COHERE_FALLBACK", "true").lower() == "true"
-COHERE_MODEL = os.getenv("QEEMA_COHERE_MODEL", "command-r") # Command-R ممتاز للسكريبتات والـ JSON
+# تم التحديث إلى النموذج الجديد والمدعوم لتفادي خطأ 404
+COHERE_MODEL = os.getenv("QEEMA_COHERE_MODEL", "command-r-plus") 
 
 USE_CLAUDE_FALLBACK = os.getenv("QEEMA_USE_CLAUDE_FALLBACK", "true").lower() == "true"
 CLAUDE_MODEL = os.getenv("QEEMA_CLAUDE_MODEL", "claude-opus-4-7")
@@ -228,7 +229,7 @@ class QuranIntegrityGuard:
 class ScriptEngine:
     """
     يولد سكريبت الحلقة باستخدام chain من الموديلات:
-    Gemini 2.5 Pro → Gemini 3.1 Pro Preview → Gemini Flash → Cohere → Claude
+    Gemini Pro → Gemini Flash → Cohere → Claude
     """
 
     SYSTEM_PROMPT = """أنت كاتب محتوى متخصص في تعليم القرآن الكريم للأطفال من سن 5-6 سنوات.
@@ -388,7 +389,8 @@ class ScriptEngine:
         for model_name, call_func in models_queue:
             logger.info(f"🤖 جاري المحاولة باستخدام: {model_name}...")
             
-            max_retries = 3
+            # 💡 زيادة الصبر في المحاولات لتفادي أعطال خوادم جوجل المؤقتة
+            max_retries = 5 
             base_wait = 10 
 
             for attempt in range(max_retries):
@@ -403,35 +405,44 @@ class ScriptEngine:
                 except Exception as e:
                     error_msg = str(e)
                     
-                    # 💡 إضافة الأخطاء 503 و 500 للمحاولة مرة أخرى بدلاً من التخطي الفوري
-                    if any(err in error_msg for err in ["429", "503", "500", "502", "Too Many Requests", "Quota"]):
-                        if "quota" in error_msg.lower():
-                            logger.error(f"❌ نفاذ الحصة لنموذج {model_name}. سيتم تخطيه.")
-                            errors.append(f"{model_name}: Quota Exhausted")
-                            break
-                            
+                    # 1. أخطاء عدم توفر النموذج (الخطأ 404 لكوهير وغيرها)
+                    if "404" in error_msg or "removed" in error_msg.lower() or "not found" in error_msg.lower():
+                        logger.error(f"❌ النموذج {model_name} غير موجود أو تم حذفه من الشركة. سيتم تخطيه فوراً.")
+                        errors.append(f"{model_name}: Model Not Found (404)")
+                        break # تخطي فوري للنموذج التالي
+                    
+                    # 2. أخطاء نفاد الحصة المجانية الثابتة (Quota)
+                    elif "quota" in error_msg.lower():
+                        logger.error(f"❌ نفاذ الحصة اليومية (Quota) لنموذج {model_name}. سيتم تخطيه.")
+                        errors.append(f"{model_name}: Quota Exhausted")
+                        break # تخطي فوري
+                        
+                    # 3. أخطاء الضغط المؤقت والأعطال (429, 503, 500, 502)
+                    elif any(err in error_msg for err in ["429", "503", "500", "502", "Too Many Requests"]):
                         if attempt < max_retries - 1:
                             wait_time = base_wait * (2 ** attempt)
-                            logger.warning(f"⚠️ مشكلة بالخوادم ({model_name}). ننتظر {wait_time}ث...")
+                            logger.warning(f"⚠️ مشكلة بالخوادم أو ضغط ({model_name}). ننتظر {wait_time}ث...")
                             time.sleep(wait_time)
                             continue
                         else:
-                            logger.error(f"❌ استنفاد محاولات {model_name}.")
-                            errors.append(f"{model_name}: Rate Limit / Server Error Exhausted")
+                            logger.error(f"❌ استنفاد محاولات {model_name} بعد الانتظار الطويل.")
+                            errors.append(f"{model_name}: Server Overload / Rate Limit Exhausted")
                             break 
                             
+                    # 4. أخطاء الرصيد والجانب المالي
                     elif "credit balance" in error_msg.lower() or "billing" in error_msg.lower():
                         logger.error(f"❌ خطأ مالي في {model_name}. سيتم تخطيه.")
                         errors.append(f"{model_name}: Insufficient Credits")
                         break 
                         
+                    # 5. أي خطأ برمجي آخر غير متوقع
                     else:
-                        logger.error(f"❌ خطأ في {model_name}: {error_msg}")
+                        logger.error(f"❌ خطأ غير متوقع في {model_name}: {error_msg}")
                         errors.append(f"{model_name}: {type(e).__name__} - {error_msg[:100]}")
                         break
 
         raise RuntimeError(
-            "فشلت كل الموديلات في توليد السكريبت:\n  - " + "\n  - ".join(errors)
+            "فشلت كل الموديلات في توليد السكريبت، يرجى فحص الأرصدة ومفاتيح الـ API:\n  - " + "\n  - ".join(errors)
         )
 
     def _call_gemini(self, model: str, prompt: str) -> str:
@@ -455,7 +466,7 @@ class ScriptEngine:
         assert self.cohere_client is not None
         response = self.cohere_client.chat(
             message=prompt,
-            preamble=self.SYSTEM_PROMPT, # Preamble = System Prompt في كوهير
+            preamble=self.SYSTEM_PROMPT,
             model=COHERE_MODEL,
             temperature=0.7
         )
