@@ -5,6 +5,7 @@ import re
 from abc import ABC, abstractmethod
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+# استدعاء المكتبات
 try:
     from google import genai
     from google.genai import types as genai_types
@@ -18,6 +19,11 @@ except ImportError:
 
 try:
     import anthropic
+except ImportError:
+    pass
+
+try:
+    from openai import OpenAI # 👈 أضفنا مكتبة OpenAI التي تدعم Grok
 except ImportError:
     pass
 
@@ -36,6 +42,26 @@ class BaseModelAdapter(ABC):
     @abstractmethod
     def generate(self, prompt: str, system_prompt: str, model_name: str) -> dict:
         pass
+
+# 👇 محول Grok الجديد
+class GrokAdapter(BaseModelAdapter):
+    def __init__(self, api_key: str):
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.x.ai/v1" # توجيه الطلبات لسيرفرات xAI
+        )
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
+    def generate(self, prompt: str, system_prompt: str, model_name: str = "grok-2-latest") -> dict:
+        response = self.client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7
+        )
+        return extract_json(response.choices[0].message.content)
 
 class GeminiAdapter(BaseModelAdapter):
     def __init__(self, api_key: str):
