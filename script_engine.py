@@ -358,6 +358,9 @@ class ScriptEngine:
         if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
             models_queue.append((FALLBACK_MODEL, self._call_gemini))
             
+        # 💡 [إضافة الطوارئ]: نموذج Flash يمتلك Limit مجاني عالي جداً (15 ضعف نماذج Pro)
+        models_queue.append(("gemini-2.5-flash", self._call_gemini))
+
         if self.claude_client is not None:
             models_queue.append((CLAUDE_MODEL, self._call_claude))
 
@@ -384,6 +387,13 @@ class ScriptEngine:
                     
                     # 1. التحقق من أخطاء الـ Rate Limit (429)
                     if "429" in error_msg or "Too Many Requests" in error_msg or "Quota" in error_msg:
+                        
+                        # التفرقة الذكية: إذا نفدت الحصة اليومية فلا فائدة من الانتظار
+                        if "quota" in error_msg.lower():
+                            logger.error(f"❌ نفاذ الحصة (Quota) لنموذج {model_name}. سيتم تخطيه فوراً.")
+                            errors.append(f"{model_name}: Daily Quota Exhausted")
+                            break
+                            
                         if attempt < max_retries - 1:
                             wait_time = base_wait * (2 ** attempt)
                             logger.warning(
