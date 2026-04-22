@@ -1,3 +1,4 @@
+```python
 """
 script_engine.py — VALUE / QEEMA v2.1
 ═══════════════════════════════════════════════════════
@@ -109,7 +110,7 @@ QURAN_FALLBACK: dict[tuple[int, int], str] = {
 class QuranTextFetcher:
     """يجلب النص القرآني من API موثوق — لا يُولَّد أبداً"""
 
-    API_URL = "https://api.qurancdn.com/api/qdc/verses/by_key/{surah}:{ayah}?words=false&fields=text_uthmani"
+    API_URL = "[https://api.qurancdn.com/api/qdc/verses/by_key/](https://api.qurancdn.com/api/qdc/verses/by_key/){surah}:{ayah}?words=false&fields=text_uthmani"
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
     def fetch(self, surah: int, ayah: int) -> str:
@@ -447,6 +448,105 @@ class ScriptEngine:
 
     @staticmethod
     def _parse_json(raw: str) -> dict:
-        """ينضّف backticks ويحوّل لـ dict."""
-        cleaned = re.sub(r"^
-http://googleusercontent.com/immersive_entry_chip/0
+        """ينضّف الكود من علامات التنسيق (backticks) ويحوّله لـ dict."""
+        # ⚠️ الحل النهائي لمشكلة SyntaxError:
+        # بدلاً من كتابة علامات (backticks) بشكل صريح والتي تكسر الكود عند نسخه
+        # نستخدم الكود السداسي العشري الخاص بها \x60 لتفادي أخطاء محررات النصوص و GitHub Actions
+        
+        cleaned = re.sub(r"^\x60{3}(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        cleaned = re.sub(r"\s*\x60{3}$", "", cleaned, flags=re.MULTILINE)
+        
+        return json.loads(cleaned)
+
+    # ──────────────────────────────────────
+    # Script builder (بدون تغيير)
+    # ──────────────────────────────────────
+    def _build_script(
+        self,
+        ep_num: int,
+        info: dict,
+        data: dict,
+        verified_ayahs: list[VerifiedAyah],
+    ) -> EpisodeScript:
+        """يبني نموذج EpisodeScript المُحقَّق"""
+        ayah_map = {a.number: a for a in verified_ayahs}
+
+        # مشهد الافتتاح
+        intro_raw = data["intro_scene"]
+        intro = NarratorScene(
+            scene_id=intro_raw["scene_id"],
+            scene_type=SceneType.INTRO,
+            duration_sec=float(intro_raw.get("duration_sec", 25)),
+            narrator_text=intro_raw["narrator_text"],
+            visual_prompt=intro_raw["visual_prompt"],
+            on_screen_text=intro_raw.get("on_screen_text"),
+            mood=AudioMood(intro_raw.get("mood", "intro")),
+        )
+
+        # مشاهد الآيات — حقن النصوص المُحقَّقة
+        ayah_scenes = []
+        for i, raw in enumerate(data.get("ayah_scenes", [])):
+            ayah_num = raw["ayah_number"]
+            if ayah_num not in ayah_map:
+                raise ValueError(f"الآية {ayah_num} غير موجودة في القائمة المحققة")
+
+            ayah_scenes.append(AyahScene(
+                scene_id=raw["scene_id"],
+                ayah=ayah_map[ayah_num],    # ← النص الموثوق فقط
+                intro_text=raw["intro_text"],
+                explain_text=raw["explain_text"],
+                visual_prompt=raw["visual_prompt"],
+                repetitions=int(raw.get("repetitions", 3)),
+                duration_sec=float(raw.get("duration_sec", 35)),
+            ))
+
+        # مشاهد وسطى (اختيارية)
+        mid_scenes = []
+        for raw in data.get("mid_scenes", []):
+            mid_scenes.append(NarratorScene(
+                scene_id=raw["scene_id"],
+                scene_type=SceneType.EXPLANATION,
+                duration_sec=float(raw.get("duration_sec", 20)),
+                narrator_text=raw["narrator_text"],
+                visual_prompt=raw["visual_prompt"],
+                mood=AudioMood(raw.get("mood", "calm")),
+            ))
+
+        # الخاتمة
+        outro_raw = data["outro_scene"]
+        outro = NarratorScene(
+            scene_id=outro_raw["scene_id"],
+            scene_type=SceneType.OUTRO,
+            duration_sec=float(outro_raw.get("duration_sec", 20)),
+            narrator_text=outro_raw["narrator_text"],
+            visual_prompt=outro_raw["visual_prompt"],
+            on_screen_text=outro_raw.get("on_screen_text"),
+            mood=AudioMood("outro"),
+        )
+
+        from config import ChannelConfig
+        return EpisodeScript(
+            episode_number=ep_num,
+            surah_name=info["name"],
+            surah_number=info["surah"],
+            title=data["title"],
+            youtube_title=data["youtube_title"],
+            youtube_description=data["youtube_description"],
+            youtube_tags=data.get("youtube_tags", []) + ChannelConfig.BASE_TAGS,
+            total_duration_sec=float(data.get("total_duration_sec", 300)),
+            intro_scene=intro,
+            ayah_scenes=ayah_scenes,
+            mid_scenes=mid_scenes,
+            outro_scene=outro,
+        )
+
+    def load_from_disk(self, episode_num: int) -> Optional[EpisodeScript]:
+        """يستأنف سكريبت محفوظ من القرص"""
+        p = Paths.SCRIPT_DIR / f"episode_{episode_num:03d}.json"
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            logger.info(f"♻️ استئناف سكريبت: {p.name}")
+            return EpisodeScript.model_validate(data)
+        return None
+
+```
