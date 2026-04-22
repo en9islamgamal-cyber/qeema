@@ -1,6 +1,9 @@
 """
 script_engine.py — VALUE / QEEMA v2.1
+═══════════════════════════════════════════════════════
 محرك السكريبت المطور - نظام السرد القصصي الشامل
+• تمت إضافة صمامات أمان لمنع أخطاء الـ Validation
+═══════════════════════════════════════════════════════
 """
 
 from __future__ import annotations
@@ -63,20 +66,13 @@ class ScriptEngine:
 2. اللهجة: عامية مصرية بسيطة ودافئة.
 3. الصور: Prompts بالإنجليزية Pixar style.
 4. المنع الصارم: ممنوع كتابة نصوص الآيات، استخدم [AYAH_X] فقط.
-أجب بصيغة JSON نظيفة فقط."""
+5. هام جداً: يجب أن يكون نص التمهيد (intro_text) والشرح (explain_text) طويلاً ومفيداً (على الأقل جملتين)، يمنع تركها فارغة."""
 
     def __init__(self):
         if not APIKeys.GEMINI: raise ValueError("GEMINI_API_KEY Missing")
         self.gemini_client = genai.Client(api_key=APIKeys.GEMINI)
-        
-        self.cohere_client = None
-        if os.getenv("COHERE_API_KEY"):
-            self.cohere_client = cohere.Client(api_key=os.getenv("COHERE_API_KEY"))
-            
-        self.claude_client = None
-        if os.getenv("ANTHROPIC_API_KEY"):
-            self.claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-            
+        self.cohere_client = cohere.Client(api_key=os.getenv("COHERE_API_KEY")) if os.getenv("COHERE_API_KEY") else None
+        self.claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY")) if os.getenv("ANTHROPIC_API_KEY") else None
         self.text_fetcher = QuranTextFetcher()
 
     def generate(self, episode_num: int) -> EpisodeScript:
@@ -86,7 +82,8 @@ class ScriptEngine:
         ayah_refs = "\n".join([f"[AYAH_{a.number}]" for a in verified_ayahs])
         
         prompt = f"""اكتب سكريبت حلقة عن سورة {info['name']} (الآيات من {info['start']} إلى {info['end']}).
-الجد أبو زياد يحكي قصة متصلة. المراجع: {ayah_refs}
+الجد أبو زياد يحكي قصة متصلة للأطفال. المراجع: {ayah_refs}
+تأكد من ملء خانات intro_text و explain_text بكل حب وتفصيل.
 أجب بـ JSON يتضمن: title, youtube_description, intro_scene, ayah_scenes, outro_scene."""
 
         data = self._call_ai_with_fallback(prompt)
@@ -135,11 +132,21 @@ class ScriptEngine:
         for i, s in enumerate(data.get("ayah_scenes", [])):
             a_num = s.get("ayah_number", info["start"] + i)
             if a_num in v_map:
+                # 💡 صمام الأمان: منع النصوص الفارغة التي تسبب فشل الـ Pydantic
+                raw_intro = s.get("intro_text", "").strip()
+                raw_explain = s.get("explain_text", "").strip()
+                
+                safe_intro = raw_intro if len(raw_intro) >= 5 else "يا حبايب جدو، تعالوا نسمع الآية دي مع بعض ونشوف ربنا بيقولنا إيه."
+                safe_explain = raw_explain if len(raw_explain) >= 10 else f"الآية دي بتعلمنا يا ولاد إن ربنا سبحانه وتعالى بيحبنا ودايماً معانا، ولازم نشكره على كل نعمه."
+
                 ayah_scenes.append(AyahScene(
-                    scene_id=10 + i, ayah=v_map[a_num],
-                    intro_text=s.get("intro_text", ""), explain_text=s.get("explain_text", ""),
-                    visual_prompt=s.get("visual_prompt", "Pixar style animation"),
-                    repetitions=3, duration_sec=35
+                    scene_id=10 + i, 
+                    ayah=v_map[a_num],
+                    intro_text=safe_intro, 
+                    explain_text=safe_explain,
+                    visual_prompt=s.get("visual_prompt", "Beautiful Pixar style Islamic animation scene"),
+                    repetitions=3, 
+                    duration_sec=35
                 ))
         
         return EpisodeScript(
@@ -149,14 +156,16 @@ class ScriptEngine:
             youtube_tags=[], total_duration_sec=300,
             intro_scene=NarratorScene(
                 scene_id=1, scene_type=SceneType.INTRO, duration_sec=25, 
-                narrator_text=data["intro_scene"]["narrator_text"], 
-                visual_prompt=data["intro_scene"]["visual_prompt"], mood=AudioMood.INTRO
+                narrator_text=data["intro_scene"].get("narrator_text", "أهلاً بكم يا أبطال في حلقة جديدة مع جدو أبو زياد."), 
+                visual_prompt=data["intro_scene"].get("visual_prompt", "Grandfather sitting with children, Pixar style"), 
+                mood=AudioMood.INTRO
             ),
             ayah_scenes=ayah_scenes, mid_scenes=[],
             outro_scene=NarratorScene(
                 scene_id=99, scene_type=SceneType.OUTRO, duration_sec=25,
-                narrator_text=data["outro_scene"]["narrator_text"], 
-                visual_prompt=data["outro_scene"]["visual_prompt"], mood=AudioMood.OUTRO
+                narrator_text=data["outro_scene"].get("narrator_text", "دمتم في حفظ الله يا أبطال، نلقاكم في حلقة قادمة."), 
+                visual_prompt=data["outro_scene"].get("visual_prompt", "Grandfather waving goodbye, Pixar style"), 
+                mood=AudioMood.OUTRO
             )
         )
 
