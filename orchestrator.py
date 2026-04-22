@@ -204,7 +204,7 @@ class PipelineOrchestrator:
         creds   = google.oauth2.credentials.Credentials(token=token)
         youtube = build("youtube", "v3", credentials=creds)
 
-        body = {
+                body = {
             "snippet": {
                 "title":            script.youtube_title,
                 "description":      script.youtube_description,
@@ -212,4 +212,6 @@ class PipelineOrchestrator:
                 "categoryId":       "27",
                 "defaultLanguage":  "ar",
             },
-            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": True
+            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": True},
+        }
+
