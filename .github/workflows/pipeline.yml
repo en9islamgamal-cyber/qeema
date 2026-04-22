@@ -1,4 +1,4 @@
-Name: "VALUE QEEMA Pipeline"
+name: "VALUE QEEMA Pipeline"
 
 on:
   schedule:
@@ -19,7 +19,7 @@ on:
 env:
   PYTHON_VERSION: "3.11"
   TZ: "Asia/Kuwait"
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # ✅ تمت إضافة هذا السطر لحل مشكلة التحذير
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   pipeline:
