@@ -61,9 +61,11 @@ class PipelineOrchestrator:
 
     # ──────────────────────────── Supabase ─────
     def _db_get_next(self) -> Optional[dict]:
+        # ✅ التعديل هنا: استخدمنا القيمة النصية 'pending' بدلاً من كائن Enum
+        # لضمان التطابق مع ما هو موجود في قاعدة البيانات
         r = (self.db.table(DBConfig.TABLE_EPISODES)
              .select("*")
-             .eq("status", EpisodeStatus.PENDING)
+             .eq("status", "pending") 
              .order("episode_number")
              .limit(1)
              .execute())
@@ -71,6 +73,11 @@ class PipelineOrchestrator:
 
     def _db_update(self, ep_id: str, **fields) -> None:
         fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+        
+        # تحويل الـ Enum إلى نص إذا تم تمريره لضمان سلامة البيانات
+        if "status" in fields and hasattr(fields["status"], "value"):
+            fields["status"] = fields["status"].value.lower()
+            
         try:
             self.db.table(DBConfig.TABLE_EPISODES).update(fields).eq("id", ep_id).execute()
         except Exception as e:
@@ -83,9 +90,11 @@ class PipelineOrchestrator:
              .execute())
         if r.data:
             return r.data[0]["id"]
+            
+        # ✅ التعديل هنا: إضافة الحلقة كـ 'pending' نصياً
         res = self.db.table(DBConfig.TABLE_EPISODES).insert({
             "episode_number": ep_num,
-            "status": EpisodeStatus.PENDING,
+            "status": "pending", 
             "created_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
@@ -203,98 +212,4 @@ class PipelineOrchestrator:
                 "categoryId":       "27",
                 "defaultLanguage":  "ar",
             },
-            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": True},
-        }
-
-        media   = MediaFileUpload(video_path, mimetype="video/mp4", resumable=True, chunksize=5*1024*1024)
-        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-
-        response = None
-        while response is None:
-            status, response = request.next_chunk()
-            if status:
-                logger.info(f"📤 {int(status.progress()*100)}%")
-
-        vid_id = response["id"]
-        logger.info(f"✅ منشور: https://youtube.com/watch?v={vid_id}")
-
-        # Thumbnail
-        if Path(thumb_path).exists():
-            try:
-                youtube.thumbnails().set(
-                    videoId=vid_id,
-                    media_body=MediaFileUpload(thumb_path, mimetype="image/jpeg"),
-                ).execute()
-            except Exception as e:
-                logger.warning(f"⚠️ Thumbnail فشل: {e}")
-
-        return vid_id
-
-    # ──────────────────────────── Main Pipeline ─
-    def run(self, episode_number: int) -> bool:
-        logger.info(f"\n{'═'*60}")
-        logger.info(f"▶ بدء تنفيذ الحلقة {episode_number}")
-        logger.info(f"{'═'*60}")
-
-        ep_dir = str(Paths.EPISODES / f"ep_{episode_number:03d}")
-        Path(ep_dir).mkdir(parents=True, exist_ok=True)
-
-        ep_id = self._db_init_episode(episode_number)
-
-        try:
-            # 1 — السكريبت
-            self._db_update(ep_id, status=EpisodeStatus.SCRIPTING)
-            script = self._stage_script(episode_number)
-            self._db_update(ep_id, status=EpisodeStatus.AUDIO, surah_name=script.surah_name, title=script.title)
-
-            # 2 — الصوت
-            self._stage_audio(script, ep_dir)
-            self._db_update(ep_id, status=EpisodeStatus.VISUAL)
-
-            # 3 — الصور
-            self._stage_visuals(script, ep_dir)
-            self._db_update(ep_id, status=EpisodeStatus.VIDEO)
-
-            # 4 — الفيديو
-            video_path = self._stage_video(script, ep_dir)
-            self._db_update(ep_id, status=EpisodeStatus.THUMBNAIL, video_path=video_path)
-
-            # 5 — Thumbnail
-            thumb_path = self._stage_thumbnail(script, ep_dir)
-            self._db_update(ep_id, status=EpisodeStatus.UPLOADING, thumbnail_path=thumb_path)
-
-            # 6 — النشر
-            vid_id  = self._stage_upload(script, video_path, thumb_path)
-            yt_url  = f"https://youtube.com/watch?v={vid_id}"
-            self._db_update(
-                ep_id,
-                status=EpisodeStatus.PUBLISHED,
-                youtube_video_id=vid_id,
-                youtube_url=yt_url,
-                published_at=datetime.now(timezone.utc).isoformat(),
-            )
-
-            logger.info(f"\n🎉 الحلقة {episode_number} نُشرت: {yt_url}")
-            return True
-
-        except Exception as exc:
-            tb = traceback.format_exc()
-            logger.error(f"❌ فشلت الحلقة {episode_number}:\n{tb}")
-            self._db_update(ep_id, status=EpisodeStatus.FAILED,
-                            error_message=str(exc), error_traceback=tb[-1500:])
-            return False
-
-    def run_next(self) -> bool:
-        ep = self._db_get_next()
-        if not ep:
-            logger.info("✅ لا توجد حلقات معلقة")
-            return True
-        return self.run(ep["episode_number"])
-
-    def seed(self):
-        """يُضيف جميع الحلقات بحالة pending"""
-        from config import CURRICULUM
-        for n in CURRICULUM:
-            self._db_init_episode(n)
-            logger.info(f"  ✓ حلقة {n}: {CURRICULUM[n]['name']}")
-        logger.info("✅ تم البذر")
+            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": True
