@@ -218,7 +218,7 @@ class ScriptEngine:
     """
     يولد سكريبت الحلقة باستخدام chain من الموديلات:
     Gemini 2.5 Pro → Gemini 3.1 Pro Preview → Claude
-    مع التزام كامل بأمانة النص القرآني
+    مع التزام كامل بأمانة النص القرآني ومعالجة ذكية للأخطاء
     """
 
     SYSTEM_PROMPT = """أنت كاتب محتوى متخصص في تعليم القرآن الكريم للأطفال من سن 5-6 سنوات.
@@ -258,7 +258,6 @@ class ScriptEngine:
             f"Claude: {'ON' if self.claude_client else 'OFF'}"
         )
 
-    # ⚠️ شلنا @retry من هنا عشان ما نرجعش نجيب الآيات من API كل retry
     def generate(self, episode_num: int) -> EpisodeScript:
         """يولد سكريبت حلقة كاملة ومُحقَّق"""
         if episode_num not in CURRICULUM:
@@ -345,54 +344,76 @@ class ScriptEngine:
         return script
 
     # ──────────────────────────────────────
-    # Fallback chain
+    # Fallback chain (Smart Error Handling)
     # ──────────────────────────────────────
     def _call_ai_with_fallback(self, prompt: str) -> dict:
         """
-        يجرّب الموديلات بالترتيب لحد ما واحد يرجع JSON صحيح:
-        1. Gemini Primary  (2.5 Pro)
-        2. Gemini Fallback (3.1 Pro Preview)
-        3. Claude          (Opus)
+        يجرّب الموديلات بالترتيب مع التراجع الأسي الذكي للأخطاء.
         """
+        models_queue = []
+        
+        if PRIMARY_MODEL:
+            models_queue.append((PRIMARY_MODEL, self._call_gemini))
+            
+        if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
+            models_queue.append((FALLBACK_MODEL, self._call_gemini))
+            
+        if self.claude_client is not None:
+            models_queue.append((CLAUDE_MODEL, self._call_claude))
+
         errors: list[str] = []
 
-        # ── [1/3] Gemini primary ──
-        try:
-            logger.info(f"🤖 [1/3] Gemini {PRIMARY_MODEL} يولد السكريبت…")
-            raw = self._call_gemini(PRIMARY_MODEL, prompt)
-            return self._parse_json(raw)
-        except Exception as e:
-            msg = f"{PRIMARY_MODEL}: {type(e).__name__}: {str(e)[:200]}"
-            logger.warning(f"⚠️ فشل {msg}")
-            errors.append(msg)
+        for model_name, call_func in models_queue:
+            logger.info(f"🤖 جاري المحاولة باستخدام: {model_name}...")
+            
+            # إعدادات التراجع الأسي لـ Rate Limits فقط
+            max_retries = 4
+            base_wait = 10 # الثواني: 10، 20، 40، 80
 
-        # ── [2/3] Gemini fallback ──
-        if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
-            try:
-                logger.info(f"🤖 [2/3] Gemini {FALLBACK_MODEL} (fallback) يولد السكريبت…")
-                raw = self._call_gemini(FALLBACK_MODEL, prompt)
-                return self._parse_json(raw)
-            except Exception as e:
-                msg = f"{FALLBACK_MODEL}: {type(e).__name__}: {str(e)[:200]}"
-                logger.warning(f"⚠️ فشل {msg}")
-                errors.append(msg)
-
-        # ── [3/3] Claude ──
-        if self.claude_client is not None:
-            try:
-                logger.info(f"🧠 [3/3] Claude {CLAUDE_MODEL} (final fallback) يولد السكريبت…")
-                raw = self._call_claude(prompt)
-                return self._parse_json(raw)
-            except Exception as e:
-                msg = f"{CLAUDE_MODEL}: {type(e).__name__}: {str(e)[:200]}"
-                logger.error(f"❌ فشل {msg}")
-                errors.append(msg)
+            for attempt in range(max_retries):
+                try:
+                    if call_func == self._call_gemini:
+                        raw = call_func(model_name, prompt)
+                    else:
+                        raw = call_func(prompt)
+                        
+                    return self._parse_json(raw)
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    
+                    # 1. التحقق من أخطاء الـ Rate Limit (429)
+                    if "429" in error_msg or "Too Many Requests" in error_msg or "Quota" in error_msg:
+                        if attempt < max_retries - 1:
+                            wait_time = base_wait * (2 ** attempt)
+                            logger.warning(
+                                f"⚠️ ضغط على خوادم {model_name} (الخطأ 429). "
+                                f"المحاولة {attempt + 1}/{max_retries}. ننتظر {wait_time} ثانية..."
+                            )
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            logger.error(f"❌ استنفاد محاولات {model_name} بسبب الضغط (Rate Limit).")
+                            errors.append(f"{model_name}: Rate Limit (429) Exhausted")
+                            break # الخروج من المحاولات والانتقال للنموذج التالي
+                            
+                    # 2. التحقق من أخطاء الرصيد (مثل Claude)
+                    elif "credit balance is too low" in error_msg.lower() or "billing" in error_msg.lower():
+                        logger.error(f"❌ خطأ مالي في {model_name} (الرصيد غير كافٍ). سيتم تخطيه فوراً.")
+                        errors.append(f"{model_name}: Insufficient Credits/Billing")
+                        break # الخروج فوراً للنموذج التالي، لا حاجة للانتظار
+                        
+                    # 3. أي أخطاء أخرى غير متوقعة (Bad Request, Server Error, etc)
+                    else:
+                        logger.error(f"❌ خطأ غير متوقع في {model_name}: {error_msg}")
+                        errors.append(f"{model_name}: {type(e).__name__} - {error_msg[:100]}")
+                        break # ننتقل للنموذج التالي
 
         raise RuntimeError(
-            "فشلت كل الموديلات:\n  - " + "\n  - ".join(errors)
+            "فشلت كل الموديلات في توليد السكريبت:\n  - " + "\n  - ".join(errors)
         )
 
-    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=4, max=20))
+    # ⚠️ تمت إزالة @retry من هنا لأننا نعالج الأخطاء بذكاء داخل _call_ai_with_fallback
     def _call_gemini(self, model: str, prompt: str) -> str:
         """استدعاء Gemini بالـ SDK الجديد."""
         config = genai_types.GenerateContentConfig(
@@ -427,97 +448,5 @@ class ScriptEngine:
     @staticmethod
     def _parse_json(raw: str) -> dict:
         """ينضّف backticks ويحوّل لـ dict."""
-        cleaned = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-        cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE)
-        return json.loads(cleaned)
-
-    # ──────────────────────────────────────
-    # Script builder (بدون تغيير)
-    # ──────────────────────────────────────
-    def _build_script(
-        self,
-        ep_num: int,
-        info: dict,
-        data: dict,
-        verified_ayahs: list[VerifiedAyah],
-    ) -> EpisodeScript:
-        """يبني نموذج EpisodeScript المُحقَّق"""
-        ayah_map = {a.number: a for a in verified_ayahs}
-
-        # مشهد الافتتاح
-        intro_raw = data["intro_scene"]
-        intro = NarratorScene(
-            scene_id=intro_raw["scene_id"],
-            scene_type=SceneType.INTRO,
-            duration_sec=float(intro_raw.get("duration_sec", 25)),
-            narrator_text=intro_raw["narrator_text"],
-            visual_prompt=intro_raw["visual_prompt"],
-            on_screen_text=intro_raw.get("on_screen_text"),
-            mood=AudioMood(intro_raw.get("mood", "intro")),
-        )
-
-        # مشاهد الآيات — حقن النصوص المُحقَّقة
-        ayah_scenes = []
-        for i, raw in enumerate(data.get("ayah_scenes", [])):
-            ayah_num = raw["ayah_number"]
-            if ayah_num not in ayah_map:
-                raise ValueError(f"الآية {ayah_num} غير موجودة في القائمة المحققة")
-
-            ayah_scenes.append(AyahScene(
-                scene_id=raw["scene_id"],
-                ayah=ayah_map[ayah_num],    # ← النص الموثوق فقط
-                intro_text=raw["intro_text"],
-                explain_text=raw["explain_text"],
-                visual_prompt=raw["visual_prompt"],
-                repetitions=int(raw.get("repetitions", 3)),
-                duration_sec=float(raw.get("duration_sec", 35)),
-            ))
-
-        # مشاهد وسطى (اختيارية)
-        mid_scenes = []
-        for raw in data.get("mid_scenes", []):
-            mid_scenes.append(NarratorScene(
-                scene_id=raw["scene_id"],
-                scene_type=SceneType.EXPLANATION,
-                duration_sec=float(raw.get("duration_sec", 20)),
-                narrator_text=raw["narrator_text"],
-                visual_prompt=raw["visual_prompt"],
-                mood=AudioMood(raw.get("mood", "calm")),
-            ))
-
-        # الخاتمة
-        outro_raw = data["outro_scene"]
-        outro = NarratorScene(
-            scene_id=outro_raw["scene_id"],
-            scene_type=SceneType.OUTRO,
-            duration_sec=float(outro_raw.get("duration_sec", 20)),
-            narrator_text=outro_raw["narrator_text"],
-            visual_prompt=outro_raw["visual_prompt"],
-            on_screen_text=outro_raw.get("on_screen_text"),
-            mood=AudioMood("outro"),
-        )
-
-        from config import ChannelConfig
-        return EpisodeScript(
-            episode_number=ep_num,
-            surah_name=info["name"],
-            surah_number=info["surah"],
-            title=data["title"],
-            youtube_title=data["youtube_title"],
-            youtube_description=data["youtube_description"],
-            youtube_tags=data.get("youtube_tags", []) + ChannelConfig.BASE_TAGS,
-            total_duration_sec=float(data.get("total_duration_sec", 300)),
-            intro_scene=intro,
-            ayah_scenes=ayah_scenes,
-            mid_scenes=mid_scenes,
-            outro_scene=outro,
-        )
-
-    def load_from_disk(self, episode_num: int) -> Optional[EpisodeScript]:
-        """يستأنف سكريبت محفوظ من القرص"""
-        p = Paths.SCRIPT_DIR / f"episode_{episode_num:03d}.json"
-        if p.exists():
-            data = json.loads(p.read_text(encoding="utf-8"))
-            logger.info(f"♻️ استئناف سكريبت: {p.name}")
-            return EpisodeScript.model_validate(data)
-        return None
+        cleaned = re.sub(r"^
+http://googleusercontent.com/immersive_entry_chip/0
