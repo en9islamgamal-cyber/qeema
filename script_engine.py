@@ -1,15 +1,9 @@
 """
 script_engine.py — VALUE / QEEMA v2.1
-═══════════════════════════════════════════════════════
 محرك السكريبت المطور - نظام السرد القصصي الشامل
-• Strategy: Holistic Prompting (تفسير شامل للسورة لتقليل الكوتة)
-• Persona: الجد أبو زياد (عالم أزهري، حنون، دافئ)
-• Visuals: Pixar 3D Cinematic Style (English Prompts)
-═══════════════════════════════════════════════════════
 """
 
 from __future__ import annotations
-
 import json
 import logging
 import os
@@ -17,10 +11,8 @@ import re
 import time
 from pathlib import Path
 from typing import Optional
-
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
-
 from google import genai
 from google.genai import types as genai_types
 
@@ -38,12 +30,8 @@ except ImportError:
 
 from config import APIKeys, CURRICULUM, Paths
 from models import (
-    AyahScene,
-    AudioMood,
-    EpisodeScript,
-    NarratorScene,
-    SceneType,
-    VerifiedAyah,
+    AyahScene, AudioMood, EpisodeScript, 
+    NarratorScene, SceneType, VerifiedAyah
 )
 
 logger = logging.getLogger(__name__)
@@ -69,43 +57,37 @@ class QuranTextFetcher:
                 for n in range(start, end + 1)]
 
 class ScriptEngine:
-    SYSTEM_PROMPT = """أنت "الجد أبو زياد"، عالم جليل من علماء الأزهر الشريف، تمتاز بوجه بشوش وقلب حنون وصوت دافئ.
-مهمتك: كتابة سيناريو حلقة كرتونية للأطفال (5-8 سنوات) تفسر فيها القرآن بأسلوب "القصة المتصلة".
-
-قواعد الإخراج:
-1. الوحدة الموضوعية: احكِ قصة واحدة مترابطة تبدأ من أول آية وتنتهي بآخر آية المطلوبة.
-2. اللهجة: عامية مصرية بسيطة ودافئة (يا حبايبي، يا أبطال، سبحان الله العظيم).
-3. هندسة الصور: Prompts بالإنجليزية بأسلوب (Cute 3D Pixar style, Disney animation, highly detailed, Islamic friendly).
-4. المنع الصارم: ممنوع كتابة نصوص الآيات. استخدم [AYAH_X] فقط.
-5. المخرجات: JSON نظيف فقط."""
+    SYSTEM_PROMPT = """أنت "الجد أبو زياد"، شيخ من علماء الأزهر الشريف.
+مهمتك: كتابة سكريبت حلقة كرتونية للأطفال (5-8 سنوات) تفسر فيها القرآن بأسلوب "القصة المتصلة".
+1. السرد الشامل: احكِ قصة واحدة ممتعة تبدأ من أول آية لنهايتها.
+2. اللهجة: عامية مصرية بسيطة ودافئة.
+3. الصور: Prompts بالإنجليزية Pixar style.
+4. المنع الصارم: ممنوع كتابة نصوص الآيات، استخدم [AYAH_X] فقط.
+أجب بصيغة JSON نظيفة فقط."""
 
     def __init__(self):
         if not APIKeys.GEMINI: raise ValueError("GEMINI_API_KEY Missing")
         self.gemini_client = genai.Client(api_key=APIKeys.GEMINI)
-        self.cohere_client = cohere.Client(api_key=os.getenv("COHERE_API_KEY")) if os.getenv("COHERE_API_KEY") else None
-        self.claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY")) if os.getenv("ANTHROPIC_API_KEY") else None
+        
+        self.cohere_client = None
+        if os.getenv("COHERE_API_KEY"):
+            self.cohere_client = cohere.Client(api_key=os.getenv("COHERE_API_KEY"))
+            
+        self.claude_client = None
+        if os.getenv("ANTHROPIC_API_KEY"):
+            self.claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+            
         self.text_fetcher = QuranTextFetcher()
 
     def generate(self, episode_num: int) -> EpisodeScript:
         info = CURRICULUM[episode_num]
-        logger.info(f"📖 جلب آيات سورة {info['name']} لعمل سكريبت متصل...")
+        logger.info(f"📖 جلب آيات سورة {info['name']}...")
         verified_ayahs = self.text_fetcher.fetch_surah(info["surah"], info["start"], info["end"])
+        ayah_refs = "\n".join([f"[AYAH_{a.number}]" for a in verified_ayahs])
         
-        ayah_refs = "\n".join([f"[AYAH_{a.number}] - الآية {a.number}" for a in verified_ayahs])
-        
-        prompt = f"""اكتب سكريبت حلقة عن سورة {info['name']} (من آية {info['start']} إلى {info['end']}).
-اجعل التفسير قصة واحدة يرويها الجد أبو زياد. 
-المراجع: {ayah_refs}
-
-JSON structure:
-{{
-  "title": "string",
-  "youtube_title": "string",
-  "youtube_description": "string",
-  "intro_scene": {{"scene_id": 1, "duration_sec": 25, "narrator_text": "string", "visual_prompt": "string", "mood": "intro"}},
-  "ayah_scenes": [ {{"scene_id": 10, "ayah_number": int, "intro_text": "string", "explain_text": "string", "visual_prompt": "string"}} ],
-  "outro_scene": {{"scene_id": 99, "duration_sec": 25, "narrator_text": "string", "visual_prompt": "string", "mood": "outro"}}
-}}"""
+        prompt = f"""اكتب سكريبت حلقة عن سورة {info['name']} (الآيات من {info['start']} إلى {info['end']}).
+الجد أبو زياد يحكي قصة متصلة. المراجع: {ayah_refs}
+أجب بـ JSON يتضمن: title, youtube_description, intro_scene, ayah_scenes, outro_scene."""
 
         data = self._call_ai_with_fallback(prompt)
         script = self._build_script(episode_num, info, data, verified_ayahs)
@@ -116,19 +98,16 @@ JSON structure:
         return script
 
     def _call_ai_with_fallback(self, prompt: str) -> dict:
-        models = [
-            (PRIMARY_MODEL, "gemini"), (FALLBACK_MODEL, "gemini"), 
-            ("gemini-2.5-flash", "gemini"), ("command-r-plus-08-2024", "cohere"),
-            ("command-r-08-2024", "cohere"), (CLAUDE_MODEL, "claude")
-        ]
+        models = [(PRIMARY_MODEL, "gemini"), (FALLBACK_MODEL, "gemini"), ("gemini-2.5-flash", "gemini"), 
+                  ("command-r-plus-08-2024", "cohere"), (CLAUDE_MODEL, "claude")]
         errors = []
         for m_name, m_type in models:
-            logger.info(f"🤖 محاولة باستخدام {m_name}...")
             for attempt in range(5):
                 try:
                     if m_type == "gemini":
                         raw = self.gemini_client.models.generate_content(
-                            model=m_name, contents=prompt, config=genai_types.GenerateContentConfig(system_instruction=self.SYSTEM_PROMPT, temperature=0.7)
+                            model=m_name, contents=prompt, 
+                            config=genai_types.GenerateContentConfig(system_instruction=self.SYSTEM_PROMPT)
                         ).text
                     elif m_type == "cohere":
                         if not self.cohere_client: break
@@ -140,12 +119,9 @@ JSON structure:
                             messages=[{"role": "user", "content": prompt}]
                         ).content[0].text
                     return self._parse_json(raw)
-                except Exception as e:
-                    if any(x in str(e).lower() for x in ["429", "503", "quota"]):
-                        time.sleep(15 * (2 ** attempt)); continue
-                    errors.append(f"{m_name}: {str(e)[:50]}")
-                    break
-        raise RuntimeError("فشلت الموديلات:\n" + "\n".join(errors))
+                except Exception:
+                    time.sleep(15); continue
+        raise RuntimeError("فشلت النماذج")
 
     @staticmethod
     def _parse_json(raw: str) -> dict:
@@ -155,32 +131,32 @@ JSON structure:
 
     def _build_script(self, ep_num, info, data, verified):
         v_map = {a.number: a for a in verified}
-        ayah_scenes = [AyahScene(
-            scene_id=s.get("scene_id", 10 + i),
-            ayah=v_map[s["ayah_number"]],
-            intro_text=s["intro_text"], explain_text=s["explain_text"],
-            visual_prompt=s["visual_prompt"], repetitions=3, duration_sec=35
-        ) for i, s in enumerate(data["ayah_scenes"]) if s["ayah_number"] in v_map]
+        ayah_scenes = []
+        for i, s in enumerate(data.get("ayah_scenes", [])):
+            a_num = s.get("ayah_number", info["start"] + i)
+            if a_num in v_map:
+                ayah_scenes.append(AyahScene(
+                    scene_id=10 + i, ayah=v_map[a_num],
+                    intro_text=s.get("intro_text", ""), explain_text=s.get("explain_text", ""),
+                    visual_prompt=s.get("visual_prompt", "Pixar style animation"),
+                    repetitions=3, duration_sec=35
+                ))
         
         return EpisodeScript(
             episode_number=ep_num, surah_name=info["name"], surah_number=info["surah"],
-            title=data["title"], youtube_title=data.get("youtube_title", data["title"]), 
-            youtube_description=data["youtube_description"],
+            title=data.get("title", f"سورة {info['name']}"), 
+            youtube_title=data.get("title", ""), youtube_description=data.get("youtube_description", ""),
             youtube_tags=[], total_duration_sec=300,
             intro_scene=NarratorScene(
-                scene_id=data["intro_scene"]["scene_id"], 
-                scene_type=SceneType.INTRO, duration_sec=25, 
+                scene_id=1, scene_type=SceneType.INTRO, duration_sec=25, 
                 narrator_text=data["intro_scene"]["narrator_text"], 
-                visual_prompt=data["intro_scene"]["visual_prompt"], 
-                mood=AudioMood.INTRO
+                visual_prompt=data["intro_scene"]["visual_prompt"], mood=AudioMood.INTRO
             ),
             ayah_scenes=ayah_scenes, mid_scenes=[],
             outro_scene=NarratorScene(
-                scene_id=data["outro_scene"]["scene_id"], 
-                scene_type=SceneType.OUTRO, duration_sec=25,
+                scene_id=99, scene_type=SceneType.OUTRO, duration_sec=25,
                 narrator_text=data["outro_scene"]["narrator_text"], 
-                visual_prompt=data["outro_scene"]["visual_prompt"], 
-                mood=AudioMood.OUTRO
+                visual_prompt=data["outro_scene"]["visual_prompt"], mood=AudioMood.OUTRO
             )
         )
 
