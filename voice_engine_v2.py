@@ -5,23 +5,28 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger(__name__)
 
-class VoiceEngine:  # 👈 تم تغيير الاسم ليتطابق مع طلب الـ Orchestrator
+class VoiceEngine: # 👈 تم تغيير الاسم ليكون VoiceEngine بدقة كما يطلبه الـ Orchestrator
     """
     محرك صوت احترافي يستخدم Google Cloud TTS
-    يتجاوز حدود Gemini المحدودة ويوفر جودة سينمائية للأطفال.
+    • يتجاوز حدود Gemini (10 طلبات يومياً)
+    • جودة سينمائية للأطفال (Wavenet)
+    • سرعة ونبرة مضبوطة لشخصية الجد أبو زياد
     """
     def __init__(self):
-        # التأكد من وجود الاعتماديات
         try:
+            # تهيئة عميل جوجل سحابياً (يعتمد على الملف الموجود في /tmp/gcp_sa.json)
             self.client = texttospeech.TextToSpeechClient()
+            
+            # إعدادات صوت "الجد أبو زياد"
             self._narrator_voice = texttospeech.VoiceSelectionParams(
                 language_code="ar-XA",
-                name="ar-XA-Wavenet-B"  # صوت ذكوري وقور (الجد أبو زياد)
+                name="ar-XA-Wavenet-B" # صوت ذكوري وقور واحترافي
             )
+            
             self._audio_config = texttospeech.AudioConfig(
                 audio_encoding=texttospeech.AudioEncoding.MP3,
-                speaking_rate=0.85, # سرعة هادئة جداً للأطفال
-                pitch=-2.0          # نبرة عميقة وحنونة
+                speaking_rate=0.88, # سرعة هادئة ومريحة للأذن
+                pitch=-2.0          # نبرة عميقة تعطي وقار العلماء
             )
             logger.info("✅ تم تفعيل محرك Google Cloud TTS بنجاح")
         except Exception as e:
@@ -30,8 +35,8 @@ class VoiceEngine:  # 👈 تم تغيير الاسم ليتطابق مع طلب
 
     @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=15))
     def synthesize(self, text: str, output_path: str):
-        """توليد ملف صوتي واحد من نص"""
-        if not text:
+        """توليد ملف صوتي MP3 من نص محدد"""
+        if not text or len(text.strip()) < 2:
             return False
         
         try:
@@ -41,34 +46,43 @@ class VoiceEngine:  # 👈 تم تغيير الاسم ليتطابق مع طلب
                 voice=self._narrator_voice,
                 audio_config=self._audio_config
             )
+            
             with open(output_path, "wb") as out:
                 out.write(response.audio_content)
+            
+            # ننتظر أجزاء من الثانية لعدم إرهاق الـ API (Best practice)
+            import time
+            time.sleep(0.5)
             return True
         except Exception as e:
-            logger.error(f"❌ فشل توليد الصوت للنص: {text[:30]}... الخطأ: {str(e)}")
+            logger.error(f"❌ خطأ في توليد الصوت للنص: {text[:30]}... | الخطأ: {str(e)}")
             raise
 
     def generate_episode_audio(self, script, ep_dir):
-        """المحرك الرئيسي لتوليد كافة أصوات الحلقة"""
-        logger.info(f"🎙️ بدء توليد أصوات الحلقة {script.episode_number}...")
+        """المحرك الرئيسي لتوليد كافة ملفات الصوت للحلقة"""
+        logger.info(f"🎙️ بدء إنتاج أصوات الحلقة {script.episode_number}...")
         
-        # 1. صوت الافتتاحية
+        # 1. صوت مقدمة الجد
         intro_path = os.path.join(ep_dir, "intro_narrator.mp3")
         self.synthesize(script.intro_scene.narrator_text, intro_path)
+        logger.info("✅ مقدمة الراوي جاهزة")
         
-        # 2. أصوات مشاهد الآيات
-        for scene in script.ayah_scenes:
-            # صوت التمهيد للآية
+        # 2. أصوات مشاهد الآيات (التمهيد + الشرح)
+        for i, scene in enumerate(script.ayah_scenes):
+            # صوت التمهيد للآية (قبل التلاوة)
             p_intro = os.path.join(ep_dir, f"ayah_{scene.scene_id}_intro.mp3")
             self.synthesize(scene.intro_text, p_intro)
             
-            # صوت شرح الآية
+            # صوت شرح المعنى (بعد التلاوة)
             p_explain = os.path.join(ep_dir, f"ayah_{scene.scene_id}_explain.mp3")
             self.synthesize(scene.explain_text, p_explain)
             
-        # 3. صوت الخاتمة
+            logger.info(f"✅ أصوات الآية {scene.ayah.number} جاهزة")
+            
+        # 3. صوت الخاتمة والوداع
         outro_path = os.path.join(ep_dir, "outro_narrator.mp3")
         self.synthesize(script.outro_scene.narrator_text, outro_path)
+        logger.info("✅ خاتمة الراوي جاهزة")
         
-        logger.info("✅ تم توليد كافة الملفات الصوتية بنجاح عبر Google Cloud")
+        logger.info("🎉 اكتمل إنتاج كافة الملفات الصوتية بنجاح!")
         return True
