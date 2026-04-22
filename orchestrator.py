@@ -61,7 +61,7 @@ class PipelineOrchestrator:
 
     # ──────────────────────────── Supabase ─────
     def _db_get_next(self) -> Optional[dict]:
-        # ✅ التعديل هنا: استخدمنا القيمة النصية 'pending' بدلاً من كائن Enum
+        # استخدمنا القيمة النصية 'pending' بدلاً من كائن Enum
         # لضمان التطابق مع ما هو موجود في قاعدة البيانات
         r = (self.db.table(DBConfig.TABLE_EPISODES)
              .select("*")
@@ -91,7 +91,7 @@ class PipelineOrchestrator:
         if r.data:
             return r.data[0]["id"]
             
-        # ✅ التعديل هنا: إضافة الحلقة كـ 'pending' نصياً
+        # إضافة الحلقة كـ 'pending' نصياً
         res = self.db.table(DBConfig.TABLE_EPISODES).insert({
             "episode_number": ep_num,
             "status": "pending", 
@@ -103,7 +103,6 @@ class PipelineOrchestrator:
     # ──────────────────────────── Stages ───────
     def _stage_script(self, ep_num: int) -> EpisodeScript:
         """مرحلة 1: السكريبت"""
-        # استئناف إذا كان موجوداً
         cached = self.script.load_from_disk(ep_num)
         if cached:
             logger.info("♻️ استئناف السكريبت من القرص")
@@ -116,17 +115,13 @@ class PipelineOrchestrator:
         if audio_map_file.exists():
             logger.info("♻️ استئناف الصوت من القرص")
             raw = json.loads(audio_map_file.read_text())
-            # تحقق من وجود الملفات فعلاً
             if all(Path(p).exists() for p in raw.values()):
                 return raw
 
         audio_map = self.voice.generate_episode_audio(script, ep_dir)
         audio_map_file.write_text(json.dumps(audio_map, ensure_ascii=False))
 
-        # معالجة الصوت (موسيقى + تطبيع)
         processed = self.sfx.process_all(audio_map, script, ep_dir)
-
-        # تحديث مسارات الصوت في السكريبت
         self._update_script_audio_paths(script, processed)
         return processed
 
@@ -151,67 +146,9 @@ class PipelineOrchestrator:
         if vis_map_file.exists():
             logger.info("♻️ استئناف الصور من القرص")
             vis_map = json.loads(vis_map_file.read_text())
-            # تطبيق المسارات
             if vis_map.get("intro") and Path(vis_map["intro"]).exists():
                 script.intro_scene.image_path = vis_map["intro"]
             if vis_map.get("outro") and Path(vis_map["outro"]).exists():
                 script.outro_scene.image_path = vis_map["outro"]
             for sc in script.ayah_scenes:
-                k = f"ayah_{sc.scene_id}"
-                if vis_map.get(k) and Path(vis_map[k]).exists():
-                    sc.image_path = vis_map[k]
-            return
-
-        self.visual.generate_episode_visuals(script, ep_dir)
-
-        # حفظ خريطة الصور
-        vis_map = {"intro": script.intro_scene.image_path, "outro": script.outro_scene.image_path}
-        for sc in script.ayah_scenes:
-            vis_map[f"ayah_{sc.scene_id}"] = sc.image_path
-        vis_map_file.write_text(json.dumps(vis_map, ensure_ascii=False))
-
-    def _stage_video(self, script: EpisodeScript, ep_dir: str) -> str:
-        """مرحلة 4: تجميع الفيديو"""
-        final_path = Paths.VIDEOS / f"ep_{script.episode_number:03d}_final.mp4"
-        if final_path.exists():
-            logger.info("♻️ استئناف الفيديو من القرص")
-            return str(final_path)
-        return self.video.assemble_episode(script, ep_dir)
-
-    def _stage_thumbnail(self, script: EpisodeScript, ep_dir: str) -> str:
-        """مرحلة 5: الـ Thumbnail"""
-        thumb_path = Paths.THUMBNAILS / f"ep_{script.episode_number:03d}.jpg"
-        if thumb_path.exists():
-            logger.info("♻️ استئناف Thumbnail من القرص")
-            return str(thumb_path)
-
-        scene_img = script.intro_scene.image_path
-        return self.thumbnail.create(script, script.episode_number, scene_img)
-
-    def _stage_upload(self, script: EpisodeScript, video_path: str, thumb_path: str) -> str:
-        """مرحلة 6: النشر على YouTube"""
-        dry = __import__("os").environ.get("DRY_RUN", "false").lower() == "true"
-        if dry:
-            logger.info("🧪 DRY_RUN — تجاوز الرفع")
-            return "dry_run_video_id"
-
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaFileUpload
-        import google.oauth2.credentials
-        from get_token import YouTubeTokenManager
-
-        token   = YouTubeTokenManager().get_valid_access_token()
-        creds   = google.oauth2.credentials.Credentials(token=token)
-        youtube = build("youtube", "v3", credentials=creds)
-
-                body = {
-            "snippet": {
-                "title":            script.youtube_title,
-                "description":      script.youtube_description,
-                "tags":             script.youtube_tags[:15],
-                "categoryId":       "27",
-                "defaultLanguage":  "ar",
-            },
-            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": True},
-        }
-
+                k
