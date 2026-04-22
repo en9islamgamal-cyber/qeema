@@ -4,6 +4,7 @@
 # AI SDKs — Gemini + Claude fallback
 google-genai>=1.17.0
 anthropic>=0.40.0
+cohere
 
 # Google Cloud (GCP TTS fallback + YouTube)
 google-api-python-client>=2.130.0
