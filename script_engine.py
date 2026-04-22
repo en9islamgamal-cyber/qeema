@@ -1,10 +1,11 @@
 """
-script_engine.py — VALUE / QEEMA v2
+script_engine.py — VALUE / QEEMA v2.1
 ═══════════════════════════════════════════════════════
-محرك السكريبت
-• Gemini 2.5 Pro للشرح والسرد
-• النص القرآني: مصدر موثوق فقط (qurancdn API + fallback)
+محرك السكريبت — Production Hardened
+• Gemini 2.5 Pro (stable) → Gemini 3.1 Pro → Claude (fallback chain)
+• النص القرآني: مصدر موثوق فقط (qurancdn API + fallback dict)
 • 5 طبقات حماية من الهلوسة
+• Verse caching: الآيات تتجاب مرة واحدة فقط
 ═══════════════════════════════════════════════════════
 """
 
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -20,7 +22,16 @@ from typing import Optional
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-import google.generativeai as genai
+# ── Google Gen AI SDK الجديد (بديل google.generativeai) ──
+from google import genai
+from google.genai import types as genai_types
+
+# ── Claude fallback (اختياري) ──
+try:
+    import anthropic
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
 
 from config import APIKeys, CURRICULUM, Paths
 from models import (
@@ -33,6 +44,15 @@ from models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════
+# إعدادات الموديلات (قابلة للتغيير من env)
+# ══════════════════════════════════════════
+PRIMARY_MODEL = os.getenv("QEEMA_PRIMARY_MODEL", "gemini-2.5-pro")
+FALLBACK_MODEL = os.getenv("QEEMA_FALLBACK_MODEL", "gemini-3.1-pro-preview")
+USE_CLAUDE_FALLBACK = os.getenv("QEEMA_USE_CLAUDE_FALLBACK", "true").lower() == "true"
+CLAUDE_MODEL = os.getenv("QEEMA_CLAUDE_MODEL", "claude-opus-4-7")
 
 
 # ══════════════════════════════════════════
@@ -192,11 +212,12 @@ class QuranIntegrityGuard:
 
 
 # ══════════════════════════════════════════
-# Script Engine
+# Script Engine — with multi-provider fallback
 # ══════════════════════════════════════════
 class ScriptEngine:
     """
-    يولد سكريبت الحلقة باستخدام Gemini 2.5 Pro
+    يولد سكريبت الحلقة باستخدام chain من الموديلات:
+    Gemini 2.5 Pro → Gemini 3.1 Pro Preview → Claude
     مع التزام كامل بأمانة النص القرآني
     """
 
@@ -212,15 +233,32 @@ class ScriptEngine:
     def __init__(self):
         if not APIKeys.GEMINI:
             raise ValueError("GEMINI_API_KEY غير موجود")
-        genai.configure(api_key=APIKeys.GEMINI)
-        self.model = genai.GenerativeModel(
-            model_name="gemini-2.5-pro-preview-05-06",
-            system_instruction=self.SYSTEM_PROMPT,
-        )
+
+        # Gemini client (الـ SDK الجديد)
+        self.gemini_client = genai.Client(api_key=APIKeys.GEMINI)
+
+        # Claude client (اختياري — fallback نهائي)
+        self.claude_client: Optional["anthropic.Anthropic"] = None
+        if USE_CLAUDE_FALLBACK and _ANTHROPIC_AVAILABLE:
+            anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+            if anthropic_key:
+                self.claude_client = anthropic.Anthropic(api_key=anthropic_key)
+                logger.info(f"✅ Claude fallback جاهز ({CLAUDE_MODEL})")
+            else:
+                logger.warning("⚠️ ANTHROPIC_API_KEY غير متوفر — Claude fallback معطّل")
+        elif USE_CLAUDE_FALLBACK and not _ANTHROPIC_AVAILABLE:
+            logger.warning("⚠️ مكتبة anthropic غير مُثبّتة — نفّذ: pip install anthropic")
+
         self.text_fetcher = QuranTextFetcher()
         self.guard        = QuranIntegrityGuard()
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=3, min=5, max=30))
+        logger.info(
+            f"🔧 Models — Primary: {PRIMARY_MODEL} | "
+            f"Fallback: {FALLBACK_MODEL} | "
+            f"Claude: {'ON' if self.claude_client else 'OFF'}"
+        )
+
+    # ⚠️ شلنا @retry من هنا عشان ما نرجعش نجيب الآيات من API كل retry
     def generate(self, episode_num: int) -> EpisodeScript:
         """يولد سكريبت حلقة كاملة ومُحقَّق"""
         if episode_num not in CURRICULUM:
@@ -233,7 +271,7 @@ class ScriptEngine:
         s_end   = info["end"]
         n_ayahs = s_end - s_start + 1
 
-        # STEP 1: جلب الآيات من المصدر الموثوق
+        # STEP 1: جلب الآيات من المصدر الموثوق (مرة واحدة فقط)
         logger.info(f"📖 جلب {n_ayahs} آيات من سورة {sname}…")
         verified_ayahs = self.text_fetcher.fetch_surah(surah, s_start, s_end)
 
@@ -243,7 +281,7 @@ class ScriptEngine:
             for a in verified_ayahs
         ])
 
-        # STEP 2: توليد السكريبت بـ Gemini
+        # STEP 2: توليد السكريبت (fallback chain)
         prompt = f"""اكتب سكريبت حلقة تعليمية كاملة عن سورة {sname} (سورة رقم {surah}).
 عدد الآيات: {n_ayahs} آيات.
 
@@ -288,19 +326,7 @@ class ScriptEngine:
   }}
 }}"""
 
-        logger.info("🤖 Gemini 2.5 Pro يولد السكريبت…")
-        response = self.model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                temperature=0.72,
-                max_output_tokens=6000,
-            ),
-        )
-        raw = response.text.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-        raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
-
-        data = json.loads(raw)
+        data = self._call_ai_with_fallback(prompt)
 
         # STEP 3: بناء نموذج EpisodeScript
         script = self._build_script(episode_num, info, data, verified_ayahs)
@@ -318,6 +344,96 @@ class ScriptEngine:
         logger.info(f"💾 سكريبت محفوظ: {script_path.name}")
         return script
 
+    # ──────────────────────────────────────
+    # Fallback chain
+    # ──────────────────────────────────────
+    def _call_ai_with_fallback(self, prompt: str) -> dict:
+        """
+        يجرّب الموديلات بالترتيب لحد ما واحد يرجع JSON صحيح:
+        1. Gemini Primary  (2.5 Pro)
+        2. Gemini Fallback (3.1 Pro Preview)
+        3. Claude          (Opus)
+        """
+        errors: list[str] = []
+
+        # ── [1/3] Gemini primary ──
+        try:
+            logger.info(f"🤖 [1/3] Gemini {PRIMARY_MODEL} يولد السكريبت…")
+            raw = self._call_gemini(PRIMARY_MODEL, prompt)
+            return self._parse_json(raw)
+        except Exception as e:
+            msg = f"{PRIMARY_MODEL}: {type(e).__name__}: {str(e)[:200]}"
+            logger.warning(f"⚠️ فشل {msg}")
+            errors.append(msg)
+
+        # ── [2/3] Gemini fallback ──
+        if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
+            try:
+                logger.info(f"🤖 [2/3] Gemini {FALLBACK_MODEL} (fallback) يولد السكريبت…")
+                raw = self._call_gemini(FALLBACK_MODEL, prompt)
+                return self._parse_json(raw)
+            except Exception as e:
+                msg = f"{FALLBACK_MODEL}: {type(e).__name__}: {str(e)[:200]}"
+                logger.warning(f"⚠️ فشل {msg}")
+                errors.append(msg)
+
+        # ── [3/3] Claude ──
+        if self.claude_client is not None:
+            try:
+                logger.info(f"🧠 [3/3] Claude {CLAUDE_MODEL} (final fallback) يولد السكريبت…")
+                raw = self._call_claude(prompt)
+                return self._parse_json(raw)
+            except Exception as e:
+                msg = f"{CLAUDE_MODEL}: {type(e).__name__}: {str(e)[:200]}"
+                logger.error(f"❌ فشل {msg}")
+                errors.append(msg)
+
+        raise RuntimeError(
+            "فشلت كل الموديلات:\n  - " + "\n  - ".join(errors)
+        )
+
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=4, max=20))
+    def _call_gemini(self, model: str, prompt: str) -> str:
+        """استدعاء Gemini بالـ SDK الجديد."""
+        config = genai_types.GenerateContentConfig(
+            temperature=0.72,
+            max_output_tokens=6000,
+            system_instruction=self.SYSTEM_PROMPT,
+        )
+        response = self.gemini_client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=config,
+        )
+        text = (response.text or "").strip()
+        if not text:
+            raise RuntimeError(f"استجابة فارغة من {model}")
+        return text
+
+    def _call_claude(self, prompt: str) -> str:
+        """استدعاء Claude كـ fallback نهائي."""
+        assert self.claude_client is not None
+        message = self.claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=6000,
+            system=self.SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = message.content[0].text.strip()
+        if not text:
+            raise RuntimeError(f"استجابة فارغة من {CLAUDE_MODEL}")
+        return text
+
+    @staticmethod
+    def _parse_json(raw: str) -> dict:
+        """ينضّف backticks ويحوّل لـ dict."""
+        cleaned = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE)
+        return json.loads(cleaned)
+
+    # ──────────────────────────────────────
+    # Script builder (بدون تغيير)
+    # ──────────────────────────────────────
     def _build_script(
         self,
         ep_num: int,
