@@ -7,7 +7,7 @@ models.py — VALUE / QEEMA v2
 from __future__ import annotations
 from enum import Enum
 from typing import Optional
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 
 # ═══════════════════════════════════════════════════════
@@ -53,10 +53,10 @@ class VerifiedAyah(BaseModel):
     audio_url: Optional[str] = None
     source:    str   = "quran_api"   # مصدر النص — لا يكون Gemini أبداً
 
-    @validator("text")
-    def text_not_generated(cls, v):
+    @field_validator("text")
+    @classmethod
+    def text_not_generated(cls, v: str) -> str:
         """يمنع أي نص قرآني مولَّد"""
-        # علامة تحذير — إذا وُجدت placeholder لم يُحقق منه
         if "[AYAH" in v or "placeholder" in v.lower():
             raise ValueError("النص القرآني لم يُحقق منه — رفض مقبول")
         return v
