@@ -1,12 +1,11 @@
 """
 video_engine.py — VALUE / QEEMA v2
 ═══════════════════════════════════════════════════════
-محرك الفيديو الاحترافي
-• جودة أعلى من الفيديو المرجعي (H.264 High CRF16)
-• سبتايتل عربي احترافي مع ظل وخلفية
+محرك الفيديو الاحترافي (الإصدار السينمائي)
+• دمج ذكي للشعار مع شفافية ومحاذاة احترافية
+• معالجة النصوص العربية الطويلة (Word Wrapping)
+• تنعيم حواف الصوت (Audio Fades) لمنع الطقطقة
 • Ken Burns effect ناعم
-• انتقالات xfade سلسة
-• دعم الصيغتين: Landscape 1920×1080 + Vertical 1080×1920
 ═══════════════════════════════════════════════════════
 """
 
@@ -17,6 +16,7 @@ import logging
 import os
 import shutil
 import subprocess
+import textwrap
 from pathlib import Path
 from typing import Optional
 
@@ -52,15 +52,19 @@ def _probe_duration(path: str) -> float:
 
 
 def _get_font() -> str:
-    """يجلب أفضل خط عربي متاح"""
+    """يجلب خط أميري أولاً، ثم يبحث عن بدائل"""
+    primary_font = Paths.FONTS / "Amiri-Bold.ttf"
+    if primary_font.exists():
+        return str(primary_font)
+        
     font_dir = Paths.FONTS
     for ext in ["*.ttf", "*.otf"]:
         fonts = list(font_dir.glob(ext))
         if fonts:
             return str(fonts[0])
+            
     system_fonts = [
         "/usr/share/fonts/truetype/arabic/Amiri-Bold.ttf",
-        "/usr/share/fonts/truetype/arabic/Amiri-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
         "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
     ]
@@ -74,15 +78,11 @@ def _get_font() -> str:
 # Subtitle Image Generator (PIL — أفضل دعم للعربية)
 # ══════════════════════════════════════════
 class SubtitleOverlay:
-    """
-    يولد صور overlay للسبتايتل باستخدام PIL
-    أفضل بكثير من FFmpeg drawtext للعربية
-    """
+    """يولد صور overlay للسبتايتل مع دعم للأسطر المتعددة"""
 
     def __init__(self, width: int, height: int):
         self.width  = width
         self.height = height
-        self._cache: dict[str, str] = {}
 
     def create(
         self,
@@ -98,78 +98,69 @@ class SubtitleOverlay:
             import arabic_reshaper
             from bidi.algorithm import get_display
         except ImportError:
-            logger.warning("⚠️ PIL/arabic_reshaper غير مثبت — سيتم تجاوز السبتايتل")
+            logger.warning("⚠️ مكتبات الخطوط غير مثبتة (Pillow, arabic-reshaper, python-bidi)")
             return ""
 
-        # إعادة تشكيل النص العربي
+        # التفاف النص (Word Wrap) لتجنب خروجه من الشاشة
+        # 55 حرف للخط العادي، و 40 حرف للقرآن الكبير
+        wrap_width = 40 if is_ayah else 55 
+        wrapped_text = textwrap.fill(text, width=wrap_width)
+
         try:
-            reshaped = arabic_reshaper.reshape(text)
+            reshaped = arabic_reshaper.reshape(wrapped_text)
             display  = get_display(reshaped)
         except Exception:
-            display = text
+            display = wrapped_text
 
         img  = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
-        # تحميل الخط
         font_path = _get_font()
         try:
             font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
         except Exception:
             font = ImageFont.load_default()
 
-        # حساب حجم النص
-        bbox = draw.textbbox((0, 0), display, font=font)
+        # استخدام multiline_textbbox للحصول على الأبعاد الدقيقة للأسطر المتعددة
+        bbox = draw.multiline_textbbox((0, 0), display, font=font, align="center")
         tw   = bbox[2] - bbox[0]
         th   = bbox[3] - bbox[1]
 
-        # موضع النص (أسفل الشاشة)
         margin = SubtitleConfig.MARGIN_BOTTOM_H
         x = (self.width  - tw) // 2
         y = self.height - th - margin
 
-        # خلفية شبه شفافة
+        # خلفية الصندوق
         pad = SubtitleConfig.BOX_PADDING
         bg_rect = [x - pad, y - pad, x + tw + pad, y + th + pad]
-        draw.rounded_rectangle(bg_rect, radius=12, fill=(0, 0, 0, 145))
+        draw.rounded_rectangle(bg_rect, radius=SubtitleConfig.BOX_BORDER_RADIUS, fill=(0, 0, 0, 160))
 
-        # إطار
-        draw.rounded_rectangle(bg_rect, radius=12, outline=(255, 215, 0, 80), width=2)
+        # الإطار (ذهبي للقرآن، رمادي خفيف للراوي)
+        outline_color = (212, 175, 55, 180) if is_ayah else (255, 255, 255, 50)
+        draw.rounded_rectangle(bg_rect, radius=SubtitleConfig.BOX_BORDER_RADIUS, outline=outline_color, width=2)
 
-        # ظل
+        # الظل
         so = SubtitleConfig.SHADOW_OFFSET
-        draw.text((x + so, y + so), display, font=font, fill=(0, 0, 0, 220))
+        draw.multiline_text((x + so, y + so), display, font=font, fill=(0, 0, 0, 200), align="center")
 
-        # نص رئيسي
-        color = (255, 215, 0, 255) if is_ayah else (*text_color, 255)
-        draw.text((x, y), display, font=font, fill=color)
+        # النص
+        # الذهبي الملكي للقرآن، والأبيض للراوي
+        color = (255, 253, 231, 255) if is_ayah else (*text_color, 255)
+        if is_ayah:
+            color = (255, 215, 0, 255) # عودة للذهبي المباشر للآيات لمزيد من التباين
+            
+        draw.multiline_text((x, y), display, font=font, fill=color, align="center")
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         img.save(output_path, "PNG")
         return output_path
-
-    def batch_create(
-        self,
-        texts: list[tuple[str, bool]],
-        output_dir: str,
-    ) -> list[str]:
-        """يولد مجموعة overlay في دفعة واحدة"""
-        paths = []
-        for i, (text, is_ayah) in enumerate(texts):
-            out = str(Path(output_dir) / f"sub_{i:04d}.png")
-            fs  = SubtitleConfig.FONT_SIZE_LARGE if is_ayah else SubtitleConfig.FONT_SIZE_MEDIUM
-            p   = self.create(text, out, font_size=fs, is_ayah=is_ayah)
-            paths.append(p)
-        return paths
 
 
 # ══════════════════════════════════════════
 # Segment Builder
 # ══════════════════════════════════════════
 class SegmentBuilder:
-    """يبني مقاطع الفيديو الفردية"""
-
-    LOGO_PATH = str(Paths.OVERLAYS / "channel_logo.png")
+    """يبني مقاطع الفيديو الفردية بدقة متناهية"""
 
     def __init__(self, width: int = 1920, height: int = 1080):
         self.W = width
@@ -177,16 +168,11 @@ class SegmentBuilder:
         self._sub = SubtitleOverlay(width, height)
 
     def _scale_image_filter(self) -> str:
-        """فلتر تحجيم الصورة مع crop ذكي"""
-        return (
-            f"scale={self.W * 2}:{self.H * 2}:flags=lanczos,"
-            f"crop={self.W}:{self.H}"
-        )
+        return f"scale={self.W * 2}:{self.H * 2}:flags=lanczos,crop={self.W}:{self.H}"
 
-    def _ken_burns(self, duration: float, zoom_speed: float = 0.0008) -> str:
-        """Ken Burns effect ناعم جداً"""
+    def _ken_burns(self, duration: float, zoom_speed: float = 0.0006) -> str:
         frames = int(duration * VideoConfig.FPS)
-        max_z  = min(1.0 + zoom_speed * frames, 1.08)
+        max_z  = min(1.0 + zoom_speed * frames, 1.10)
         return (
             f"scale=8000:-1:flags=lanczos,"
             f"zoompan=z='min(zoom+{zoom_speed},{max_z})':d={frames}:"
@@ -202,16 +188,14 @@ class SegmentBuilder:
         duration: Optional[float] = None,
         use_ken_burns: bool = True,
     ) -> str:
-        """يبني مقطع مشهد راوي"""
         if not Path(audio_path).exists():
             raise FileNotFoundError(f"ملف صوتي مفقود: {audio_path}")
 
         dur = duration or _probe_duration(audio_path)
-        img = image_path if Path(str(image_path)).exists() else str(Paths.OVERLAYS / "default_bg.png")
+        img = image_path if Path(str(image_path)).exists() else str(Paths.ASSETS / "default_bg.png")
 
         vf = self._ken_burns(dur) if use_ken_burns else self._scale_image_filter()
 
-        # إضافة السبتايتل كـ overlay
         sub_filter = ""
         sub_inputs  = []
         if subtitle_text:
@@ -236,6 +220,8 @@ class SegmentBuilder:
                "-filter_complex", fc,
                "-map", final_map,
                "-map", f"{1 + len(sub_inputs)//2}:a",
+               # 👈 تطبيق Audio Fade لمنع فرقعة الصوت بين المقاطع
+               "-af", "afade=t=in:st=0:d=0.2,afade=t=out:st=999:d=0.2", 
                "-c:v", VideoConfig.CODEC,
                "-profile:v", VideoConfig.PROFILE,
                "-crf", str(VideoConfig.CRF),
@@ -244,7 +230,7 @@ class SegmentBuilder:
                "-c:a", VideoConfig.AUDIO_CODEC,
                "-b:a", VideoConfig.AUDIO_BITRATE,
                "-ar", str(VideoConfig.AUDIO_RATE),
-               "-t", str(dur + 0.3),
+               "-t", str(dur + 0.4), # زيادة طفيفة لتأمين نهاية الصوت
                "-shortest",
                output_path]
         )
@@ -259,14 +245,9 @@ class SegmentBuilder:
         output_path: str,
         duration: Optional[float] = None,
     ) -> str:
-        """
-        يبني مقطع التلاوة القرآنية
-        النص القرآني يظهر كخط ذهبي كبير
-        """
         dur = duration or _probe_duration(quran_audio)
-        img = image_path if Path(str(image_path)).exists() else str(Paths.OVERLAYS / "quran_bg.png")
+        img = image_path if Path(str(image_path)).exists() else str(Paths.ASSETS / "default_bg.png")
 
-        # overlay الآية
         sub_path = str(Paths.ASSEMBLY / f"ayah_{hash(ayah_text) % 99999:05d}.png")
         self._sub.create(
             ayah_text, sub_path,
@@ -274,14 +255,12 @@ class SegmentBuilder:
             is_ayah=True,
         )
 
-        # Ken Burns أبطأ للتلاوة (تأمل)
-        vf = self._ken_burns(dur, zoom_speed=0.0003)
+        vf = self._ken_burns(dur, zoom_speed=0.0004)
 
         sub_inputs = []
         sub_filter = ""
         if Path(sub_path).exists():
             sub_inputs = ["-i", sub_path]
-            # fade in/out للنص
             fd_in  = 0.6
             fd_out = dur - 0.8
             sub_filter = (
@@ -303,6 +282,7 @@ class SegmentBuilder:
                "-filter_complex", fc,
                "-map", final_map,
                "-map", f"{1 + len(sub_inputs)//2}:a",
+               "-af", "afade=t=in:st=0:d=0.2,afade=t=out:st=999:d=0.2",
                "-c:v", VideoConfig.CODEC,
                "-profile:v", VideoConfig.PROFILE,
                "-crf", str(VideoConfig.CRF),
@@ -311,7 +291,7 @@ class SegmentBuilder:
                "-c:a", VideoConfig.AUDIO_CODEC,
                "-b:a", VideoConfig.AUDIO_BITRATE,
                "-ar", str(VideoConfig.AUDIO_RATE),
-               "-t", str(dur + 0.3),
+               "-t", str(dur + 0.4),
                "-shortest",
                output_path]
         )
@@ -319,9 +299,10 @@ class SegmentBuilder:
         return output_path
 
     def add_logo_overlay(self, video_path: str, output_path: str) -> str:
-        """يضيف شعار القناة في الأعلى"""
-        logo = self.LOGO_PATH
+        """يضع اللوجو في الزاوية العلوية باحترافية مع ضبط الشفافية"""
+        logo = str(Paths.LOGO_PRIMARY) # 👈 تم ربطه بـ config.py
         if not Path(logo).exists():
+            logger.warning("⚠️ اللوجو غير موجود، سيتم تخطي الإضافة.")
             shutil.copy(video_path, output_path)
             return output_path
 
@@ -330,19 +311,23 @@ class SegmentBuilder:
             "-i", video_path,
             "-i", logo,
             "-filter_complex",
-            f"[1:v]scale=110:110[logo];[0:v][logo]overlay=W/2-55:15[vout]",
+            # 👈 تصغير اللوجو برمجياً ليناسب الشاشة (عرض 160 بيكسل)، مع شفافية 85%، وضعه أعلى اليمين
+            "[1:v]scale=160:-1,format=rgba,colorchannelmixer=aa=0.85[logo];[0:v][logo]overlay=W-w-30:30[vout]",
             "-map", "[vout]",
             "-map", "0:a",
             "-c:v", VideoConfig.CODEC,
-            "-crf", str(VideoConfig.CRF + 2),
-            "-c:a", "copy",
+            "-profile:v", VideoConfig.PROFILE,
+            "-crf", str(VideoConfig.CRF), # نحافظ على الجودة العالية
+            "-preset", "fast", # يمكننا التسريع هنا لأننا نضيف طبقة فقط
+            "-pix_fmt", VideoConfig.PIX_FMT,
+            "-c:a", "copy", # لا حاجة لإعادة ترميز الصوت
             output_path,
         ]
-        success = _run(cmd, "إضافة الشعار")
+        success = _run(cmd, "إضافة الشعار المائي")
         return output_path if success else video_path
 
     def concatenate(self, segments: list[str], output_path: str) -> str:
-        """يدمج المقاطع بانتقالات xfade"""
+        """يدمج المقاطع باستخدام concat demuxer الفعال"""
         valid = [s for s in segments if Path(s).exists()]
         if not valid:
             raise RuntimeError("لا توجد مقاطع صالحة")
@@ -350,7 +335,6 @@ class SegmentBuilder:
             shutil.copy(valid[0], output_path)
             return output_path
 
-        # استخدام concat filter مع fade بسيط
         concat_list = Paths.ASSEMBLY / "concat_list.txt"
         concat_list.write_text(
             "\n".join(f"file '{os.path.abspath(s)}'" for s in valid)
@@ -369,7 +353,7 @@ class SegmentBuilder:
             "-c:a", VideoConfig.AUDIO_CODEC,
             "-b:a", VideoConfig.AUDIO_BITRATE,
             "-ar", str(VideoConfig.AUDIO_RATE),
-            "-movflags", "+faststart",   # مهم لـ YouTube streaming
+            "-movflags", "+faststart",
             output_path,
         ]
         _run(cmd, f"دمج {len(valid)} مقطع", timeout=900)
@@ -380,8 +364,6 @@ class SegmentBuilder:
 # Main Video Engine
 # ══════════════════════════════════════════
 class VideoEngine:
-    """المحرك الرئيسي — يجمع الحلقة كاملة"""
-
     def __init__(self, vertical: bool = False):
         self.vertical = vertical
         self.W = VideoConfig.WIDTH_V if vertical else VideoConfig.WIDTH_H
@@ -394,10 +376,6 @@ class VideoEngine:
         script: EpisodeScript,
         ep_dir: str,
     ) -> str:
-        """
-        يجمع الحلقة كاملة من السكريبت المُعالَج
-        (بعد اكتمال الصوت والصور)
-        """
         logger.info(f"🎬 تجميع الحلقة {script.episode_number}: {script.surah_name}")
         seg_dir = Path(ep_dir) / "segments"
         seg_dir.mkdir(parents=True, exist_ok=True)
@@ -405,7 +383,6 @@ class VideoEngine:
 
         segments: list[str] = []
 
-        # ── الافتتاح ──────────────────────────
         if script.intro_scene.audio_path:
             intro_seg = str(seg_dir / "00_intro.mp4")
             self.builder.build_narrator_segment(
@@ -413,16 +390,13 @@ class VideoEngine:
                 audio_path=script.intro_scene.audio_path,
                 subtitle_text=script.intro_scene.narrator_text,
                 output_path=intro_seg,
-                use_ken_burns=True,
             )
             if Path(intro_seg).exists():
                 segments.append(intro_seg)
 
-        # ── مشاهد الآيات ─────────────────────
         for i, ayah_scene in enumerate(script.ayah_scenes):
             sid = ayah_scene.scene_id
 
-            # مقدمة الآية
             if ayah_scene.intro_audio:
                 intro_p = str(seg_dir / f"{i+1:02d}_ayah_{sid:03d}_intro.mp4")
                 self.builder.build_narrator_segment(
@@ -434,7 +408,6 @@ class VideoEngine:
                 if Path(intro_p).exists():
                     segments.append(intro_p)
 
-            # التلاوة + النص على الشاشة
             if ayah_scene.quran_audio:
                 quran_p = str(seg_dir / f"{i+1:02d}_ayah_{sid:03d}_quran.mp4")
                 self.builder.build_ayah_segment(
@@ -446,7 +419,6 @@ class VideoEngine:
                 if Path(quran_p).exists():
                     segments.append(quran_p)
 
-            # الشرح بعد الآية
             if ayah_scene.explain_audio:
                 exp_p = str(seg_dir / f"{i+1:02d}_ayah_{sid:03d}_explain.mp4")
                 self.builder.build_narrator_segment(
@@ -458,7 +430,6 @@ class VideoEngine:
                 if Path(exp_p).exists():
                     segments.append(exp_p)
 
-        # ── المشاهد الوسطى ─────────────────────
         for j, mid in enumerate(script.mid_scenes):
             if mid.audio_path:
                 mid_p = str(seg_dir / f"mid_{j:02d}.mp4")
@@ -471,7 +442,6 @@ class VideoEngine:
                 if Path(mid_p).exists():
                     segments.append(mid_p)
 
-        # ── الخاتمة ───────────────────────────
         if script.outro_scene.audio_path:
             outro_p = str(seg_dir / "99_outro.mp4")
             self.builder.build_narrator_segment(
@@ -479,7 +449,6 @@ class VideoEngine:
                 audio_path=script.outro_scene.audio_path,
                 subtitle_text=script.outro_scene.narrator_text,
                 output_path=outro_p,
-                use_ken_burns=True,
             )
             if Path(outro_p).exists():
                 segments.append(outro_p)
@@ -487,15 +456,12 @@ class VideoEngine:
         if not segments:
             raise RuntimeError("❌ لا توجد مقاطع لتجميعها")
 
-        # ── دمج كل المقاطع ─────────────────────
         raw_output = str(Paths.VIDEOS / f"ep_{script.episode_number:03d}_raw.mp4")
         self.builder.concatenate(segments, raw_output)
 
-        # ── إضافة الشعار ──────────────────────
         final_output = str(Paths.VIDEOS / f"ep_{script.episode_number:03d}_final.mp4")
         self.builder.add_logo_overlay(raw_output, final_output)
 
-        # مسح الملف المؤقت
         try:
             Path(raw_output).unlink(missing_ok=True)
         except Exception:
