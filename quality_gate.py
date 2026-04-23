@@ -1,129 +1,358 @@
-"""
-quality_gate.py — VALUE / QEEMA v3.0 (Enterprise Architecture)
-بوابة الجودة الشاملة (Quality Assurance Director)
-تراقب: الإيقاع البصري، الهوية الصوتية (المصرية)، والأسلوب الإنفوجرافيك.
-"""
-
 import logging
 import re
-from typing import List
+from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+
 class QualityReport:
-    def __init__(self, passed: bool, score: float, critiques: List[str]):
+    def __init__(
+        self,
+        passed: bool,
+        overall_score: float,
+        section_scores: Dict[str, float],
+        critiques: List[str],
+    ):
         self.passed = passed
-        self.score = score
-        self.critiques = critiques # رسائل النقد التي تُرسل للموديل ليتعلم ويصلح نفسه
+        self.overall_score = overall_score
+        self.section_scores = section_scores  # e.g. "pacing", "language", "visual_style", "structure"
+        self.critiques = critiques  # رسائل النقد المُفيدة للاستفادة في الإصلاح الذاتي
+
+    def __bool__(self) -> bool:
+        return self.passed
+
 
 class QualityGate:
-    """بوابة جودة لغوية، بصرية، وهيكلية صارمة جداً"""
-    def __init__(self, min_words=5, max_words=25):
-        # الاعتماد على عدد الكلمات لضبط الإيقاع (Pacing)
+    """
+    بوابة جودة لغوية، بصرية، وهيكية صارمة، مبنية على معايير حلقات يوتيوب للأطفال.
+    """
+
+    def __init__(self, min_words: int = 5, max_words: int = 25, enterprise_threshold: float = 85.0):
         self.min_words = min_words
         self.max_words = max_words
+        self.enterprise_threshold = enterprise_threshold
 
-        # 1. فخاخ الذكاء الاصطناعي (AI Hallucinations)
+        # 1. فخاخ LLM وعبارات "الذكاء الاصطناعي"
         self.forbidden_llm_phrases = [
-            "أنا نموذج لغوي", "كذكاء اصطناعي", "بِسْمِ اللَّهِ", "قُلْ هُوَ",
-            "آسف", "لا يمكنني", "بالتأكيد", "إليك الـ JSON"
+            "أنا نموذج لغوي",
+            "كذكاء اصطناعي",
+            "أنا مساعد ذكي",
+            "بِسْمِ اللَّهِ",
+            "قُلْ هُوَ",
+            "آسف",
+            "لا يمكنني",
+            "بالتأكيد",
+            "إليك الـ JSON",
+            "أولًا، ثانياً, ثالثًا",
         ]
 
-        # 2. فلتر اللهجة (الحفاظ على هوية الجد المصري ومنع اللهجات الدخيلة)
+        # 2. فلتر اللهجة (الحفاظ على مصرية بسيطة ومنتقدة للهجات الدخيلة)
         self.forbidden_dialects = [
-            "هيك", "بدي", "شلون", "شو", "زلمة", "وايد", "أبي", "بركي", "هلا والله"
+            "هيك", "بدي", "شلون", "شو", "زلمة", "وايد", "أبي", "بركي", "هلا والله",
+            "ياخي", "نعما", "حنك", "نبكي", "يلا بينك"
         ]
 
-        # 3. فلتر الستايل البصري (منع الـ 3D وإجبار الإنفوجرافيك)
-        self.forbidden_visuals = [
-            "3d", "pixar", "realistic", "photo", "cinema", "render", "octane", "photography"
+        # 3. مصطلحات اللهجات المصرية المسموحة / المرغوبة في بعض الأحيان (positive hint)
+        self.egyptian_touch = [
+            "يا حبايبي",
+            "يا أبطال",
+            "يلا بينا",
+            "نركز",
+            "حلو",
+            "أكيد",
+            "أكتر",
+            "أنا فاهم",
+            "الراجل",
+            "البنت",
+            "الحاجة",
+            "الأسئلة",
+            "أحلى",
         ]
+
+        # 4. فلتر الستايل البصري (إنفوجرافيك فقط)
+        self.forbidden_visuals = [
+            "3d", "pixar", "realistic", "photo", "cinema", "render", "octane", "photography",
+            "cinematic", "film", "movie", "character design", "portrait", "realistic photo",
+        ]
+
+        # 5. مصطلحات visual style المطلوبة
+        self.required_visuals = ["flat", "vector", "infographic", "for kids"]
 
     def _count_words(self, text: str) -> int:
-        return len(str(text).split())
+        """حساب عدد الكلمات غير فارغة"""
+        cleaned = re.sub(r"[^ws]", " ", str(text)).strip()
+        words = [w for w in cleaned.split() if w and len(w) >= 2]
+        return len(words)
 
-    def _check_text_segment(self, text: str, segment_name: str, critiques: List[str]) -> float:
-        """يفحص مقطع نصي ويعيد قيمة الخصم من التقييم"""
+    def _contains_ingredient(self, text: str, items: List[str]) -> bool:
+        lower = str(text).lower()
+        return any(i.lower() in lower for i in items)
+
+    def _check_text_segment(
+        self, text: str, segment_name: str, max_penalty: float = 100.0
+    ) -> Tuple[float, List[str]]:
+        """
+        يُحسب الخصم ومجموعة ملاحظات على قطعة نصية واحدة.
+        """
         penalty = 0.0
-        words = self._count_words(text)
+        critiques = []
+        word_count = self._count_words(text)
 
-        # فحص الملل البصري (الإيقاع)
-        if words < self.min_words:
-            critiques.append(f"[{segment_name}]: قصير جداً ({words} كلمات). يجب أن يكون أعمق قصصياً.")
-            penalty += 15
-        elif words > self.max_words + 10: # سماحية 10 كلمات إضافية كحد أقصى
-            critiques.append(f"[{segment_name}]: طويل جداً ({words} كلمات). هذا يسبب مللاً بصرياً! قسّمه أو اختصره ليكون أقل من {self.max_words} كلمة.")
-            penalty += 30
+        # 1. الإيقاع / الملل البصري (عدد الكلمات)
+        if word_count < self.min_words:
+            critiques.append(
+                f"[{segment_name}]: قصير جداً ({word_count} كلمات). يجب أن يكون محتوى أعمق قصصياً."
+            )
+            penalty += 15.0
+        elif word_count > self.max_words + 10:  # سماحية 10 كلمات
+            critiques.append(
+                f"[{segment_name}]: طويل جداً ({word_count} كلمات). هذا يسبب مللاً بصرياً! قصّه أو قسّمه ليكون أقل من {self.max_words} كلمة."
+            )
+            penalty += 30.0
 
-        # فحص الهوية والذكاء الاصطناعي
+        # 2. هوية LLM وعبارات "الذكاء الاصطناعي"
         for phrase in self.forbidden_llm_phrases:
             if phrase in text:
-                critiques.append(f"[{segment_name}]: يحتوي على لغة روبوتية أو غير مقبولة ('{phrase}').")
-                penalty += 50
-                
+                critiques.append(
+                    f"[{segment_name}]: يحتوي على عبارة روبوتية غير مقبولة ('{phrase}')."
+                )
+                penalty += 50.0
+
+        # 3. انحراف لهجوي
         for word in self.forbidden_dialects:
-            if f" {word} " in f" {text} ":
-                critiques.append(f"[{segment_name}]: انحراف عن اللهجة المصرية المطلوبة. احذف كلمة ('{word}').")
-                penalty += 40
+            if f" {word} " in text:
+                critiques.append(
+                    f"[{segment_name}]: انحراف عن اللهجة المصرية المطلوبة. احذف/غيّر كلمة ('{word}')."
+                )
+                penalty += 40.0
 
-        # فحص التشكيل المفرط (حماية الـ TTS)
-        diacritics_count = len(re.findall(r'[\u064B-\u0652]', text))
-        if diacritics_count > words * 1.5:
-            critiques.append(f"[{segment_name}]: يحتوي على تشكيل مبالغ فيه سيفسد النطق الآلي. قم بإزالة التشكيل قدر الإمكان.")
-            penalty += 20
+        # 4. تشكيل مفرط (حماية TTS)
+        diacritics = len(re.findall(r"[ً-ْ]", text))
+        if diacritics > word_count * 1.5:
+            critiques.append(
+                f"[{segment_name}]: تشكيل مبالغ فيه ({diacritics} علامة) سيُضعف نطق TTS. احذف التشكيل قدر الإمكان."
+            )
+            penalty += 20.0
 
-        return penalty
+        # 5. وجود لهجة مصرية إيجابية (مكافأة اختيارية، لكن هنا لا نُخصم فقط)
+        if not self._contains_ingredient(text, self.egyptian_touch):
+            # هذا لا يُخصم درجة، لكن يمكن استخدامه في scoring منفصل إذا أردت
+            pass
 
-    def _check_visual_segment(self, visual_prompt: str, segment_name: str, critiques: List[str]) -> float:
-        """يفحص الوصف البصري لضمان جودة ليوناردو"""
+        # 6. تجنب النص "الجاف" وتشجيع البدايّات والتشويق
+        if text.startswith("السورة") or text.startswith("سورة"):
+            critiques.append(
+                f"[{segment_name}]: يبدأ بجملة جامدة ('السورة …'). حاول البدء بدعوة مباشرة أو سؤال."
+            )
+            penalty += 10.0
+
+        return min(penalty, max_penalty), critiques
+
+    def _check_visual_segment(
+        self, visual_prompt: str, segment_name: str
+    ) -> Tuple[float, List[str]]:
         penalty = 0.0
-        v_lower = str(visual_prompt).lower()
-        
-        for word in self.forbidden_visuals:
-            if word in v_lower:
-                critiques.append(f"[{segment_name} Visual]: استخدمت ستايل ممنوع ('{word}'). استبدله بـ 'flat vector graphic, infographic'.")
-                penalty += 40
-                
-        if "flat" not in v_lower and "vector" not in v_lower:
-            critiques.append(f"[{segment_name} Visual]: الوصف البصري يفتقر إلى كلمات التوجيه الأساسية. أضف 'flat vector graphic'.")
-            penalty += 25
-            
-        return penalty
-
-    def evaluate(self, script_data: dict) -> QualityReport:
         critiques = []
-        score = 100.0
+        lower = str(visual_prompt).lower()
 
-        if not isinstance(script_data, dict):
-            return QualityReport(False, 0.0, ["المخرج ليس بصيغة JSON صحيحة (يجب أن يكون Object)."])
+        # 1. عدم وجود الكلمات الضرورية للإنفوجرافيك
+        missing = []
+        for req in self.required_visuals:
+            if req not in lower:
+                missing.append(req)
+        if missing:
+            critiques.append(
+                f"[{segment_name} Visual]: يفتقر بعض الكلمات الإرشادية ({', '.join(missing)}). أضفها مثل: 'flat vector graphic, infographic style for kids'."
+            )
+            penalty += 25.0
 
-        # 1. فحص المشاهد الأساسية (الراوي والآيات)
-        if "ayah_scenes" not in script_data or not script_data["ayah_scenes"]:
-            critiques.append("الهيكل مفقود: لا يوجد ayah_scenes.")
-            score -= 100
+        # 2. استخدام أنماط ممنوعة 3D/Photo/Render
+        for forbidden in self.forbidden_visuals:
+            if forbidden in lower:
+                critiques.append(
+                    f"[{segment_name} Visual]: استخدم ستايل ممنوع ('{forbidden}'). استخدم بدلاً من ذلك: 'flat vector graphic, infographic'."
+                )
+                penalty += 40.0
 
-        # فحص مقدمة وخاتمة الحلقة
-        for scene_key in ["intro_scene", "outro_scene"]:
-            scene = script_data.get(scene_key, {})
-            score -= self._check_text_segment(scene.get("narrator_text", ""), scene_key, critiques)
-            score -= self._check_visual_segment(scene.get("visual_prompt", ""), scene_key, critiques)
+        # 3. وجود نصوص مكتوبة على الصورة (ممنوع في الـquality gate)
+        if "no text" not in lower and "no letters" not in lower:
+            critiques.append(
+                f"[{segment_name} Visual]: الوصف لا يمنع النصوص المكتوبة. أضف 'no text, no letters'."
+            )
+            penalty += 15.0
 
-        # 2. فحص مشاهد الآيات بدقة
-        for i, scene in enumerate(script_data.get("ayah_scenes", [])):
-            name_intro = f"مشهد الآية {i+1} (التمهيد)"
-            name_explain = f"مشهد الآية {i+1} (الشرح)"
-            name_visual = f"مشهد الآية {i+1}"
+        return penalty, critiques
 
-            score -= self._check_text_segment(scene.get("intro_text", ""), name_intro, critiques)
-            score -= self._check_text_segment(scene.get("explain_text", ""), name_explain, critiques)
-            score -= self._check_visual_segment(scene.get("visual_prompt", ""), name_visual, critiques)
+    def _check_structure(self, data: dict) -> Tuple[float, List[str]]:
+        """
+        فحص الهيكل العام (الحقول الأساسية، وجود المشاهد).
+        """
+        penalty = 0.0
+        critiques = []
 
-        # درجة النجاح أصبحت 85% كمعيار Enterprise
-        passed = score >= 85.0 and len(critiques) <= 1
+        if "title" not in data:
+            critiques.append("[Structure] missing 'title'")
+            penalty += 10.0
+
+        if "youtube_title" not in data:
+            critiques.append("[Structure] missing 'youtube_title'")
+            penalty += 10.0
+
+        if "intro_scene" not in data:
+            critiques.append("[Structure] missing 'intro_scene'")
+            penalty += 20.0
+        else:
+            intro = data["intro_scene"]
+            if "narrator_text" not in intro:
+                critiques.append("[Structure] 'intro_scene.narrator_text' missing")
+                penalty += 15.0
+            if "visual_prompt" not in intro:
+                critiques.append("[Structure] 'intro_scene.visual_prompt' missing")
+                penalty += 10.0
+
+        if "outro_scene" not in data:
+            critiques.append("[Structure] missing 'outro_scene'")
+            penalty += 20.0
+        else:
+            outro = data["outro_scene"]
+            if "narrator_text" not in outro:
+                critiques.append("[Structure] 'outro_scene.narrator_text' missing")
+                penalty += 15.0
+            if "visual_prompt" not in outro:
+                critiques.append("[Structure] 'outro_scene.visual_prompt' missing")
+                penalty += 10.0
+
+        if "ayah_scenes" not in data or not data["ayah_scenes"]:
+            critiques.append("[Structure] missing 'ayah_scenes' أو فارغة")
+            penalty += 30.0
+        else:
+            # extra فحص لكل آية
+            for i, scene in enumerate(data["ayah_scenes"]):
+                prefix = f"[Ayah {i} Field]"
+                if not isinstance(scene, dict):
+                    critiques.append(f"{prefix} scene not a dict")
+                    penalty += 10.0
+                elif not scene.get("ayah_number"):
+                    critiques.append(f"{prefix} missing ayah_number")
+                    penalty += 5.0
+                elif not scene.get("intro_text"):
+                    critiques.append(f"{prefix} missing intro_text")
+                    penalty += 5.0
+                elif not scene.get("explain_text"):
+                    critiques.append(f"{prefix} missing explain_text")
+                    penalty += 5.0
+                elif not scene.get("visual_prompt"):
+                    critiques.append(f"{prefix} missing visual_prompt")
+                    penalty += 5.0
+        return penalty, critiques
+
+    def evaluate(self, script_data: Union[str, dict]) -> QualityReport:
+        """
+        تقييم JSON كامل، وتحديد إن كان يمر من البوابة أم يحتاج إصلاح ذاتي.
+        """
+        raw = script_data
+        if isinstance(raw, str):
+            try:
+                data = json.loads(raw)
+            except Exception as e:
+                logger.warning("Failed to parse JSON for QA: %s", str(e))
+                return QualityReport(
+                    False,
+                    0.0,
+                    {"all": 0.0},
+                    ["❌ المخرج ليس بصيغة JSON صحيحة (يجب أن يكون Object)."],
+                )
+        else:
+            data = raw
+
+        section_scores: Dict[str, float] = {}
+        critiques: List[str] = []
+
+        # 1. فحص الهيكل العام
+        struct_penalty, struct_critiques = self._check_structure(data)
+        section_scores["structure"] = max(0.0, 100.0 - struct_penalty)
+        critiques.extend(struct_critiques)
+
+        # 2. فحص النصوص (الإيقاع + اللغة)
+        pacing_penalty = 0.0
+
+        # مشهد المقدمة
+        intro = data.get("intro_scene", {})
+        p, c = self._check_text_segment(
+            intro.get("narrator_text", ""), "intro_scene.narrator_text"
+        )
+        pacing_penalty += p
+        critiques.extend(c)
+
+        # مشهد الخاتمة
+        outro = data.get("outro_scene", {})
+        p, c = self._check_text_segment(
+            outro.get("narrator_text", ""), "outro_scene.narrator_text"
+        )
+        pacing_penalty += p
+        critiques.extend(c)
+
+        # مشاهد الآيات
+        for i, scene in enumerate(data.get("ayah_scenes", [])):
+            prefix = f"ayah_scenes[{i}]"
+            p1, c1 = self._check_text_segment(
+                scene.get("intro_text", ""), f"{prefix}.intro_text"
+            )
+            p2, c2 = self._check_text_segment(
+                scene.get("explain_text", ""), f"{prefix}.explain_text"
+            )
+            pacing_penalty += (p1 + p2) / 2.0
+            critiques.extend(c1)
+            critiques.extend(c2)
+
+        section_scores["pacing"] = max(0.0, 100.0 - pacing_penalty / 2.0)
+
+        # 3. فحص الأسلوب اللغوي/اللهجة والمحتوى
+        lang_penalty = 0.0
+        # في نسخة متقدمة، يمكن استخدام معالج لهجة أكثر تعقيدًا، أو محاكاة هوية مساعد الطفل
+        # هنا نكتفي بقلة الانتهاكات فقط
+        if pacing_penalty > 0:
+            lang_penalty += 10.0  # معاقبة النصوص غير المريحة
+
+        section_scores["language"] = max(0.0, 100.0 - lang_penalty)
+
+        # 4. فحص الوصف البصري (الإنفوجرافيك)
+        visual_penalty = 0.0
+
+        p1, c1 = self._check_visual_segment(
+            intro.get("visual_prompt", ""), "intro_scene.visual_prompt"
+        )
+        p2, c2 = self._check_visual_segment(
+            outro.get("visual_prompt", ""), "outro_scene.visual_prompt"
+        )
+        visual_penalty += (p1 + p2) / 2.0
+        critiques.extend(c1)
+        critiques.extend(c2)
+
+        for i, scene in enumerate(data.get("ayah_scenes", [])):
+            p, c = self._check_visual_segment(
+                scene.get("visual_prompt", ""), f"ayah_scenes[{i}].visual_prompt"
+            )
+            visual_penalty += p
+            critiques.extend(c)
+
+        section_scores["visual_style"] = max(0.0, 100.0 - visual_penalty)
+
+        # 5. درجة إجمالية وقرار القبول
+        w = {"structure": 30.0, "pacing": 30.0, "language": 20.0, "visual_style": 20.0}
+        total = 0.0
+        for k in section_scores:
+            weight = w.get(k, 10.0)
+            total += section_scores[k] * (weight / 100.0)
+
+        # 6. توليد تقييم نهائي
+        passed = total >= self.enterprise_threshold and len(critiques) <= 2
 
         if not passed:
-            logger.warning(f"❌ فشل في بوابة الجودة. التقييم: {score}%. يتم توجيه الموديل للإصلاح...")
+            logger.warning("❌ Quality Gate Failure: overall_score=%.1f%%", total)
         else:
-            logger.info(f"✅ اجتاز بوابة الجودة بتفوق (التقييم: {score}%)")
+            logger.info("✅ Quality Gate Passed: overall_score=%.1f%%", total)
 
-        return QualityReport(passed, max(0.0, score), critiques)
+        return QualityReport(
+            passed, total, section_scores, list(set(critiques))
+        )
