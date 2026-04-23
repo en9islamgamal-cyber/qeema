@@ -1,27 +1,24 @@
 """
-core_adapters.py — VALUE / QEEMA v3.0 (Enterprise Architecture)
-محولات النماذج (LLM Adapters) - متوافقة مع أي عدد من الوسائط الإضافية.
+core_adapters.py — VALUE / QEEMA v3.0 (تم التحديث للنماذج الحديثة)
 """
 
 import logging
-import os
 import json
 import re
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List
-
+from typing import Optional, Dict, Any
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger(__name__)
 
-# استيراد المكتبات بشكل آمن
+# استيراد المكتبات
 try:
     from google import genai
     from google.genai import types as genai_types
     HAS_GEMINI = True
 except ImportError:
     HAS_GEMINI = False
-    logger.warning("Google GenAI not installed.")
+    logger.warning("google-genai not installed")
 
 try:
     import cohere
@@ -41,31 +38,22 @@ try:
 except ImportError:
     HAS_OPENAI = False
 
-
-# ========== دالة قوية لاستخراج JSON ==========
-def extract_json(text: str) -> Dict[str, Any]:
-    """استخراج JSON من النص الخام مع تحمل الأخطاء الشائعة."""
-    if not text:
-        raise json.JSONDecodeError("Empty text", text, 0)
-    # إزالة علامات markdown
+def extract_json(text: str) -> dict:
+    """استخراج JSON من النص الخام (مقاوم للفوضى)"""
     cleaned = re.sub(r"```(?:json)?\s*", "", text)
     cleaned = re.sub(r"\s*```", "", cleaned).strip()
-    # البحث عن أول { وآخر }
     start = cleaned.find('{')
     end = cleaned.rfind('}')
     if start == -1 or end == -1:
         start = cleaned.find('[')
         end = cleaned.rfind(']')
         if start == -1 or end == -1:
-            raise json.JSONDecodeError("No JSON object/array found", cleaned, 0)
+            raise ValueError("No JSON found")
     json_str = cleaned[start:end+1]
-    # محاولة إصلاح الفواصل الزائدة
     json_str = re.sub(r',\s*}', '}', json_str)
     json_str = re.sub(r',\s*]', ']', json_str)
     return json.loads(json_str)
 
-
-# ========== الفئة الأساسية ==========
 class BaseAdapter(ABC):
     def __init__(self, api_key: str, model_name: str, max_retries: int = 3):
         self.api_key = api_key
@@ -74,31 +62,27 @@ class BaseAdapter(ABC):
 
     @abstractmethod
     def generate(self, prompt: str, system_instruction: Optional[str] = None, *args, **kwargs) -> str:
-        """توليد رد نصي. *args و **kwargs لاستيعاب أي وسائط إضافية دون خطأ."""
         pass
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def generate_with_retry(self, prompt: str, system_instruction: Optional[str] = None, *args, **kwargs) -> str:
         return self.generate(prompt, system_instruction, *args, **kwargs)
 
-    def generate_json(self, prompt: str, system_instruction: Optional[str] = None, *args, **kwargs) -> Dict[str, Any]:
-        response = self.generate_with_retry(prompt, system_instruction, *args, **kwargs)
-        return extract_json(response)
+    def generate_json(self, prompt: str, system_instruction: Optional[str] = None, *args, **kwargs) -> dict:
+        return extract_json(self.generate_with_retry(prompt, system_instruction, *args, **kwargs))
 
-
-# ========== محول Gemini ==========
+# ----------------------------------------------------------------------
+# Gemini (تم التحديد إلى gemini-2.5-flash وهو النموذج المستقر حاليًا)
+# ----------------------------------------------------------------------
 class GeminiAdapter(BaseAdapter):
-    def __init__(self, api_key: str, model_name: str = "gemini-2.0-flash-exp"):
+    def __init__(self, api_key: str, model_name: str = "gemini-2.5-flash"):
         super().__init__(api_key, model_name)
         if not HAS_GEMINI:
             raise ImportError("google-genai not installed")
         self.client = genai.Client(api_key=api_key)
 
     def generate(self, prompt: str, system_instruction: Optional[str] = None, *args, **kwargs) -> str:
-        # args يتم تجاهلها، و kwargs قد تحتوي على generation_config إلخ
         generation_config = kwargs.pop("generation_config", {})
-        if kwargs.get("response_mime_type") == "application/json":
-            generation_config["response_mime_type"] = "application/json"
         sys_instr = None
         if system_instruction:
             sys_instr = genai_types.Content(role="user", parts=[genai_types.Part(text=system_instruction)])
@@ -109,17 +93,17 @@ class GeminiAdapter(BaseAdapter):
         )
         return response.text
 
-
-# ========== محول Cohere ==========
+# ----------------------------------------------------------------------
+# Cohere (أحدث نموذج متوفر command-a-03-2025)
+# ----------------------------------------------------------------------
 class CohereAdapter(BaseAdapter):
-    def __init__(self, api_key: str, model_name: str = "command-r-plus"):
+    def __init__(self, api_key: str, model_name: str = "command-a-03-2025"):
         super().__init__(api_key, model_name)
         if not HAS_COHERE:
             raise ImportError("cohere not installed")
         self.client = cohere.Client(api_key=api_key)
 
     def generate(self, prompt: str, system_instruction: Optional[str] = None, *args, **kwargs) -> str:
-        # args و kwargs يمكن أن تحتوي على temperature, max_tokens إلخ
         response = self.client.chat(
             model=self.model_name,
             message=prompt,
@@ -128,8 +112,9 @@ class CohereAdapter(BaseAdapter):
         )
         return response.text
 
-
-# ========== محول Anthropic ==========
+# ----------------------------------------------------------------------
+# Anthropic (يتطلب رصيدًا كافيًا في الحساب)
+# ----------------------------------------------------------------------
 class AnthropicAdapter(BaseAdapter):
     def __init__(self, api_key: str, model_name: str = "claude-3-opus-20240229"):
         super().__init__(api_key, model_name)
@@ -148,10 +133,11 @@ class AnthropicAdapter(BaseAdapter):
         )
         return response.content[0].text
 
-
-# ========== محول Grok ==========
+# ----------------------------------------------------------------------
+# Grok (آخر نموذج متوفر في x.ai)
+# ----------------------------------------------------------------------
 class GrokAdapter(BaseAdapter):
-    def __init__(self, api_key: str, model_name: str = "grok-beta"):
+    def __init__(self, api_key: str, model_name: str = "grok-4.20-beta-0309-non-reasoning"):
         super().__init__(api_key, model_name)
         if not HAS_OPENAI:
             raise ImportError("openai not installed")
@@ -169,17 +155,18 @@ class GrokAdapter(BaseAdapter):
         )
         return response.choices[0].message.content
 
-
-# ========== مصنع المحولات ==========
+# ----------------------------------------------------------------------
+# مصنع المحولات
+# ----------------------------------------------------------------------
 def get_adapter(provider: str, api_key: str, model_name: Optional[str] = None) -> BaseAdapter:
     provider = provider.lower()
     if provider == "gemini":
-        return GeminiAdapter(api_key, model_name or "gemini-2.0-flash-exp")
+        return GeminiAdapter(api_key, model_name or "gemini-2.5-flash")
     elif provider == "cohere":
-        return CohereAdapter(api_key, model_name or "command-r-plus")
+        return CohereAdapter(api_key, model_name or "command-a-03-2025")
     elif provider == "anthropic":
         return AnthropicAdapter(api_key, model_name or "claude-3-opus-20240229")
     elif provider == "grok":
-        return GrokAdapter(api_key, model_name or "grok-beta")
+        return GrokAdapter(api_key, model_name or "grok-4.20-beta-0309-non-reasoning")
     else:
         raise ValueError(f"Unknown provider: {provider}")
