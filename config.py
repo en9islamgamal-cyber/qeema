@@ -1,5 +1,6 @@
 """
 config.py — VALUE / QEEMA v2
+الإعدادات المركزية المتقدمة (Advanced Settings)
 """
 
 import os
@@ -16,29 +17,35 @@ class APIKeys:
     YT_CLIENT_ID     = os.environ.get("YOUTUBE_CLIENT_ID", "")
     YT_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
     YT_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN", "")
+    # تم إضافتها للمستقبل في حال الترقية لمحرك صوت بشري فائق
+    ELEVENLABS       = os.environ.get("ELEVENLABS_API_KEY", "")
 
     @classmethod
     def validate(cls) -> list[str]:
+        # نكتفي بفحص الأساسيات حتى لا يتوقف البايبلاين بسبب مفاتيح اليوتيوب إذا كان في وضع DRY_RUN
         required = {
             "GEMINI_API_KEY":          cls.GEMINI,
             "LEONARDO_API_KEY":        cls.LEONARDO,
             "SUPABASE_URL":            cls.SUPABASE_URL,
             "SUPABASE_KEY":            cls.SUPABASE_KEY,
-            "YOUTUBE_CLIENT_ID":       cls.YT_CLIENT_ID,
-            "YOUTUBE_CLIENT_SECRET":   cls.YT_CLIENT_SECRET,
-            "YOUTUBE_REFRESH_TOKEN":   cls.YT_REFRESH_TOKEN,
         }
         return [k for k, v in required.items() if not v]
 
 
 class Paths:
-    ROOT       = Path(__file__).parent
+    # استخدام resolve() يضمن عدم حدوث أخطاء في مسارات الملفات مهما اختلف نظام التشغيل
+    ROOT       = Path(__file__).parent.resolve()
     ASSETS     = ROOT / "assets"
     FONTS      = ASSETS / "fonts"
     MUSIC      = ASSETS / "music"
     SFX        = ASSETS / "sfx"
     OVERLAYS   = ASSETS / "overlays"
     THUMBNAILS = ASSETS / "thumbnails"
+    
+    # 👈 حل مشكلة اللوجو: تعريف مسار ثابت له
+    LOGO_PRIMARY = ASSETS / "logo.png"
+    WATERMARK    = ASSETS / "watermark.png"
+
     OUTPUT     = ROOT / "output"
     VIDEOS     = OUTPUT / "videos"
     SHORTS     = OUTPUT / "shorts"
@@ -64,27 +71,36 @@ class VideoConfig:
     CODEC    = "libx264"
     PROFILE  = "high"
     LEVEL    = "4.2"
-    CRF      = 16
+    CRF      = 18        # توازن ممتاز بين حجم الملف وجودة اليوتيوب العالية
     PRESET   = "slow"
     PIX_FMT  = "yuv420p"
+    
     AUDIO_CODEC   = "aac"
-    AUDIO_BITRATE = "256k"
+    AUDIO_BITRATE = "320k" # ترقية لجودة صوت سينمائية
     AUDIO_RATE    = 48000
+    
     DEFAULT_DURATION = 300
     CROSSFADE_DURATION = 0.6
     FADE_IN_DURATION   = 0.8
     FADE_OUT_DURATION  = 1.2
+    
+    # 👈 إعدادات دمج اللوجو الجديدة
+    LOGO_MARGIN_X = 40
+    LOGO_MARGIN_Y = 40
+    LOGO_OPACITY = 0.85
 
 
 class VoiceConfig:
-    MODEL = "gemini-2.5-flash-preview-tts"
-    NARRATOR_VOICE = "Charon"
-    CHILD_VOICE = "Puck"
+    # تم تنظيف الإعدادات القديمة لتعكس المحرك الاحترافي الحالي (GCP Wavenet)
+    TTS_PROVIDER = "gcp"
+    GCP_VOICE_NARRATOR = "ar-XA-Wavenet-B"
+    GCP_PITCH = -2.0
+    GCP_SPEED = 0.90
+
     PCM_SAMPLE_RATE = 24000
-    PCM_CHANNELS    = 1
-    PCM_BIT_DEPTH   = 16
     OUTPUT_SAMPLE_RATE = 48000
-    OUTPUT_BITRATE     = "192k"
+    OUTPUT_BITRATE     = "320k"
+
     QURAN_CDN_ALAFASY   = "https://everyayah.com/data/Alafasy_128kbps/{surah:03d}{ayah:03d}.mp3"
     QURAN_CDN_SUDAIS    = "https://everyayah.com/data/Abdurrahmaan_As-Sudais_192kbps/{surah:03d}{ayah:03d}.mp3"
     QURAN_CDN_HUSARY    = "https://everyayah.com/data/Husary_128kbps/{surah:03d}{ayah:03d}.mp3"
@@ -93,44 +109,56 @@ class VoiceConfig:
 
 
 class SubtitleConfig:
+    # 👈 إضافة خطوط مخصصة إن وجدت، مع ألوان أكثر احترافية للطفل
+    PRIMARY_FONT = "Cairo, Arial"
+    QURAN_FONT   = "Amiri, Traditional Arabic"
+
     FONT_SIZE_LARGE  = 80
     FONT_SIZE_MEDIUM = 60
     FONT_SIZE_SMALL  = 42
-    COLOR_AYAH      = "white"
-    COLOR_NARRATOR  = "white"
-    COLOR_HIGHLIGHT = "#FFD700"
-    SHADOW_COLOR    = "black@0.9"
-    SHADOW_OFFSET   = 3
-    BORDER_WIDTH    = 4
-    BORDER_COLOR    = "black@0.8"
+    
+    COLOR_AYAH      = "#FFFDE7" # أبيض دافئ ومريح للعين
+    COLOR_NARRATOR  = "#FFFFFF"
+    COLOR_HIGHLIGHT = "#FFC107" # لون ذهبي للكلمات المهمة
+    COLOR_QURAN_GOLD= "#D4AF37" 
+
+    SHADOW_COLOR    = "black@0.6" # ظل ناعم بدلاً من الظل الحاد القديم
+    SHADOW_OFFSET   = 4
+    BORDER_WIDTH    = 3
+    BORDER_COLOR    = "#1A1A1A@0.8"
+
     MARGIN_BOTTOM_H  = 120
     MARGIN_BOTTOM_V  = 200
-    BOX_PADDING      = 20
-    BOX_COLOR        = "black@0.55"
-    BOX_BORDER_RADIUS = 12
+    BOX_PADDING      = 25
+    BOX_COLOR        = "#000000@0.4" # صندوق ترجمة أنيق شبه شفاف
+    BOX_BORDER_RADIUS = 16
 
 
 class VisualConfig:
     MODEL_ANIME    = "e71a1c2f-4f80-4800-934f-2c68979d8cc8"
     MODEL_CREATIVE = "6bef9f1b-29cb-40c7-b9df-32b51c1f67d3"
     MODEL_VISION   = "aa77f04e-3eec-4034-9c07-d0f619684628"
-    WIDTH  = 1440
-    HEIGHT = 1440
-    GUIDANCE_SCALE = 7
-    STEPS = 35
+    
+    WIDTH  = 1920 # 👈 تعديل للأبعاد القياسية لليوتيوب
+    HEIGHT = 1080
+    GUIDANCE_SCALE = 8 # زيادة التزام الموديل بوصف الصورة
+    STEPS = 40         # زيادة دقة الصورة وجودتها
     NUM_IMAGES = 1
+    
+    # 👈 التغيير السحري هنا: توجيه صارم لنمط الإنفوجرافيك النظيف 
     STYLE_SUFFIX = (
-        "children's illustrated Arabic Islamic style, "
-        "warm soft colors, 2D flat art, cozy atmosphere, "
-        "mosque geometric patterns, Arabic calligraphy accents, "
-        "safe welcoming environment, child-friendly, "
-        "professional high quality illustration"
+        ", premium minimalist flat vector infographic, clean modern UI style, "
+        "corporate Islamic education aesthetic, solid pastel background, "
+        "warm cozy palette, precise geometric vectors, NO TEXT, NO LETTERS, "
+        "high-end motion graphics asset, polished, 8k resolution"
     )
+    # 👈 منع الأشياء البدائية والمشوهة بشكل قاطع
     NEGATIVE_PROMPT = (
-        "realistic photo, violence, scary, darkness, "
-        "distorted faces, ugly, low quality, watermark, "
-        "western anime, inappropriate content"
+        "text, letters, words, realistic photo, 3d render, messy, chaotic, "
+        "scary, violence, darkness, distorted faces, ugly, low quality, "
+        "watermark, signature, western anime, inappropriate content"
     )
+    
     POLL_INTERVAL = 6
     MAX_POLLS     = 20
 
