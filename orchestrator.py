@@ -2,10 +2,10 @@
 orchestrator.py — VALUE / QEEMA v3.0 (Enterprise Architecture)
 ═══════════════════════════════════════════════════════
 قائد المنظومة الكاملة (The Master Controller)
-• استئناف ذكي وموثوق 100% مع حفظ حالة السكريبت (State Persistence)
+• دمج تام لمحرك التلعيب (Gamification Integration)
+• استئناف ذكي وموثوق 100% مع حفظ حالة السكريبت
 • تتبع زمني لأداء المحركات (Performance Metrics)
-• تنظيف آلي للملفات المؤقتة لتوفير مساحة السيرفر (Garbage Collection)
-• معالجة استثنائية شاملة وحفظ الحالة في Supabase
+• تنظيف آلي صارم للملفات المؤقتة لتوفير مساحة السيرفر
 ═══════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -99,17 +99,12 @@ class PipelineOrchestrator:
         return res.data[0]["id"]
 
     def _save_script_state(self, script: EpisodeScript) -> None:
-        """
-        [ترقية حيوية]: يحفظ حالة السكريبت في كل مرحلة 
-        ليضمن عدم ضياع مسارات الملفات (الصور والصوت) عند الانقطاع.
-        """
         save_path = Paths.SCRIPT_DIR / f"episode_{script.episode_number:03d}.json"
         save_path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
         logger.debug(f"💾 تم حفظ حالة السكريبت محلياً بنجاح.")
 
     # ──────────────────────────── Core Stages ──────
     def _stage_script(self, ep_num: int) -> EpisodeScript:
-        """مرحلة 1: هندسة السكريبت (Scripting)"""
         logger.info("📝 [المرحلة 1]: توليد السكريبت...")
         cached = self.script.load_from_disk(ep_num)
         if cached:
@@ -118,40 +113,34 @@ class PipelineOrchestrator:
         return self.script.generate(ep_num)
 
     def _stage_audio(self, script: EpisodeScript, ep_dir: str) -> dict:
-        """مرحلة 2: الإنتاج الصوتي (Voice & SFX)"""
         logger.info("🎙️ [المرحلة 2]: هندسة الصوت والمؤثرات...")
         audio_map_file = Path(ep_dir) / "audio_map.json"
-        
-        # قراءة آمنة
+
         if audio_map_file.exists():
             try:
                 raw = json.loads(audio_map_file.read_text())
                 if isinstance(raw, dict) and all(Path(str(p)).exists() for p in raw.values()):
                     logger.info("♻️ استئناف: تم استرجاع خريطة الصوت من القرص.")
-                    self._update_script_audio_paths(script, raw) # تحديث السكريبت في الذاكرة
+                    self._update_script_audio_paths(script, raw)
                     return raw
             except Exception as e:
                 logger.warning(f"⚠️ ملف audio_map.json غير صالح، سيتم إعادة التوليد. الخطأ: {e}")
 
-        # التوليد الفعلي
         audio_map = self.voice.generate_episode_audio(script, ep_dir)
-        
+
         if not isinstance(audio_map, dict):
             logger.error(f"❌ خطأ حرج: محرك الصوت أعاد {type(audio_map)} بدلاً من dict.")
             raise ValueError("مخرجات محرك الصوت غير متوافقة برمجياً.")
 
         audio_map_file.write_text(json.dumps(audio_map, ensure_ascii=False))
 
-        # دمج المؤثرات
         processed = self.sfx.process_all(audio_map, script, ep_dir)
         self._update_script_audio_paths(script, processed)
-        
-        # حفظ السكريبت المُحدث (تأمين المسارات)
+
         self._save_script_state(script) 
         return processed
 
     def _update_script_audio_paths(self, script: EpisodeScript, audio_map: dict) -> None:
-        """يحدّث مسارات الصوت في السكريبت"""
         if "intro" in audio_map:
             script.intro_scene.audio_path = audio_map["intro"]
         if "outro" in audio_map:
@@ -166,15 +155,13 @@ class PipelineOrchestrator:
             if f"mid_{sid}" in audio_map: scene.audio_path = audio_map[f"mid_{sid}"]
 
     def _stage_visuals(self, script: EpisodeScript, ep_dir: str) -> None:
-        """مرحلة 3: الإنتاج البصري (Visuals & Infographics)"""
         logger.info("🎨 [المرحلة 3]: توليد الإنفوجرافيك البصري...")
         vis_map_file = Path(ep_dir) / "visuals_map.json"
-        
+
         if vis_map_file.exists():
             logger.info("♻️ استئناف: تم استرجاع خريطة الصور من القرص.")
             vis_map = json.loads(vis_map_file.read_text())
-            
-            # ربط المسارات الموجودة
+
             if vis_map.get("intro") and Path(vis_map["intro"]).exists():
                 script.intro_scene.image_path = vis_map["intro"]
             if vis_map.get("outro") and Path(vis_map["outro"]).exists():
@@ -189,32 +176,37 @@ class PipelineOrchestrator:
                     sc.image_path = vis_map[k]
             return
 
-        # توليد الصور (والذي يقوم بتحديث كائن السكريبت داخلياً)
         self.visual.generate_episode_visuals(script, ep_dir)
 
-        # حفظ الخريطة
         vis_map = {"intro": script.intro_scene.image_path, "outro": script.outro_scene.image_path}
         for sc in script.ayah_scenes:
             vis_map[f"ayah_{sc.scene_id}"] = sc.image_path
         for sc in script.mid_scenes:
             vis_map[f"mid_{sc.scene_id}"] = sc.image_path
-            
+
         vis_map_file.write_text(json.dumps(vis_map, ensure_ascii=False))
-        
-        # حفظ السكريبت المُحدث (تأمين المسارات)
         self._save_script_state(script)
 
     def _stage_video(self, script: EpisodeScript, ep_dir: str) -> str:
-        """مرحلة 4: المونتاج وتجميع الفيديو (Video Assembly)"""
-        logger.info("🎬 [المرحلة 4]: تجميع ومونتاج الفيديو...")
-        final_path = Paths.VIDEOS / f"ep_{script.episode_number:03d}_final.mp4"
-        if final_path.exists():
-            logger.info("♻️ استئناف: تم العثور على الفيديو النهائي مسبقاً.")
-            return str(final_path)
+        logger.info("🎬 [المرحلة 4]: تجميع ومونتاج الفيديو الأساسي...")
+        raw_path = Paths.VIDEOS / f"ep_{script.episode_number:03d}_raw.mp4"
+        if raw_path.exists():
+            logger.info("♻️ استئناف: تم العثور على الفيديو الخام مسبقاً.")
+            return str(raw_path)
         return self.video.assemble_episode(script, ep_dir)
 
+    def _stage_gamification(self, script: EpisodeScript, raw_video_path: str) -> str:
+        """مرحلة 4.5: إضافة التلعيب (Progress bar, Encouragements)"""
+        logger.info("🎮 [المرحلة 4.5]: دمج تأثيرات التلعيب البصري...")
+        gamified_path = str(Paths.VIDEOS / f"ep_{script.episode_number:03d}_final.mp4")
+        
+        if Path(gamified_path).exists():
+            logger.info("♻️ استئناف: تم العثور على الفيديو النهائي (المُلعب) مسبقاً.")
+            return gamified_path
+            
+        return self.gamify.apply_to_episode(raw_video_path, script, gamified_path)
+
     def _stage_thumbnail(self, script: EpisodeScript, ep_dir: str) -> str:
-        """مرحلة 5: الغلاف المصغر (Thumbnail)"""
         logger.info("🖼️ [المرحلة 5]: تصميم الغلاف المصغر...")
         thumb_path = Paths.THUMBNAILS / f"ep_{script.episode_number:03d}.jpg"
         if thumb_path.exists():
@@ -225,7 +217,6 @@ class PipelineOrchestrator:
         return self.thumbnail.create(script, script.episode_number, scene_img)
 
     def _stage_upload(self, script: EpisodeScript, video_path: str, thumb_path: str) -> str:
-        """مرحلة 6: النشر على YouTube"""
         logger.info("📤 [المرحلة 6]: رفع الفيديو على منصة YouTube...")
         dry = __import__("os").environ.get("DRY_RUN", "false").lower() == "true"
         if dry:
@@ -286,15 +277,24 @@ class PipelineOrchestrator:
 
         return vid_id
 
-    def _cleanup_temp_files(self, ep_dir: str):
-        """تنظيف الملفات المؤقتة لتوفير مساحة القرص بعد النشر الناجح"""
+    def _cleanup_temp_files(self, ep_dir: str, raw_video_path: Optional[str] = None):
+        """تنظيف شامل للملفات المؤقتة لتوفير مساحة السيرفر"""
+        # مسح مجلد الـ segments
         seg_dir = Path(ep_dir) / "segments"
         if seg_dir.exists():
             try:
                 shutil.rmtree(seg_dir)
-                logger.info("🧹 تم تنظيف المقاطع المؤقتة (Garbage Collection) لتوفير المساحة.")
+                logger.info("🧹 تم تنظيف المقاطع المؤقتة (Segments) لتوفير المساحة.")
             except Exception as e:
                 logger.warning(f"⚠️ لم يتم تنظيف الملفات المؤقتة: {e}")
+                
+        # مسح الفيديو الخام بعد نجاح إصدار الفيديو النهائي المُلعب
+        if raw_video_path and Path(raw_video_path).exists():
+            try:
+                Path(raw_video_path).unlink()
+                logger.info("🧹 تم مسح الفيديو الخام لتوفير المساحة.")
+            except Exception as e:
+                pass
 
     # ──────────────────────────── Main Pipeline ─
     def run(self, episode_number: int) -> bool:
@@ -327,23 +327,28 @@ class PipelineOrchestrator:
             self._stage_visuals(script, ep_dir)
             logger.info(f"⏱️ اكتمل الإنتاج البصري في {time.time()-t0:.1f} ثانية")
 
-            # 4. Video Assembly
+            # 4. Video Assembly (الفيديو الخام)
             t0 = time.time()
             self._db_update(ep_id, status=EpisodeStatus.VIDEO)
-            video_path = self._stage_video(script, ep_dir)
-            self._db_update(ep_id, status=EpisodeStatus.THUMBNAIL, video_path=video_path)
-            logger.info(f"⏱️ اكتمل المونتاج في {time.time()-t0:.1f} ثانية")
+            raw_video_path = self._stage_video(script, ep_dir)
+            logger.info(f"⏱️ اكتمل المونتاج الأساسي في {time.time()-t0:.1f} ثانية")
+
+            # 4.5. Gamification (التلعيب والفيديو النهائي)
+            t0 = time.time()
+            final_video_path = self._stage_gamification(script, raw_video_path)
+            self._db_update(ep_id, status=EpisodeStatus.THUMBNAIL, video_path=final_video_path)
+            logger.info(f"⏱️ اكتملت تأثيرات التلعيب في {time.time()-t0:.1f} ثانية")
 
             # 5. Thumbnail
             t0 = time.time()
             thumb_path = self._stage_thumbnail(script, ep_dir)
             self._db_update(ep_id, status=EpisodeStatus.UPLOADING, thumbnail_path=thumb_path)
 
-            # 6. Upload
+            # 6. Upload (رفع الفيديو النهائي)
             t0 = time.time()
-            vid_id  = self._stage_upload(script, video_path, thumb_path)
+            vid_id  = self._stage_upload(script, final_video_path, thumb_path)
             logger.info(f"⏱️ اكتمل النشر في {time.time()-t0:.1f} ثانية")
-            
+
             yt_url  = f"https://youtube.com/watch?v={vid_id}"
             self._db_update(
                 ep_id,
@@ -354,7 +359,7 @@ class PipelineOrchestrator:
             )
 
             # 7. Cleanup
-            self._cleanup_temp_files(ep_dir)
+            self._cleanup_temp_files(ep_dir, raw_video_path)
 
             total_time = (time.time() - start_time) / 60
             logger.info(f"\n🎉 الحلقة {episode_number} نُشرت بنجاح!")
