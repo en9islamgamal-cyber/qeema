@@ -1,160 +1,206 @@
-"""
-visual_engine.py — VALUE / QEEMA v2
-محرك الصور: ذكاء الإنفوجرافيك (Smart Infographic Engine)
-• توليد حصري لرسوم الإنفوجرافيك المسطحة للأطفال
-• خالية من الصور الثابتة، وتعتمد على محاولات بديلة ذكية
-"""
-
 from __future__ import annotations
 
 import logging
 import time
+import re
 from pathlib import Path
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple
 
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from config import APIKeys, Paths, VisualConfig
-from models import AyahScene, EpisodeScript, NarratorScene
+from models import EpisodeScript
 
 logger = logging.getLogger(__name__)
 
+class LeonardoAPIError(RuntimeError):
+    pass
+
 class VisualEngine:
     API = "https://cloud.leonardo.ai/api/rest/v1"
-    
-    # 👈 الأساس الصارم للإنفوجرافيك
+
     BASE_STYLE = (
-        "flat vector graphic, 2d educational infographic style for kids, "
-        "clean solid pastel background, modern UI elements, simple shapes, "
-        "no text, no letters, no gradients, highly aesthetic, minimalist"
+        "flat vector infographic, 2D educational illustration for children, "
+        "clean solid pastel background, simple shapes, geometric composition, "
+        "high readability, no text, no letters, no gradients, no photo realism, "
+        "minimalist, polished, premium editorial design"
+    )
+
+    STYLE_BY_SCENE = {
+        "intro": "warm welcoming educational hero illustration, balanced symmetry, cheerful icons",
+        "outro": "closing illustration, calm joyful ending, gentle composition",
+        "narrator": "explanatory icon-driven infographic, structured layout, clear visual hierarchy",
+        "ayah": "respectful symbolic educational illustration, serene palette, abstract sacred motifs"
+    }
+
+    NEGATIVE_OVERRIDES = (
+        "text, captions, watermark, logo, blurry, cluttered layout, noisy background, "
+        "photograph, realistic skin, 3D render, extra limbs, distorted objects, low contrast"
     )
 
     def __init__(self):
         if not APIKeys.LEONARDO:
-            raise ValueError("❌ مفتاح LEONARDO_API_KEY مفقود")
+            raise ValueError("LEONARDO_API_KEY missing")
+
         self.headers = {
             "authorization": f"Bearer {APIKeys.LEONARDO}",
             "content-type": "application/json",
+            "accept": "application/json",
         }
         Paths.ensure_all()
 
+    def _normalize_prompt(self, text: str) -> str:
+        text = re.sub(r"s+", " ", text).strip()
+        text = text.replace("،،", "،").replace("..", ".")
+        return text
+
+    def _scene_style(self, scene_type: str) -> str:
+        return self.STYLE_BY_SCENE.get(scene_type, self.STYLE_BY_SCENE["narrator"])
+
     def _build_infographic_prompt(self, base_concept: str, scene_type: str) -> str:
-        """
-        حقن متغير وذكي لأسلوب الإنفوجرافيك بناءً على نوع المشهد،
-        ليمنع التكرار والرتابة ويضمن التنوع في كل فيديو.
-        """
-        # إذا كان المشهد راوي (مقدمة/خاتمة/شرح)، نركز على الأيقونات التوضيحية
-        if scene_type in ["intro", "outro", "narrator"]:
-            modifiers = "isometric vector illustration, bright cheerful colors, educational concept art, "
-        # إذا كان قرآن (آية)، نركز على الرسوم البيانية الروحانية الهادئة
-        else:
-            modifiers = "geometric Islamic patterns vector, calm warm color palette, symbolic minimalist art, "
+        base_concept = self._normalize_prompt(base_concept)
+        scene_style = self._scene_style(scene_type)
 
-        # دمج الفكرة الأساسية + المتغيرات + الأساس الصارم
-        full_prompt = f"{base_concept}, {modifiers} {self.BASE_STYLE}"
-        return full_prompt.replace(", ,", ",").strip()
+        prompt = (
+            f"{base_concept}. "
+            f"{scene_style}. "
+            f"{self.BASE_STYLE}. "
+            f"composition focused, centered subject, strong silhouettes, soft pastel palette, "
+            f"storybook clarity, premium children's educational design"
+        )
+        return self._normalize_prompt(prompt)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=5, max=15))
-    def _request(self, prompt: str) -> str:
-        """إرسال الطلب مع إجبار الذكاء الاصطناعي على الرسم (ILLUSTRATION)"""
-        payload = {
+    def _build_fallback_prompts(self, original_prompt: str, scene_type: str) -> List[str]:
+        original_prompt = self._normalize_prompt(original_prompt)
+
+        return [
+            self._build_infographic_prompt(original_prompt, scene_type),
+            self._normalize_prompt(
+                f"{self._scene_style(scene_type)}, {self.BASE_STYLE}, "
+                f"simple symbolic composition, clean iconography, pastel background"
+            ),
+            self._normalize_prompt(
+                f"{self.BASE_STYLE}, abstract symbolic educational art, "
+                f"children's infographic style, minimal, calm, clear"
+            ),
+        ]
+
+    def _payload_for_prompt(self, prompt: str) -> dict:
+        return {
             "prompt": prompt,
-            "negative_prompt": VisualConfig.NEGATIVE_PROMPT,
-            "modelId": VisualConfig.MODEL_ANIME, # يفضل استخدام موديل يدعم الرسوميات
+            "negative_prompt": f"{VisualConfig.NEGATIVE_PROMPT}, {self.NEGATIVE_OVERRIDES}",
+            "modelId": VisualConfig.MODEL_ANIME,
             "num_images": VisualConfig.NUM_IMAGES,
             "width": VisualConfig.WIDTH,
             "height": VisualConfig.HEIGHT,
             "guidance_scale": VisualConfig.GUIDANCE_SCALE,
             "num_inference_steps": VisualConfig.STEPS,
-            "presetStyle": "ILLUSTRATION" # 👈 إجبار على الرسم المسطح
+            "presetStyle": "ILLUSTRATION",
         }
 
-        r = requests.post(f"{self.API}/generations", headers=self.headers, json=payload, timeout=30)
-        if r.status_code != 200:
-            logger.error(f"Leonardo API Request Error: {r.text}")
-        r.raise_for_status()
-        
-        return r.json()["sdGenerationJob"]["generationId"]
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(min=2, max=10),
+        retry=retry_if_exception_type(requests.RequestException),
+    )
+    def _request(self, prompt: str) -> str:
+        payload = self._payload_for_prompt(prompt)
+        r = requests.post(f"{self.API}/generations", headers=self.headers, json=payload, timeout=45)
+        if r.status_code not in (200, 201):
+            raise LeonardoAPIError(f"Request failed: {r.status_code} | {r.text}")
 
-    @retry(stop=stop_after_attempt(12), wait=wait_exponential(min=4, max=15))
-    def _poll(self, gen_id: str) -> str:
-        r = requests.get(f"{self.API}/generations/{gen_id}", headers=self.headers, timeout=15)
+        data = r.json()
+        gen_id = (
+            data.get("sdGenerationJob", {}).get("generationId")
+            or data.get("generationId")
+        )
+        if not gen_id:
+            raise LeonardoAPIError(f"Missing generationId: {data}")
+        return gen_id
+
+    def _poll_once(self, gen_id: str) -> Tuple[str, dict]:
+        r = requests.get(f"{self.API}/generations/{gen_id}", headers=self.headers, timeout=20)
         r.raise_for_status()
         data = r.json().get("generations_by_pk", {})
-        
-        status = data.get("status")
+        status = data.get("status", "")
+        return status, data
+
+    @retry(
+        stop=stop_after_attempt(18),
+        wait=wait_exponential(min=2, max=12),
+        retry=retry_if_exception_type(LeonardoAPIError),
+    )
+    def _poll_until_complete(self, gen_id: str) -> str:
+        status, data = self._poll_once(gen_id)
+
         if status == "COMPLETE":
-            return data["generated_images"][0]["url"]
+            images = data.get("generated_images", [])
+            if not images:
+                raise LeonardoAPIError("Complete but no generated_images returned")
+            return images[0]["url"]
+
         if status == "FAILED":
-            raise RuntimeError("Generation marked as FAILED by Leonardo.")
-        raise Exception("Still processing...")
+            raise LeonardoAPIError(data.get("failed_reason") or "Generation failed")
+
+        raise LeonardoAPIError(f"Generation not ready: {status}")
 
     def _download(self, url: str, path: str) -> str:
-        r = requests.get(url, timeout=30)
+        r = requests.get(url, timeout=45)
         r.raise_for_status()
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_bytes(r.content)
-        return path
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(r.content)
+        return str(p)
+
+    def _quality_gate(self, image_path: str) -> bool:
+        p = Path(image_path)
+        return p.exists() and p.stat().st_size > 10_000
+
+    def _generate_with_prompt(self, prompt: str, output_path: str) -> str:
+        gen_id = self._request(prompt)
+        url = self._poll_until_complete(gen_id)
+        saved = self._download(url, output_path)
+
+        if not self._quality_gate(saved):
+            raise LeonardoAPIError("Quality gate failed")
+
+        return saved
 
     def generate_scene_image(
         self, original_prompt: str, output_path: str, scene_type: str = "narrator"
     ) -> str:
-        """
-        توليد ذكي: إذا فشل الوصف المعقد، يحاول المحرك تبسيط الوصف 
-        لتوليد صورة حقيقية بدلاً من الاستسلام لصور ثابتة.
-        """
-        primary_prompt = self._build_infographic_prompt(original_prompt, scene_type)
-        logger.info(f"📊 توليد إنفوجرافيك: {original_prompt[:45]}...")
-        
-        try:
-            gen_id = self._request(primary_prompt)
-            time.sleep(4)
-            url = self._poll(gen_id)
-            return self._download(url, output_path)
-            
-        except Exception as e:
-            logger.warning(f"⚠️ فشل الطلب الأساسي للإنفوجرافيك. السبب: {e}")
-            logger.info("🔄 تفعيل المحاولة الذكية بوصف بديل مبسط...")
-            
-            # 👈 المحاولة الذكية (Smart Fallback): إرسال وصف مبسط جداً لتجاوز أخطاء الكلمات المحظورة أو التعقيد
-            safe_prompt = f"abstract minimalist islamic vector art, flat colors, {self.BASE_STYLE}"
-            
+        prompts = self._build_fallback_prompts(original_prompt, scene_type)
+        last_error = None
+
+        for idx, prompt in enumerate(prompts, start=1):
             try:
-                gen_id = self._request(safe_prompt)
-                time.sleep(4)
-                url = self._poll(gen_id)
-                logger.info("✅ نجحت المحاولة الذكية للإنفوجرافيك.")
-                return self._download(url, output_path)
-            except Exception as final_e:
-                logger.error(f"❌ فشلت جميع محاولات التوليد. النظام يتطلب التدخل: {final_e}")
-                raise RuntimeError(f"فشل ذريع في توليد الصورة للمسار: {output_path}")
+                logger.info(f"Generating image attempt {idx}: {prompt[:90]}...")
+                return self._generate_with_prompt(prompt, output_path)
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Attempt {idx} failed: {e}")
+
+        raise RuntimeError(f"Failed to generate image: {output_path}") from last_error
 
     def generate_episode_visuals(self, script: EpisodeScript, ep_dir: str) -> None:
         vis_dir = Path(ep_dir) / "visuals"
         vis_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"📈 بدء معالجة الإنفوجرافيك للحلقة {script.episode_number}")
+        logger.info(f"Starting visuals for episode {script.episode_number}")
 
-        p_intro = str(vis_dir / "intro.png")
-        self.generate_scene_image(script.intro_scene.visual_prompt, p_intro, "intro")
-        script.intro_scene.image_path = p_intro
-        time.sleep(2)
+        items = [
+            (script.intro_scene, "intro", "intro.png"),
+            *[(sc, "ayah", f"ayah_{sc.scene_id:03d}.png") for sc in script.ayah_scenes],
+            *[(sc, "narrator", f"mid_{sc.scene_id:03d}.png") for sc in script.mid_scenes],
+            (script.outro_scene, "outro", "outro.png"),
+        ]
 
-        for sc in script.ayah_scenes:
-            p_ayah = str(vis_dir / f"ayah_{sc.scene_id:03d}.png")
-            self.generate_scene_image(sc.visual_prompt, p_ayah, "ayah")
-            sc.image_path = p_ayah
-            time.sleep(2)
+        for scene, scene_type, filename in items:
+            output_path = str(vis_dir / filename)
+            self.generate_scene_image(scene.visual_prompt, output_path, scene_type)
+            scene.image_path = output_path
+            time.sleep(1.0)
 
-        for sc in script.mid_scenes:
-            p_mid = str(vis_dir / f"mid_{sc.scene_id:03d}.png")
-            self.generate_scene_image(sc.visual_prompt, p_mid, "narrator")
-            sc.image_path = p_mid
-            time.sleep(2)
-
-        p_outro = str(vis_dir / "outro.png")
-        self.generate_scene_image(script.outro_scene.visual_prompt, p_outro, "outro")
-        script.outro_scene.image_path = p_outro
-
-        logger.info("✅ اكتمل توليد جميع الإنفوجرافيكس بنجاح")
+        logger.info("All visuals generated successfully")
