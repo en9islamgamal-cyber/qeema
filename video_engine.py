@@ -1,67 +1,77 @@
-"""
-video_engine.py — VALUE / QEEMA v3.0 (Enterprise Architecture)
-═══════════════════════════════════════════════════════
-محرك تجميع الفيديو (Lossless Assembly Engine)
-• دمج لحظي بدون فقدان جودة (Zero-Loss Concat)
-• معالجة النصوص العربية الطويلة (Word Wrapping)
-• تنعيم حواف الصوت (Audio Fades) لمنع الطقطقة
-• تصدير الفيديو "خاماً" ليتم تشطيبه نهائياً في محرك التلعيب
-═══════════════════════════════════════════════════════
-"""
-
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import shutil
 import subprocess
 import textwrap
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple
 
 from config import Paths, SubtitleConfig, VideoConfig
-from models import AyahScene, EpisodeScript, NarratorScene
+from models import EpisodeScript
 
 logger = logging.getLogger(__name__)
 
 
-def _run(cmd: list[str], label: str = "", timeout: int = 600) -> bool:
-    logger.info(f"▶ {label}")
+def _run(cmd: list[str], label: str = "", timeout: int = 900) -> bool:
+    logger.info("▶ %s", label)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0:
-            logger.error(f"❌ {label}:\n{r.stderr[-600:]}")
+            logger.error("❌ %s
+%s", label, r.stderr[-2000:])
             return False
         return True
     except subprocess.TimeoutExpired:
-        logger.error(f"⏱️ Timeout: {label}")
+        logger.error("⏱️ Timeout: %s", label)
         return False
+
+
+def _probe(path: str) -> dict:
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams", "-show_format",
+        path
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffprobe failed for {path}")
+    return json.loads(r.stdout)
 
 
 def _probe_duration(path: str) -> float:
     try:
-        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        return float(json.loads(r.stdout)["format"]["duration"])
+        data = _probe(path)
+        return float(data["format"]["duration"])
     except Exception:
-        return 10.0
+        return 0.0
+
+
+def _sha_name(text: str, prefix: str, ext: str = ".png") -> str:
+    h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}_{h}{ext}"
 
 
 def _get_font() -> str:
-    primary_font = Paths.FONTS / "Amiri-Bold.ttf"
-    if primary_font.exists():
-        return str(primary_font)
-
-    font_dir = Paths.FONTS
-    for ext in ["*.ttf", "*.otf"]:
-        fonts = list(font_dir.glob(ext))
-        if fonts:
-            return str(fonts[0])
+    candidates = [
+        Paths.FONTS / "Amiri-Bold.ttf",
+        Paths.FONTS / "NotoNaskhArabic-Regular.ttf",
+        Paths.FONTS / "Cairo-Bold.ttf",
+        Paths.FONTS / "NotoSansArabic-Regular.ttf",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
 
     system_fonts = [
-        "/usr/share/fonts/truetype/arabic/Amiri-Bold.ttf",
         "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
     ]
     for f in system_fonts:
@@ -71,66 +81,124 @@ def _get_font() -> str:
 
 
 class SubtitleOverlay:
-    """يولد صور overlay للسبتايتل مع دعم للأسطر المتعددة"""
-
     def __init__(self, width: int, height: int):
-        self.width  = width
+        self.width = width
         self.height = height
+        self.font_path = _get_font()
+
+    def _fit_font_size(self, draw, text: str, max_width: int, start_size: int) -> int:
+        try:
+            from PIL import ImageFont
+        except ImportError:
+            return start_size
+
+        size = start_size
+        while size > 24:
+            try:
+                font = ImageFont.truetype(self.font_path, size) if self.font_path else ImageFont.load_default()
+                bbox = draw.multiline_textbbox((0, 0), text, font=font, align="center", spacing=12)
+                if (bbox[2] - bbox[0]) <= max_width:
+                    return size
+            except Exception:
+                pass
+            size -= 2
+        return 24
+
+    def _shape_arabic(self, text: str) -> str:
+        try:
+            import arabic_reshaper
+            from bidi.algorithm import get_display
+            reshaped = arabic_reshaper.reshape(text)
+            return get_display(reshaped)
+        except Exception:
+            return text
+
+    def _wrap_text(self, text: str, max_chars: int) -> str:
+        parts = text.replace("
+", " ").split()
+        lines = []
+        current = ""
+        for w in parts:
+            candidate = f"{current} {w}".strip()
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = w
+        if current:
+            lines.append(current)
+        return "
+".join(lines)
 
     def create(
         self,
         text: str,
         output_path: str,
         font_size: int = 60,
-        text_color: tuple = (255, 255, 255),
+        text_color: tuple[int, int, int] = (255, 255, 255),
         is_ayah: bool = False,
     ) -> str:
         try:
             from PIL import Image, ImageDraw, ImageFont
-            import arabic_reshaper
-            from bidi.algorithm import get_display
         except ImportError:
-            logger.warning("⚠️ مكتبات الخطوط غير مثبتة (Pillow, arabic-reshaper, python-bidi)")
+            logger.warning("Pillow is missing")
             return ""
 
-        wrap_width = 40 if is_ayah else 55 
-        wrapped_text = textwrap.fill(text, width=wrap_width)
+        if not text.strip():
+            return ""
 
-        try:
-            reshaped = arabic_reshaper.reshape(wrapped_text)
-            display  = get_display(reshaped)
-        except Exception:
-            display = wrapped_text
+        wrap_width = 34 if is_ayah else 46
+        wrapped = self._wrap_text(text, wrap_width)
+        display = self._shape_arabic(wrapped)
 
-        img  = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
+        img = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
-        font_path = _get_font()
         try:
-            font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
+            font_size = self._fit_font_size(draw, display, int(self.width * 0.86), font_size)
+            font = ImageFont.truetype(self.font_path, font_size) if self.font_path else ImageFont.load_default()
         except Exception:
             font = ImageFont.load_default()
 
-        bbox = draw.multiline_textbbox((0, 0), display, font=font, align="center")
-        tw   = bbox[2] - bbox[0]
-        th   = bbox[3] - bbox[1]
+        bbox = draw.multiline_textbbox((0, 0), display, font=font, align="center", spacing=12)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
 
-        margin = SubtitleConfig.MARGIN_BOTTOM_H
-        x = (self.width  - tw) // 2
-        y = self.height - th - margin
+        x = (self.width - tw) // 2
+        y = self.height - th - SubtitleConfig.MARGIN_BOTTOM_H
 
-        pad = SubtitleConfig.BOX_PADDING
-        bg_rect = [x - pad, y - pad, x + tw + pad, y + th + pad]
-        draw.rounded_rectangle(bg_rect, radius=SubtitleConfig.BOX_BORDER_RADIUS, fill=(0, 0, 0, 160))
+        pad_x = SubtitleConfig.BOX_PADDING
+        pad_y = SubtitleConfig.BOX_PADDING
+        bg_rect = [x - pad_x, y - pad_y, x + tw + pad_x, y + th + pad_y]
 
-        outline_color = (212, 175, 55, 180) if is_ayah else (255, 255, 255, 50)
-        draw.rounded_rectangle(bg_rect, radius=SubtitleConfig.BOX_BORDER_RADIUS, outline=outline_color, width=2)
+        draw.rounded_rectangle(
+            bg_rect,
+            radius=SubtitleConfig.BOX_BORDER_RADIUS,
+            fill=(0, 0, 0, 165),
+            outline=(212, 175, 55, 180) if is_ayah else (255, 255, 255, 50),
+            width=2
+        )
 
-        so = SubtitleConfig.SHADOW_OFFSET
-        draw.multiline_text((x + so, y + so), display, font=font, fill=(0, 0, 0, 200), align="center")
+        shadow_offset = SubtitleConfig.SHADOW_OFFSET
+        draw.multiline_text(
+            (x + shadow_offset, y + shadow_offset),
+            display,
+            font=font,
+            fill=(0, 0, 0, 210),
+            align="center",
+            spacing=12,
+        )
 
         color = (255, 215, 0, 255) if is_ayah else (*text_color, 255)
-        draw.multiline_text((x, y), display, font=font, fill=color, align="center")
+        draw.multiline_text(
+            (x, y),
+            display,
+            font=font,
+            fill=color,
+            align="center",
+            spacing=12,
+        )
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         img.save(output_path, "PNG")
@@ -138,26 +206,46 @@ class SubtitleOverlay:
 
 
 class SegmentBuilder:
-    """يبني مقاطع الفيديو الفردية بدقة متناهية"""
-
     def __init__(self, width: int = 1920, height: int = 1080):
         self.W = width
         self.H = height
-        self._sub = SubtitleOverlay(width, height)
+        self.sub = SubtitleOverlay(width, height)
 
-    def _scale_image_filter(self) -> str:
-        return f"scale={self.W * 2}:{self.H * 2}:flags=lanczos,crop={self.W}:{self.H}"
+    def _base_filter(self, duration: float, zoom: bool = True, zoom_speed: float = 0.00055) -> str:
+        if zoom:
+            frames = max(int(duration * VideoConfig.FPS), 1)
+            max_z = min(1.0 + zoom_speed * frames, 1.08)
+            return (
+                f"scale=8000:-1:flags=lanczos,"
+                f"zoompan=z='min(zoom+{zoom_speed},{max_z})':d={frames}:"
+                f"s={self.W}x{self.H}:fps={VideoConfig.FPS}"
+            )
+        return f"scale={self.W}:{self.H}:force_original_aspect_ratio=decrease,pad={self.W}:{self.H}:(ow-iw)/2:(oh-ih)/2"
 
-    def _ken_burns(self, duration: float, zoom_speed: float = 0.0006) -> str:
-        frames = int(duration * VideoConfig.FPS)
-        max_z  = min(1.0 + zoom_speed * frames, 1.10)
+    def _audio_fade_filter(self, duration: float) -> str:
+        fade_out_start = max(duration - 0.35, 0.01)
         return (
-            f"scale=8000:-1:flags=lanczos,"
-            f"zoompan=z='min(zoom+{zoom_speed},{max_z})':d={frames}:"
-            f"s={self.W}x{self.H}:fps={VideoConfig.FPS}"
+            f"afade=t=in:st=0:d=0.20,"
+            f"afade=t=out:st={fade_out_start:.3f}:d=0.20,"
+            f"aresample=async=1:first_pts=0"
         )
 
-    def build_narrator_segment(
+    def _subtitle_inputs(self, subtitle_text: Optional[str], is_ayah: bool, tag: str) -> Tuple[list[str], str]:
+        if not subtitle_text:
+            return [], ""
+        safe_name = _sha_name(subtitle_text, tag)
+        sub_path = str(Paths.ASSEMBLY / safe_name)
+        created = self.sub.create(
+            subtitle_text,
+            sub_path,
+            font_size=SubtitleConfig.FONT_SIZE_LARGE if is_ayah else SubtitleConfig.FONT_SIZE_MEDIUM,
+            is_ayah=is_ayah,
+        )
+        if created and Path(created).exists():
+            return ["-i", created], created
+        return [], ""
+
+    def build_segment(
         self,
         image_path: str,
         audio_path: str,
@@ -165,142 +253,79 @@ class SegmentBuilder:
         subtitle_text: Optional[str] = None,
         duration: Optional[float] = None,
         use_ken_burns: bool = True,
+        is_ayah: bool = False,
+        tag: str = "sub",
     ) -> str:
         if not Path(audio_path).exists():
-            raise FileNotFoundError(f"ملف صوتي مفقود: {audio_path}")
+            raise FileNotFoundError(f"Missing audio: {audio_path}")
 
         dur = duration or _probe_duration(audio_path)
-        img = image_path if Path(str(image_path)).exists() else str(Paths.ASSETS / "default_bg.png")
+        if dur <= 0:
+            raise RuntimeError(f"Invalid duration for {audio_path}")
 
-        vf = self._ken_burns(dur) if use_ken_burns else self._scale_image_filter()
+        img = image_path if Path(image_path).exists() else str(Paths.ASSETS / "default_bg.png")
+        sub_inputs, sub_path = self._subtitle_inputs(subtitle_text, is_ayah, tag)
 
-        sub_filter = ""
-        sub_inputs  = []
-        if subtitle_text:
-            sub_path = str(Paths.ASSEMBLY / f"sub_{hash(subtitle_text) % 99999:05d}.png")
-            created  = self._sub.create(subtitle_text, sub_path, font_size=SubtitleConfig.FONT_SIZE_MEDIUM)
-            if created:
-                sub_inputs  = ["-i", created]
-                sub_filter  = f";[v][1:v]overlay=0:0[vout]"
-                final_map   = "[vout]"
-            else:
-                final_map = "[v]"
-        else:
-            final_map = "[v]"
-
-        fc = f"[0:v]{vf}[v]{sub_filter}"
-
-        cmd = (
-            ["ffmpeg", "-y", "-loop", "1", "-i", img]
-            + sub_inputs
-            + ["-i", audio_path,
-               "-filter_complex", fc,
-               "-map", final_map,
-               "-map", f"{1 + len(sub_inputs)//2}:a",
-               "-af", "afade=t=in:st=0:d=0.2,afade=t=out:st=999:d=0.2", 
-               "-c:v", VideoConfig.CODEC,
-               "-profile:v", VideoConfig.PROFILE,
-               "-crf", str(VideoConfig.CRF),
-               "-preset", VideoConfig.PRESET,
-               "-pix_fmt", VideoConfig.PIX_FMT,
-               "-c:a", VideoConfig.AUDIO_CODEC,
-               "-b:a", VideoConfig.AUDIO_BITRATE,
-               "-ar", str(VideoConfig.AUDIO_RATE),
-               "-t", str(dur + 0.4),
-               "-shortest",
-               output_path]
-        )
-        _run(cmd, f"مقطع راوي: {Path(output_path).name}")
-        return output_path
-
-    def build_ayah_segment(
-        self,
-        image_path: str,
-        quran_audio: str,
-        ayah_text: str,
-        output_path: str,
-        duration: Optional[float] = None,
-    ) -> str:
-        dur = duration or _probe_duration(quran_audio)
-        img = image_path if Path(str(image_path)).exists() else str(Paths.ASSETS / "default_bg.png")
-
-        sub_path = str(Paths.ASSEMBLY / f"ayah_{hash(ayah_text) % 99999:05d}.png")
-        self._sub.create(
-            ayah_text, sub_path,
-            font_size=SubtitleConfig.FONT_SIZE_LARGE,
-            is_ayah=True,
-        )
-
-        vf = self._ken_burns(dur, zoom_speed=0.0004)
-
-        sub_inputs = []
-        sub_filter = ""
-        if Path(sub_path).exists():
-            sub_inputs = ["-i", sub_path]
-            fd_in  = 0.6
-            fd_out = dur - 0.8
-            sub_filter = (
-                f";[1:v]fade=t=in:st=0:d={fd_in}:alpha=1,"
-                f"fade=t=out:st={fd_out}:d=0.6:alpha=1[sub];"
-                f"[v][sub]overlay=0:0[vout]"
-            )
+        vf = self._base_filter(dur, zoom=use_ken_burns)
+        maps = ["[0:v]" + vf + "[v]"]
+        if sub_path:
+            maps.append(f"[1:v]format=rgba[sv];[v][sv]overlay=0:0[vout]")
             final_map = "[vout]"
         else:
             final_map = "[v]"
 
-        fc = f"[0:v]{vf}[v]{sub_filter}"
+        fc = ";".join(maps)
 
-        cmd = (
-            ["ffmpeg", "-y", "-loop", "1", "-i", img]
-            + sub_inputs
-            + ["-i", quran_audio,
-               "-filter_complex", fc,
-               "-map", final_map,
-               "-map", f"{1 + len(sub_inputs)//2}:a",
-               "-af", "afade=t=in:st=0:d=0.2,afade=t=out:st=999:d=0.2",
-               "-c:v", VideoConfig.CODEC,
-               "-profile:v", VideoConfig.PROFILE,
-               "-crf", str(VideoConfig.CRF),
-               "-preset", VideoConfig.PRESET,
-               "-pix_fmt", VideoConfig.PIX_FMT,
-               "-c:a", VideoConfig.AUDIO_CODEC,
-               "-b:a", VideoConfig.AUDIO_BITRATE,
-               "-ar", str(VideoConfig.AUDIO_RATE),
-               "-t", str(dur + 0.4),
-               "-shortest",
-               output_path]
-        )
-        _run(cmd, f"مقطع تلاوة: {Path(output_path).name}")
+        audio_input_index = 1 + len(sub_inputs)
+        cmd = ["ffmpeg", "-y", "-loop", "1", "-i", img] + sub_inputs + ["-i", audio_path, "-filter_complex", fc]
+
+        if sub_path:
+            cmd += ["-map", final_map]
+        else:
+            cmd += ["-map", "[v]"]
+
+        cmd += [
+            "-map", f"{audio_input_index}:a:0",
+            "-af", self._audio_fade_filter(dur),
+            "-c:v", VideoConfig.CODEC,
+            "-profile:v", VideoConfig.PROFILE,
+            "-crf", str(VideoConfig.CRF),
+            "-preset", VideoConfig.PRESET,
+            "-pix_fmt", VideoConfig.PIX_FMT,
+            "-c:a", VideoConfig.AUDIO_CODEC,
+            "-b:a", VideoConfig.AUDIO_BITRATE,
+            "-ar", str(VideoConfig.AUDIO_RATE),
+            "-movflags", "+faststart",
+            "-shortest",
+            output_path,
+        ]
+
+        _run(cmd, f"Build segment {Path(output_path).name}")
         return output_path
 
     def concatenate(self, segments: list[str], output_path: str) -> str:
-        """
-        [ترقية هندسية]: دمج لحظي (Lossless Concat) للمقاطع.
-        بما أن كل المقاطع تم إنشاؤها بنفس الإعدادات، نستخدم (-c copy) لدمجها 
-        في ثانية واحدة وبدون فقدان 1% من الجودة.
-        """
         valid = [s for s in segments if Path(s).exists()]
         if not valid:
-            raise RuntimeError("لا توجد مقاطع صالحة")
+            raise RuntimeError("No valid segments")
+
         if len(valid) == 1:
-            shutil.copy(valid[0], output_path)
+            shutil.copy2(valid[0], output_path)
             return output_path
 
         concat_list = Paths.ASSEMBLY / "concat_list.txt"
-        concat_list.write_text(
-            "\n".join(f"file '{os.path.abspath(s)}'" for s in valid)
-        )
+        concat_list.write_text("
+".join(f"file '{os.path.abspath(s)}'" for s in valid), encoding="utf-8")
 
         cmd = [
             "ffmpeg", "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", str(concat_list),
-            "-c", "copy", # 👈 السحر هنا: دمج بدون رندرة!
+            "-c", "copy",
             "-movflags", "+faststart",
             output_path,
         ]
-        _run(cmd, f"دمج {len(valid)} مقاطع (Lossless)", timeout=900)
+        _run(cmd, f"Concat {len(valid)} segments")
         return output_path
 
 
@@ -312,87 +337,105 @@ class VideoEngine:
         self.builder = SegmentBuilder(self.W, self.H)
         Paths.ensure_all()
 
+    def _add_segment_if_exists(self, path: str, segments: list[str]) -> None:
+        if Path(path).exists():
+            segments.append(path)
+
     def assemble_episode(self, script: EpisodeScript, ep_dir: str) -> str:
-        logger.info(f"🎬 تجميع الحلقة {script.episode_number}: {script.surah_name}")
+        logger.info("🎬 Assembling episode %s", script.episode_number)
+
         seg_dir = Path(ep_dir) / "segments"
         seg_dir.mkdir(parents=True, exist_ok=True)
         Paths.ASSEMBLY.mkdir(parents=True, exist_ok=True)
 
         segments: list[str] = []
 
-        if script.intro_scene.audio_path:
-            intro_seg = str(seg_dir / "00_intro.mp4")
-            self.builder.build_narrator_segment(
+        if getattr(script.intro_scene, "audio_path", None):
+            out = str(seg_dir / "00_intro.mp4")
+            self.builder.build_segment(
                 image_path=script.intro_scene.image_path or "",
                 audio_path=script.intro_scene.audio_path,
-                subtitle_text=script.intro_scene.narrator_text,
-                output_path=intro_seg,
+                subtitle_text=getattr(script.intro_scene, "narrator_text", None),
+                output_path=out,
+                use_ken_burns=True,
+                is_ayah=False,
+                tag="intro",
             )
-            if Path(intro_seg).exists(): segments.append(intro_seg)
+            self._add_segment_if_exists(out, segments)
 
         for i, ayah_scene in enumerate(script.ayah_scenes):
             sid = ayah_scene.scene_id
 
-            if ayah_scene.intro_audio:
-                intro_p = str(seg_dir / f"{i+1:02d}_ayah_{sid:03d}_intro.mp4")
-                self.builder.build_narrator_segment(
-                    image_path=ayah_scene.image_path or "",
-                    audio_path=ayah_scene.intro_audio,
-                    subtitle_text=ayah_scene.intro_text,
-                    output_path=intro_p,
+            if getattr(ayah_scene, "intro_audio", None):
+                p = str(seg_dir / f"{i+1:02d}_ayah_{sid:03d}_intro.mp4")
+                self.builder.build_segment(
+                    ayah_scene.image_path or "",
+                    ayah_scene.intro_audio,
+                    p,
+                    subtitle_text=getattr(ayah_scene, "intro_text", None),
+                    is_ayah=False,
+                    tag=f"ayah_{sid}_intro",
                 )
-                if Path(intro_p).exists(): segments.append(intro_p)
+                self._add_segment_if_exists(p, segments)
 
-            if ayah_scene.quran_audio:
-                quran_p = str(seg_dir / f"{i+1:02d}_ayah_{sid:03d}_quran.mp4")
-                self.builder.build_ayah_segment(
-                    image_path=ayah_scene.image_path or "",
-                    quran_audio=ayah_scene.quran_audio,
-                    ayah_text=ayah_scene.ayah.text,
-                    output_path=quran_p,
+            if getattr(ayah_scene, "quran_audio", None):
+                p = str(seg_dir / f"{i+1:02d}_ayah_{sid:03d}_quran.mp4")
+                self.builder.build_segment(
+                    ayah_scene.image_path or "",
+                    ayah_scene.quran_audio,
+                    p,
+                    subtitle_text=getattr(ayah_scene.ayah, "text", None),
+                    use_ken_burns=True,
+                    is_ayah=True,
+                    tag=f"ayah_{sid}_quran",
                 )
-                if Path(quran_p).exists(): segments.append(quran_p)
+                self._add_segment_if_exists(p, segments)
 
-            if ayah_scene.explain_audio:
-                exp_p = str(seg_dir / f"{i+1:02d}_ayah_{sid:03d}_explain.mp4")
-                self.builder.build_narrator_segment(
-                    image_path=ayah_scene.image_path or "",
-                    audio_path=ayah_scene.explain_audio,
-                    subtitle_text=ayah_scene.explain_text,
-                    output_path=exp_p,
+            if getattr(ayah_scene, "explain_audio", None):
+                p = str(seg_dir / f"{i+1:02d}_ayah_{sid:03d}_explain.mp4")
+                self.builder.build_segment(
+                    ayah_scene.image_path or "",
+                    ayah_scene.explain_audio,
+                    p,
+                    subtitle_text=getattr(ayah_scene, "explain_text", None),
+                    use_ken_burns=True,
+                    is_ayah=False,
+                    tag=f"ayah_{sid}_explain",
                 )
-                if Path(exp_p).exists(): segments.append(exp_p)
+                self._add_segment_if_exists(p, segments)
 
         for j, mid in enumerate(script.mid_scenes):
-            if mid.audio_path:
-                mid_p = str(seg_dir / f"mid_{j:02d}.mp4")
-                self.builder.build_narrator_segment(
-                    image_path=mid.image_path or "",
-                    audio_path=mid.audio_path,
-                    subtitle_text=mid.narrator_text,
-                    output_path=mid_p,
+            if getattr(mid, "audio_path", None):
+                p = str(seg_dir / f"mid_{j:02d}.mp4")
+                self.builder.build_segment(
+                    mid.image_path or "",
+                    mid.audio_path,
+                    p,
+                    subtitle_text=getattr(mid, "narrator_text", None),
+                    use_ken_burns=True,
+                    is_ayah=False,
+                    tag=f"mid_{j}",
                 )
-                if Path(mid_p).exists(): segments.append(mid_p)
+                self._add_segment_if_exists(p, segments)
 
-        if script.outro_scene.audio_path:
-            outro_p = str(seg_dir / "99_outro.mp4")
-            self.builder.build_narrator_segment(
-                image_path=script.outro_scene.image_path or "",
-                audio_path=script.outro_scene.audio_path,
-                subtitle_text=script.outro_scene.narrator_text,
-                output_path=outro_p,
+        if getattr(script.outro_scene, "audio_path", None):
+            out = str(seg_dir / "99_outro.mp4")
+            self.builder.build_segment(
+                script.outro_scene.image_path or "",
+                script.outro_scene.audio_path,
+                out,
+                subtitle_text=getattr(script.outro_scene, "narrator_text", None),
+                use_ken_burns=True,
+                is_ayah=False,
+                tag="outro",
             )
-            if Path(outro_p).exists(): segments.append(outro_p)
+            self._add_segment_if_exists(out, segments)
 
         if not segments:
-            raise RuntimeError("❌ لا توجد مقاطع لتجميعها")
+            raise RuntimeError("No generated segments")
 
         raw_output = str(Paths.VIDEOS / f"ep_{script.episode_number:03d}_raw.mp4")
-        # الدمج اللحظي بدون إضافة الشعار هنا (سيتم إضافته في Gamification)
         self.builder.concatenate(segments, raw_output)
 
-        size_mb = Path(raw_output).stat().st_size / 1024 / 1024
-        dur_min = _probe_duration(raw_output) / 60
-        logger.info(f"✅ تم تجهيز الفيديو الخام: {raw_output} ({size_mb:.1f} MB | {dur_min:.1f} دقيقة)")
-        
+        logger.info("✅ Raw video ready: %s", raw_output)
         return raw_output
