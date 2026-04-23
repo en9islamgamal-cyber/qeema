@@ -1,198 +1,271 @@
 """
-gamification_engine.py — VALUE / QEEMA v3.0
-محرك إضافة تأثيرات التلعيب (Gamification): لوجو، شريط تقدم، نصوص تشجيعية.
+gamification_engine.py — VALUE / QEEMA v4.0 (Production Grade)
+
+محرك تلعيب احترافي:
+- Adaptive overlays
+- Smart encouragement timing
+- Fault-tolerant ffmpeg execution
+- Production-level video normalization
 """
+
+from __future__ import annotations
 
 import logging
 import random
 import shutil
 import subprocess as sp
+import time
+import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from script_engine import EpisodeScript
 
-# استيرادات من المشروع (يفترض وجودها في config و utils)
-try:
-    from config import VideoConfig, Paths
-    from utils import get_video_duration, run_ffmpeg_command
-    from constants import ENCOURAGEMENTS
-except ImportError:
-    # قيم افتراضية للتشغيل المستقل
-    class VideoConfig:
-        CODEC = 'libx264'
-        PROFILE = 'high'
-        CRF = 18
-        PIX_FMT = 'yuv420p'
-    
-    class Paths:
-        LOGO_PRIMARY = Path("assets/logo.png")
-    
-    ENCOURAGEMENTS = ["👍 ممتاز!", "💪 استمر!", "🎯 قمة التركيز", "🧠 عبقرية"]
-
 logger = logging.getLogger(__name__)
 
 
+# =========================
+# CONFIGURATION LAYER
+# =========================
+
+@dataclass(frozen=True)
+class RenderProfile:
+    crf: int = 18
+    preset: str = "slow"
+    codec: str = "libx264"
+    pix_fmt: str = "yuv420p"
+    profile: str = "high"
+
+
+@dataclass(frozen=True)
+class GamificationSettings:
+    logo_size: int = 160
+    logo_opacity: float = 0.85
+    margin: int = 30
+
+    bar_height: int = 12
+    bar_bg_alpha: float = 0.6
+    bar_color: str = "0xFFD700"
+
+    font_size: int = 72
+    text_y_ratio: float = 0.15
+
+    fade: float = 0.5
+    text_duration: float = 4.0
+
+    max_retries: int = 3
+    timeout: int = 900
+
+
+ENCOURAGEMENTS = [
+    "👍 ممتاز!",
+    "💪 استمر!",
+    "🎯 قمة التركيز",
+    "🧠 عبقرية",
+    "🚀 أداء مذهل!",
+    "🔥 أنت في القمة!",
+]
+
+
+# =========================
+# CORE ENGINE
+# =========================
+
 class GamificationEngine:
-    """تطبيق شارة التقدم، اللوجو، والنصوص التشجيعية على الفيديو النهائي"""
-    
-    def __init__(self, font_path: str = None):
-        """
-        Args:
-            font_path: مسار خط يدعم العربية (اختياري، إذا لم يوجد فلن تُضاف النصوص)
-        """
-        self.font = font_path
-        if self.font and not Path(self.font).exists():
-            logger.warning(f"الخط المحدد غير موجود: {self.font}. سيتم تعطيل النصوص التشجيعية.")
+
+    def __init__(self, font_path: Optional[str] = None):
+        self.font = Path(font_path) if font_path else None
+        self.settings = GamificationSettings()
+        self.profile = RenderProfile()
+
+        if self.font and not self.font.exists():
+            logger.warning("Font not found → disabling text")
             self.font = None
-    
-    def _prepare_arabic_text(self, text: str) -> str:
-        """تجهيز النص العربي لـ ffmpeg (escape الأحرف الخاصة)"""
-        # استبدال الاقتباسات المنفردة والمزدوجة
-        safe = text.replace("'", r"\'").replace('"', r'\"')
-        # إزالة أي حروف غير قابلة للطباعة
-        safe = ''.join(ch for ch in safe if ch.isprintable() or ch == ' ')
-        return safe
-    
-    def apply_to_episode(self, video_path: str, script: "EpisodeScript", output_path: str) -> str:
-        """
-        يطبق جميع تأثيرات التلعيب (اللوجو + شريط التقدم + التشجيع) 
-        في مسار واحد (Single-Pass Complex Filter) لضمان أعلى جودة.
-        
-        Returns:
-            مسار الفيديو الناتج (الملف المعدل أو النسخة الأصلية في حالة الفشل).
-        """
-        # التحقق من وجود الفيديو الأصلي
-        if not Path(video_path).exists():
-            logger.error(f"❌ الفيديو الأصلي غير موجود: {video_path}")
-            return video_path
-        
-        # الحصول على مدة الفيديو
-        duration = self._get_duration(video_path)
-        if duration <= 0:
-            logger.error("❌ لم أتمكن من قراءة مدة الفيديو، سيتم تجاوز التلعيب.")
-            shutil.copy(video_path, output_path)
-            return output_path
-        
-        logger.info(f"🎮 بدء تطبيق التلعيب على فيديو مدته {duration:.1f} ثانية...")
-        
-        logo_path = Paths.LOGO_PRIMARY
-        has_logo = logo_path.exists()
-        
-        # بناء أوامر ffmpeg
-        inputs = ["-y", "-i", video_path]
-        if has_logo:
-            inputs.extend(["-i", str(logo_path)])
-        
-        filter_parts = []
-        
-        # 1. إضافة اللوجو (مقياس + شفافية + موضع)
-        if has_logo:
-            # معالجة أفضل للشفافية: دعم PNG مع قناة ألفا
-            filter_parts.append(
-                "[1:v]scale=160:-1,format=rgba,colorchannelmixer=aa=0.85[wm];"
-                "[0:v][wm]overlay=W-w-30:30[v_base]"
-            )
-        else:
-            filter_parts.append("[0:v]copy[v_base]")
-        
-        # 2. شريط التقدم (خلفية سوداء شفافة، ثم شريط ذهبي يتقدم مع الوقت)
-        # نستخدم 'drawbox' مرتين: الأولى للخلفية، الثانية للشريط المتقدم
-        filter_parts.append(
-            "[v_base]drawbox=x=0:y=H-12:w=W:h=12:color=black@0.6:t=fill[v_box1]"
-        )
-        # شريط التقدم الذهبي: عرضه يتناسب مع الوقت المنقضي
-        progress_width = f"W*(t/{duration})"
-        filter_parts.append(
-            f"[v_box1]drawbox=x=0:y=H-12:w={progress_width}:h=12:color=#FFD700@0.9:t=fill[v_box2]"
-        )
-        
-        # 3. النص التشجيعي (يظهر في منتصف المدة لمدة 4 ثوانٍ)
-        if self.font:
-            encouragement = random.choice(ENCOURAGEMENTS)
-            safe_text = self._prepare_arabic_text(encouragement)
-            
-            # زمن البدء: بعد 50% من المدة، والنهاية بعد 4 ثوانٍ أو قبل نهاية الفيديو بـ 1 ثانية
-            start_time = duration * 0.5
-            end_time = min(start_time + 4.0, duration - 1.0)
-            if end_time > start_time:
-                # تأثير تلاشي تدريجي عند الدخول والخروج
-                fade_duration = 0.5
-                alpha_logic = (
-                    f"if(lt(t,{start_time+fade_duration}),"
-                    f"(t-{start_time})/{fade_duration},"
-                    f"if(gt(t,{end_time-fade_duration}),"
-                    f"({end_time}-t)/{fade_duration},1))"
-                )
-                
-                text_filter = (
-                    f"[v_box2]drawtext=fontfile='{self.font}':text='{safe_text}':"
-                    f"fontcolor=yellow@1.0:fontsize=75:x=(W-text_w)/2:y=H*0.15:"
-                    f"enable='between(t,{start_time},{end_time})':alpha='{alpha_logic}':"
-                    f"shadowcolor=black@0.8:shadowx=4:shadowy=4[vout]"
-                )
-                filter_parts.append(text_filter)
-            else:
-                logger.warning("⚠️ مدة الفيديو قصيرة جداً لعرض النص التشجيعي، سيتم تخطيه.")
-                filter_parts.append("[v_box2]copy[vout]")
-        else:
-            filter_parts.append("[v_box2]copy[vout]")
-        
-        # تجميع سلسلة الفلاتر
-        vf_string = ";".join(filter_parts)
-        
-        # أمر ffmpeg النهائي
-        cmd = inputs + [
-            "-filter_complex", vf_string,
-            "-map", "[vout]",
-            "-map", "0:a",
-            "-c:v", VideoConfig.CODEC,
-            "-profile:v", VideoConfig.PROFILE,
-            "-crf", str(VideoConfig.CRF),
-            "-preset", "fast",
-            "-pix_fmt", VideoConfig.PIX_FMT,
-            "-c:a", "copy",
-            output_path
-        ]
-        
-        # تنفيذ الأمر مع مهلة 15 دقيقة
-        success = self._run_ffmpeg(cmd, timeout=900)
-        
-        if success and Path(output_path).exists():
-            logger.info("✅ تمت إضافة اللوجو وتأثيرات التلعيب بنجاح.")
-            return output_path
-        else:
-            logger.warning("⚠️ فشل تطبيق التلعيب، سيتم استخدام الفيديو الأصلي كإجراء احتياطي.")
-            shutil.copy(video_path, output_path)
-            return output_path
-    
-    def _get_duration(self, video_path: str) -> float:
-        """استخراج مدة الفيديو باستخدام ffprobe"""
+
+    # =========================
+    # VIDEO ANALYSIS
+    # =========================
+
+    def _probe(self, video: str):
+        """تحليل الفيديو (مدة + صوت + أبعاد)"""
         try:
             cmd = [
-                "ffprobe", "-v", "error", "-show_entries",
-                "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
-                video_path
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=nw=1:nk=1",
+                video
             ]
-            result = sp.run(cmd, capture_output=True, text=True, timeout=10)
-            return float(result.stdout.strip())
-        except Exception as e:
-            logger.error(f"فشل قراءة المدة: {e}")
-            return 0.0
-    
-    def _run_ffmpeg(self, cmd, timeout: int) -> bool:
-        """تنفيذ أمر ffmpeg مع معالجة الأخطاء"""
-        logger.debug(f"تشغيل: {' '.join(cmd)}")
+            duration = float(sp.run(cmd, capture_output=True, text=True).stdout.strip())
+
+            audio = self._has_audio(video)
+
+            return {
+                "duration": duration,
+                "has_audio": audio
+            }
+        except:
+            return {"duration": 0, "has_audio": False}
+
+    def _has_audio(self, video):
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index",
+            "-of", "csv=p=0",
+            video
+        ]
+        out = sp.run(cmd, capture_output=True, text=True).stdout.strip()
+        return bool(out)
+
+    # =========================
+    # SMART TEXT ENGINE
+    # =========================
+
+    def _pick_text(self, script: Optional["EpisodeScript"]):
+        if not script:
+            return random.choice(ENCOURAGEMENTS)
+
+        text_blob = str(vars(script)).lower()
+
+        if "quiz" in text_blob:
+            return "🎯 ركّز! انت قدها"
+        if "learn" in text_blob:
+            return "📘 فهم ممتاز!"
+        if "kids" in text_blob:
+            return "🌟 بطل!"
+
+        return random.choice(ENCOURAGEMENTS)
+
+    def _sanitize(self, text: str):
+        text = unicodedata.normalize("NFC", text)
+        return text.replace(":", "\\:").replace("'", "\\'")
+
+    # =========================
+    # FILTER GRAPH BUILDER
+    # =========================
+
+    def _build_filters(self, duration, text, has_logo):
+
+        s = self.settings
+        parts = []
+
+        parts.append(
+            "[0:v]scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v0]"
+        )
+
+        current = "v0"
+
+        if has_logo:
+            parts.append(
+                f"[1:v]scale={s.logo_size}:-1,format=rgba,colorchannelmixer=aa={s.logo_opacity}[wm]"
+            )
+            parts.append(
+                f"[{current}][wm]overlay=W-w-{s.margin}:{s.margin}[v1]"
+            )
+            current = "v1"
+
+        # Progress bar
+        parts.append(
+            f"[{current}]drawbox=0:H-{s.bar_height}:W:{s.bar_height}:black@{s.bar_bg_alpha}:t=fill[v2]"
+        )
+
+        parts.append(
+            f"[v2]drawbox=0:H-{s.bar_height}:W*(t/{duration}):{s.bar_height}:{s.bar_color}@0.9:t=fill[v3]"
+        )
+
+        current = "v3"
+
+        # Text
+        if self.font:
+            start = duration * 0.5
+            end = start + s.text_duration
+
+            alpha = f"if(lt(t\\,{start+s.fade}),(t-{start})/{s.fade},if(gt(t\\,{end-s.fade}),({end}-t)/{s.fade},1))"
+
+            parts.append(
+                f"[{current}]drawtext=fontfile='{self.font}':text='{self._sanitize(text)}':"
+                f"fontsize={s.font_size}:fontcolor=yellow:"
+                f"x=(W-text_w)/2:y=H*{s.text_y_ratio}:"
+                f"alpha='{alpha}':enable='between(t,{start},{end})'[vout]"
+            )
+        else:
+            parts.append(f"[{current}]null[vout]")
+
+        return ";".join(parts)
+
+    # =========================
+    # EXECUTION ENGINE
+    # =========================
+
+    def _run(self, cmd):
         try:
-            result = sp.run(cmd, capture_output=True, text=True, timeout=timeout)
-            if result.returncode != 0:
-                logger.error(f"ffmpeg error (code {result.returncode}): {result.stderr[-500:]}")
-                return False
-            return True
-        except sp.TimeoutExpired:
-            logger.error(f"انتهت المهلة ({timeout} ثانية) أثناء معالجة الفيديو.")
+            res = sp.run(cmd, capture_output=True, text=True, timeout=self.settings.timeout)
+            return res.returncode == 0
+        except:
             return False
-        except Exception as e:
-            logger.error(f"استثناء غير متوقع: {e}")
-            return False
+
+    def _execute_with_retry(self, cmd):
+        for i in range(self.settings.max_retries):
+            logger.info(f"Attempt {i+1}")
+            if self._run(cmd):
+                return True
+            time.sleep(1.5 * (i + 1))
+        return False
+
+    # =========================
+    # MAIN API
+    # =========================
+
+    def apply_to_episode(self, video_path, script, output_path):
+
+        video = Path(video_path)
+        output = Path(output_path)
+
+        if not video.exists():
+            return video_path
+
+        meta = self._probe(str(video))
+
+        if meta["duration"] <= 0:
+            shutil.copy(video, output)
+            return str(output)
+
+        text = self._pick_text(script)
+
+        has_logo = Path("assets/logo.png").exists()
+
+        inputs = ["-y", "-i", str(video)]
+
+        if has_logo:
+            inputs += ["-i", "assets/logo.png"]
+
+        filters = self._build_filters(meta["duration"], text, has_logo)
+
+        cmd = inputs + [
+            "-filter_complex", filters,
+            "-map", "[vout]"
+        ]
+
+        if meta["has_audio"]:
+            cmd += ["-map", "0:a?", "-c:a", "copy"]
+        else:
+            cmd += ["-an"]
+
+        cmd += [
+            "-c:v", self.profile.codec,
+            "-crf", str(self.profile.crf),
+            "-preset", self.profile.preset,
+            "-pix_fmt", self.profile.pix_fmt,
+            "-movflags", "+faststart",
+            str(output)
+        ]
+
+        success = self._execute_with_retry(cmd)
+
+        if success and output.exists():
+            return str(output)
+
+        shutil.copy(video, output)
+        return str(output)
