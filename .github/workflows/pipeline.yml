@@ -1,7 +1,8 @@
-name: "VALUE QEEMA Pipeline"
+Name: "VALUE QEEMA Pipeline"
 
 on:
   schedule:
+    # يعمل يومي الإثنين والخميس الساعة 3:00 فجراً بتوقيت جرينتش
     - cron: "0 3 * * 1,4"
   workflow_dispatch:
     inputs:
@@ -28,18 +29,18 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip' # تسريع تثبيت المكتبات
+          cache: 'pip'
 
       - name: "Step 3: Install System Dependencies"
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg fonts-noto-core libfreetype6-dev
+          # 👈 إضافة خطوط أميري بشكل أصلي (fonts-hosny-amiri) لدعم اللغة العربية باحترافية
+          sudo apt-get install -y ffmpeg fonts-noto-core fonts-hosny-amiri libfreetype6-dev
           echo "✅ System dependencies installed."
 
       - name: "Step 4: Create Required Directories"
         run: |
-          # إنشاء كافة المسارات التي يحتاجها الكود لمنع خطأ FileNotFoundError
-          mkdir -p logs temp/episodes/tts_cache temp/assembly output/videos assets/thumbnails
+          mkdir -p logs temp/episodes/tts_cache temp/assembly output/videos assets/thumbnails assets/fonts assets/overlays
           echo "✅ Directories created."
 
       - name: "Step 5: Install Python Packages"
@@ -65,6 +66,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }} # 👈 تم إضافة مفتاح Grok هنا
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
@@ -77,14 +79,12 @@ jobs:
             ARGS="--episode ${{ github.event.inputs.episode_number }}"
           fi
           
-          # نظام إعادة المحاولة الذكي (3 محاولات)
           max_retries=3
           attempt=1
           success=false
           
           until [ $attempt -gt $max_retries ]; do
             echo "🚀 Attempt $attempt of $max_retries..."
-            # نستخدم python -u للحصول على Logs فورية
             if python -u main.py $ARGS; then
               echo "✅ Pipeline finished successfully!"
               success=true
