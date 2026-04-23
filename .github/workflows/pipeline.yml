@@ -1,8 +1,7 @@
-Name: "VALUE QEEMA Pipeline"
+name: "VALUE QEEMA Pipeline"
 
 on:
   schedule:
-    # يعمل يومي الإثنين والخميس الساعة 3:00 فجراً بتوقيت جرينتش
     - cron: "0 3 * * 1,4"
   workflow_dispatch:
     inputs:
@@ -34,7 +33,6 @@ jobs:
       - name: "Step 3: Install System Dependencies"
         run: |
           sudo apt-get update -qq
-          # 👈 إضافة خطوط أميري بشكل أصلي (fonts-hosny-amiri) لدعم اللغة العربية باحترافية
           sudo apt-get install -y ffmpeg fonts-noto-core fonts-hosny-amiri libfreetype6-dev
           echo "✅ System dependencies installed."
 
@@ -66,7 +64,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GROK_API_KEY: ${{ secrets.GROK_API_KEY }} # 👈 تم إضافة مفتاح Grok هنا
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
