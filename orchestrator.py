@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import traceback
-import time  # تمت الإضافة هنا من أجل تأخير إعادة المحاولة أثناء الرفع
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -92,4 +92,222 @@ class PipelineOrchestrator:
         res = self.db.table(DBConfig.TABLE_EPISODES).insert({
             "episode_number": ep_num,
             "status": "pending",
-            "created_at":
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        return res.data[0]["id"]
+
+    # ──────────────────────────── Stages ───────
+    def _stage_script(self, ep_num: int) -> EpisodeScript:
+        """مرحلة 1: السكريبت"""
+        cached = self.script.load_from_disk(ep_num)
+        if cached:
+            logger.info("♻️ استئناف السكريبت من القرص")
+            return cached
+        return self.script.generate(ep_num)
+
+    def _stage_audio(self, script: EpisodeScript, ep_dir: str) -> dict:
+        """مرحلة 2: الصوت"""
+        audio_map_file = Path(ep_dir) / "audio_map.json"
+        
+        # قراءة آمنة لتجنب الانهيار
+        if audio_map_file.exists():
+            try:
+                raw = json.loads(audio_map_file.read_text())
+                if isinstance(raw, dict) and all(Path(str(p)).exists() for p in raw.values()):
+                    logger.info("♻️ استئناف الصوت من القرص")
+                    return raw
+            except Exception as e:
+                logger.warning(f"⚠️ ملف audio_map.json غير صالح، سيتم إعادة التوليد. الخطأ: {e}")
+
+        audio_map = self.voice.generate_episode_audio(script, ep_dir)
+        
+        # حماية (Guard Clause) للتأكد من أن المخرجات قاموس
+        if not isinstance(audio_map, dict):
+            logger.error(f"❌ خطأ: محرك الصوت أعاد {type(audio_map)} بدلاً من dict.")
+            raise ValueError("يجب أن تقوم دالة generate_episode_audio بإرجاع قاموس (dict).")
+
+        audio_map_file.write_text(json.dumps(audio_map, ensure_ascii=False))
+
+        processed = self.sfx.process_all(audio_map, script, ep_dir)
+        self._update_script_audio_paths(script, processed)
+        return processed
+
+    def _update_script_audio_paths(self, script: EpisodeScript, audio_map: dict) -> None:
+        """يحدّث مسارات الصوت في السكريبت بعد المعالجة"""
+        if "intro" in audio_map:
+            script.intro_scene.audio_path = audio_map["intro"]
+        if "outro" in audio_map:
+            script.outro_scene.audio_path = audio_map["outro"]
+        for scene in script.ayah_scenes:
+            sid = scene.scene_id
+            if f"ayah_{sid}_intro"   in audio_map: scene.intro_audio   = audio_map[f"ayah_{sid}_intro"]
+            if f"ayah_{sid}_quran"   in audio_map: scene.quran_audio   = audio_map[f"ayah_{sid}_quran"]
+            if f"ayah_{sid}_explain" in audio_map: scene.explain_audio = audio_map[f"ayah_{sid}_explain"]
+        for scene in script.mid_scenes:
+            sid = scene.scene_id
+            if f"mid_{sid}" in audio_map: scene.audio_path = audio_map[f"mid_{sid}"]
+
+    def _stage_visuals(self, script: EpisodeScript, ep_dir: str) -> None:
+        """مرحلة 3: الصور"""
+        vis_map_file = Path(ep_dir) / "visuals_map.json"
+        if vis_map_file.exists():
+            logger.info("♻️ استئناف الصور من القرص")
+            vis_map = json.loads(vis_map_file.read_text())
+            if vis_map.get("intro") and Path(vis_map["intro"]).exists():
+                script.intro_scene.image_path = vis_map["intro"]
+            if vis_map.get("outro") and Path(vis_map["outro"]).exists():
+                script.outro_scene.image_path = vis_map["outro"]
+            for sc in script.ayah_scenes:
+                k = f"ayah_{sc.scene_id}"
+                if vis_map.get(k) and Path(vis_map[k]).exists():
+                    sc.image_path = vis_map[k]
+            return
+
+        self.visual.generate_episode_visuals(script, ep_dir)
+
+        vis_map = {"intro": script.intro_scene.image_path, "outro": script.outro_scene.image_path}
+        for sc in script.ayah_scenes:
+            vis_map[f"ayah_{sc.scene_id}"] = sc.image_path
+        vis_map_file.write_text(json.dumps(vis_map, ensure_ascii=False))
+
+    def _stage_video(self, script: EpisodeScript, ep_dir: str) -> str:
+        """مرحلة 4: تجميع الفيديو"""
+        final_path = Paths.VIDEOS / f"ep_{script.episode_number:03d}_final.mp4"
+        if final_path.exists():
+            logger.info("♻️ استئناف الفيديو من القرص")
+            return str(final_path)
+        return self.video.assemble_episode(script, ep_dir)
+
+    def _stage_thumbnail(self, script: EpisodeScript, ep_dir: str) -> str:
+        """مرحلة 5: الـ Thumbnail"""
+        thumb_path = Paths.THUMBNAILS / f"ep_{script.episode_number:03d}.jpg"
+        if thumb_path.exists():
+            logger.info("♻️ استئناف Thumbnail من القرص")
+            return str(thumb_path)
+
+        scene_img = script.intro_scene.image_path
+        return self.thumbnail.create(script, script.episode_number, scene_img)
+
+    def _stage_upload(self, script: EpisodeScript, video_path: str, thumb_path: str) -> str:
+        """مرحلة 6: النشر على YouTube"""
+        dry = __import__("os").environ.get("DRY_RUN", "false").lower() == "true"
+        if dry:
+            logger.info("🧪 DRY_RUN — تجاوز الرفع")
+            return "dry_run_video_id"
+
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaFileUpload
+        import google.oauth2.credentials
+        from get_token import YouTubeTokenManager
+
+        token   = YouTubeTokenManager().get_valid_access_token()
+        creds   = google.oauth2.credentials.Credentials(token=token)
+        youtube = build("youtube", "v3", credentials=creds)
+
+        body = {
+            "snippet": {
+                "title":            script.youtube_title,
+                "description":      script.youtube_description,
+                "tags":             script.youtube_tags[:15],
+                "categoryId":       "27",
+                "defaultLanguage":  "ar",
+            },
+            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": True},
+        }
+
+        media   = MediaFileUpload(video_path, mimetype="video/mp4", resumable=True, chunksize=5*1024*1024)
+        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+
+        response = None
+        retries = 0
+        max_retries = 5
+
+        while response is None:
+            try:
+                status, response = request.next_chunk()
+                if status:
+                    logger.info(f"📤 رفع الفيديو: {int(status.progress()*100)}%")
+            except Exception as e:
+                retries += 1
+                if retries > max_retries:
+                    raise e
+                logger.warning(f"⚠️ انقطع الاتصال أثناء الرفع، محاولة إعادة الاتصال ({retries}/{max_retries})...")
+                time.sleep(10 * retries)
+
+        vid_id = response["id"]
+        logger.info(f"✅ منشور: https://youtube.com/watch?v={vid_id}")
+
+        if Path(thumb_path).exists():
+            try:
+                youtube.thumbnails().set(
+                    videoId=vid_id,
+                    media_body=MediaFileUpload(thumb_path, mimetype="image/jpeg"),
+                ).execute()
+            except Exception as e:
+                logger.warning(f"⚠️ Thumbnail فشل: {e}")
+
+        return vid_id
+
+    # ──────────────────────────── Main Pipeline ─
+    def run(self, episode_number: int) -> bool:
+        logger.info(f"\n{'═'*60}")
+        logger.info(f"▶ بدء تنفيذ الحلقة {episode_number}")
+        logger.info(f"{'═'*60}")
+
+        ep_dir = str(Paths.EPISODES / f"ep_{episode_number:03d}")
+        Path(ep_dir).mkdir(parents=True, exist_ok=True)
+
+        ep_id = self._db_init_episode(episode_number)
+
+        try:
+            self._db_update(ep_id, status=EpisodeStatus.SCRIPTING)
+            script = self._stage_script(episode_number)
+            self._db_update(ep_id, status=EpisodeStatus.AUDIO, surah_name=script.surah_name, title=script.title)
+
+            self._stage_audio(script, ep_dir)
+            self._db_update(ep_id, status=EpisodeStatus.VISUAL)
+
+            self._stage_visuals(script, ep_dir)
+            self._db_update(ep_id, status=EpisodeStatus.VIDEO)
+
+            video_path = self._stage_video(script, ep_dir)
+            self._db_update(ep_id, status=EpisodeStatus.THUMBNAIL, video_path=video_path)
+
+            thumb_path = self._stage_thumbnail(script, ep_dir)
+            self._db_update(ep_id, status=EpisodeStatus.UPLOADING, thumbnail_path=thumb_path)
+
+            vid_id  = self._stage_upload(script, video_path, thumb_path)
+            yt_url  = f"https://youtube.com/watch?v={vid_id}"
+            self._db_update(
+                ep_id,
+                status=EpisodeStatus.PUBLISHED,
+                youtube_video_id=vid_id,
+                youtube_url=yt_url,
+                published_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+            logger.info(f"\n🎉 الحلقة {episode_number} نُشرت: {yt_url}")
+            return True
+
+        except Exception as exc:
+            tb = traceback.format_exc()
+            logger.error(f"❌ فشلت الحلقة {episode_number}:\n{tb}")
+            self._db_update(ep_id, status=EpisodeStatus.FAILED,
+                            error_message=str(exc), error_traceback=tb[-1500:])
+            return False
+
+    def run_next(self) -> bool:
+        ep = self._db_get_next()
+        if not ep:
+            logger.info("✅ لا توجد حلقات معلقة")
+            return True
+        return self.run(ep["episode_number"])
+
+    def seed(self):
+        """يُضيف جميع الحلقات بحالة pending"""
+        from config import CURRICULUM
+        for n in CURRICULUM:
+            self._db_init_episode(n)
+            logger.info(f"  ✓ حلقة {n}: {CURRICULUM[n]['name']}")
+        logger.info("✅ تم البذر")
