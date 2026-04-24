@@ -1,7 +1,7 @@
 """
 main.py — VALUE / QEEMA v4.0 (Enterprise Edition - Enhanced)
 نقطة الدخول الرئيسية (The Command Center)
-• نظام Logging متقدم مع JSON Structured Logging و RotatingFileHandler محسن.
+• نظام Logging متقدم مع JSON Structured Logging (اختياري) و RotatingFileHandler محسن.
 • فحص تشخيصي شامل للبيئة مع Path validation قبل الإطلاق.
 • إغلاق آمن متقدم (Graceful Shutdown) يدعم SIGTERM/SIGINT مع priority handlers.
 • دعم Environment-based logging levels و structured context.
@@ -24,16 +24,30 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 
-# 1. تجهيز بيئة السجلات المتقدمة مع dictConfig للـ structured JSON logging
+# ----------------------------------------------------------------------
+# تكوين نظام التسجيل مع دعم JSON اختياري (Fault-tolerant)
+# ----------------------------------------------------------------------
 logs_dir = Path("logs")
 logs_dir.mkdir(exist_ok=True)
 
-# Validate log directory permissions
 if not os.access(logs_dir, os.W_OK):
     print("❌ خطأ: لا يمكن الكتابة في مجلد logs", file=sys.stderr)
     sys.exit(1)
 
-log_config: Dict = {
+# محاولة استيراد JsonFormatter إذا كانت المكتبة متاحة
+JSON_LOGGER_AVAILABLE = False
+json_formatter_class = None
+try:
+    from pythonjsonlogger import jsonlogger
+    JSON_LOGGER_AVAILABLE = True
+    json_formatter_class = jsonlogger.JsonFormatter
+    print("✅ JSON structured logging متاحة (python-json-logger مثبت)", file=sys.stderr)
+except ImportError:
+    print("⚠️ تحذير: python-json-logger غير مثبت، سيتم استخدام logging نصي عادي.", file=sys.stderr)
+    print("   للتثبيت: pip install python-json-logger", file=sys.stderr)
+
+# بناء التكوين الأساسي (دون JSON في البداية)
+log_config = {
     'version': 1,
     'disable_existing_loggers': False,
     'formatters': {
@@ -41,17 +55,9 @@ log_config: Dict = {
             'format': '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
             'datefmt': '%Y-%m-%d %H:%M:%S'
         },
-        'json': {
-            '()': 'pythonjsonlogger.jsonlogger.JsonFormatter',
-            'format': '%(asctime)s %(levelname)s %(name)s %(message)s %(pathname)s %(lineno)d %(process)d %(thread)d',
-            'datefmt': '%Y-%m-%dT%H:%M:%S%z',
-            'rename_fields': {
-                'levelname': 'level',
-                'asctime': 'timestamp',
-                'name': 'logger',
-                'pathname': 'file',
-                'lineno': 'line',
-            }
+        'file_text': {
+            'format': '%(asctime)s [%(levelname)s] %(name)s - %(message)s (file:%(pathname)s line:%(lineno)d)',
+            'datefmt': '%Y-%m-%d %H:%M:%S'
         }
     },
     'handlers': {
@@ -64,9 +70,9 @@ log_config: Dict = {
         'file': {
             'class': 'logging.handlers.RotatingFileHandler',
             'level': 'DEBUG',
-            'formatter': 'json',
+            'formatter': 'file_text',      # سنبدله لاحقاً إذا أمكن
             'filename': str(logs_dir / 'pipeline.log'),
-            'maxBytes': 10 * 1024 * 1024,  # 10MB
+            'maxBytes': 10 * 1024 * 1024,
             'backupCount': 5,
             'encoding': 'utf-8'
         }
@@ -84,22 +90,56 @@ log_config: Dict = {
     }
 }
 
-logging.config.dictConfig(log_config)
+# إذا كانت المكتبة متاحة، نضيف formatter JSON ونعدل ملف handler لاستخدامه
+if JSON_LOGGER_AVAILABLE:
+    log_config['formatters']['json'] = {
+        '()': 'pythonjsonlogger.jsonlogger.JsonFormatter',
+        'format': '%(asctime)s %(levelname)s %(name)s %(message)s %(pathname)s %(lineno)d %(process)d %(thread)d',
+        'datefmt': '%Y-%m-%dT%H:%M:%S%z',
+        'rename_fields': {
+            'levelname': 'level',
+            'asctime': 'timestamp',
+            'name': 'logger',
+            'pathname': 'file',
+            'lineno': 'line',
+        }
+    }
+    log_config['handlers']['file']['formatter'] = 'json'
+
+# تطبيق التكوين (مع catch للأخطاء)
+try:
+    logging.config.dictConfig(log_config)
+except Exception as e:
+    print(f"❌ فشل تكوين logging: {e}", file=sys.stderr)
+    # إذا فشل بسبب JSON، نحاول مرة أخرى بدون JSON
+    if JSON_LOGGER_AVAILABLE:
+        print("⚠️ إعادة المحاولة بدون JSON logging...", file=sys.stderr)
+        log_config['handlers']['file']['formatter'] = 'file_text'
+        # حذف formatter json إذا كان موجوداً
+        log_config['formatters'].pop('json', None)
+        try:
+            logging.config.dictConfig(log_config)
+        except Exception as e2:
+            print(f"❌ فشل حتى بدون JSON: {e2}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        sys.exit(1)
+
 logger = logging.getLogger("main")
 
+# ----------------------------------------------------------------------
+# بقية الكود (ShutdownHandler, GracefulShutdownManager, دوال مساعدة, إلخ)
+# ----------------------------------------------------------------------
 
 @dataclass
 class ShutdownHandler:
-    """Shutdown handler configuration for graceful shutdown"""
     name: str
     handler: Callable[[], None]
     timeout: float = 10.0
-    priority: int = 0  # Higher = runs first
+    priority: int = 0
 
 
 class GracefulShutdownManager:
-    """Enterprise-grade graceful shutdown manager"""
-
     def __init__(self, grace_period: float = 30.0):
         self.grace_period = grace_period
         self._shutdown_event = threading.Event()
@@ -109,24 +149,20 @@ class GracefulShutdownManager:
         self._setup_signals()
 
     def _setup_signals(self):
-        """Register signal handlers"""
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGQUIT, self._signal_handler)
 
     def _signal_handler(self, signum: int, frame):
-        """Handle shutdown signals"""
         signal_name = signal.Signals(signum).name
         logger.info(f"Received {signal_name}, initiating graceful shutdown", extra={'signal': signal_name})
         self._shutdown_event.set()
 
     def register_handler(self, name: str, handler: Callable[[], None], timeout: float = 10.0, priority: int = 0):
-        """Register cleanup handler"""
         self._handlers.append(ShutdownHandler(name, handler, timeout, priority))
 
     @contextmanager
     def track_operation(self):
-        """Track in-flight operations"""
         with self._lock:
             self._in_flight += 1
         try:
@@ -136,20 +172,14 @@ class GracefulShutdownManager:
                 self._in_flight -= 1
 
     def wait_for_shutdown(self):
-        """Main loop wait point"""
         while not self._shutdown_event.is_set():
             self._shutdown_event.wait(0.1)
 
     def shutdown(self):
-        """Execute full shutdown sequence"""
         logger.info("Starting graceful shutdown sequence")
-
-        # Wait for in-flight operations
         start = time.time()
         while self._in_flight > 0 and (time.time() - start) < self.grace_period * 0.5:
             time.sleep(0.1)
-
-        # Execute handlers by priority
         handlers = sorted(self._handlers, key=lambda h: h.priority, reverse=True)
         for handler in handlers:
             try:
@@ -157,16 +187,13 @@ class GracefulShutdownManager:
                 handler.handler()
             except Exception as e:
                 logger.error(f"Handler {handler.name} failed", exc_info=True)
-
         logger.info("Graceful shutdown complete")
 
 
-# Global shutdown manager
 shutdown_manager = GracefulShutdownManager()
 
 
 def positive_int(value: str) -> int:
-    """Custom validator for positive episode numbers"""
     ivalue = int(value)
     if ivalue <= 0:
         raise argparse.ArgumentTypeError("Episode number must be positive")
@@ -174,7 +201,6 @@ def positive_int(value: str) -> int:
 
 
 def print_banner():
-    """Enhanced diagnostic banner"""
     version = "v4.0 Enterprise Enhanced"
     banner = f"""
 ╔════════════════════════════════════════════════════╗
@@ -187,7 +213,6 @@ def print_banner():
 
 
 def validate_env() -> List[str]:
-    """Enhanced environment validation"""
     missing = []
     try:
         from config import APIKeys
@@ -195,20 +220,15 @@ def validate_env() -> List[str]:
     except ImportError:
         logger.error("Config module not found", exc_info=True)
         missing = ["config.APIKeys"]
-
-    # Validate logs directory again
     if not os.access(Path("logs"), os.W_OK):
         missing.append("logs directory writable")
-
     return missing
 
 
 def print_status(orch):
-    """Enhanced status dashboard - FIXED multiline string"""
     try:
         r = orch.db.table("episodes").select("*").order("episode_number").execute()
         logger.info("Episode status dashboard", extra={'total_episodes': len(r.data)})
-        # ✅ إصلاح الخطأ: استخدام \n للسطر الجديد بدلاً من سطر حرفي
         print("\n📊 [لوحة معلومات الحلقات - Episode Status Dashboard]")
         print(f"{'رقم':>4} | {'السورة':<12} | {'الحالة':<12} | {'رابط يوتيوب'}")
         print("═" * 65)
@@ -224,7 +244,6 @@ def print_status(orch):
 
 
 def main():
-    # Enhanced argument parser with validation
     parser = argparse.ArgumentParser(
         description="VALUE / QEEMA Pipeline v4.0 Enterprise Enhanced",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -235,13 +254,11 @@ Examples:
   python main.py --status
         """
     )
-
     parser.add_argument("--episode", type=positive_int, help="رقم الحلقة المحددة")
     parser.add_argument("--dry-run", action="store_true", help="وضع الاختبار (لا رفع ليوتيوب)")
     parser.add_argument("--seed", action="store_true", help="بذر قاعدة البيانات بالمنهج")
     parser.add_argument("--status", action="store_true", help="عرض لوحة الحلقات")
     parser.add_argument("--list-voices", action="store_true", help="قائمة الأصوات المتاحة")
-
     args = parser.parse_args()
 
     print_banner()
@@ -259,7 +276,6 @@ Examples:
             print(f"  • {v}")
         return
 
-    # Comprehensive environment validation
     missing = validate_env()
     if missing:
         logger.error("Environment validation failed", extra={'missing': missing})
@@ -269,20 +285,16 @@ Examples:
         os.environ["DRY_RUN"] = "true"
         logger.info("Dry run mode activated")
 
-    # Register shutdown handlers
     def orchestrator_cleanup():
-        # Placeholder for orchestrator cleanup
         logger.debug("Orchestrator cleanup")
 
     shutdown_manager.register_handler("orchestrator", orchestrator_cleanup, priority=10)
 
-    # Load orchestrator with operation tracking
     with shutdown_manager.track_operation():
         from orchestrator import PipelineOrchestrator
         orch = PipelineOrchestrator()
 
     if args.seed:
-        # تأكد من وجود دالة seed في orchestrator
         if hasattr(orch, 'seed'):
             orch.seed()
         else:
@@ -301,13 +313,11 @@ Examples:
                 success = orch.run(args.episode)
             else:
                 logger.info("Auto mode: next pending episode")
-                # استدعاء run بدون وسائط (أو run_next إن وجد)
                 if hasattr(orch, 'run_next'):
                     success = orch.run_next()
                 else:
-                    success = orch.run()  # يفترض أن run بدون وسائط يأخذ التالي
+                    success = orch.run()
         sys.exit(0 if success else 1)
-
     except KeyboardInterrupt:
         logger.warning("Keyboard interrupt received")
         sys.exit(0)
