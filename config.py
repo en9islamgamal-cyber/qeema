@@ -18,6 +18,7 @@ class APIKeys:
     SUPABASE_URL = os.getenv("SUPABASE_URL", "")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
     LEONARDO_API_KEY = os.getenv("LEONARDO_API_KEY", "")
+    LEONARDO = LEONARDO_API_KEY   # ليتوافق مع visual_engine.py
     YOUTUBE_CLIENT_ID = os.getenv("YOUTUBE_CLIENT_ID", "")
     YOUTUBE_CLIENT_SECRET = os.getenv("YOUTUBE_CLIENT_SECRET", "")
     YOUTUBE_REFRESH_TOKEN = os.getenv("YOUTUBE_REFRESH_TOKEN", "")
@@ -83,19 +84,15 @@ class VideoConfig:
 # إعدادات البصريات (VisualEngine)
 # ============================================================================
 class VisualConfig:
-    # الأبعاد
     WIDTH = 1920
     HEIGHT = 1080
-    # الألوان
-    BACKGROUND_COLOR = (34, 139, 34)  # أخضر غامق
+    BACKGROUND_COLOR = (34, 139, 34)  # أخضر
     TEXT_COLOR = (255, 255, 255)
     STROKE_COLOR = (0, 0, 0)
     STROKE_WIDTH = 2
-    # الخطوط
     FONT_SIZE_TITLE = 80
     FONT_SIZE_BODY = 50
     FONT_PATH = str(Paths.FONTS / "NotoSansArabic-Bold.ttf") if (Paths.FONTS / "NotoSansArabic-Bold.ttf").exists() else None
-    # الصورة
     OUTPUT_FORMAT = "JPEG"
     OUTPUT_QUALITY = 90
 
