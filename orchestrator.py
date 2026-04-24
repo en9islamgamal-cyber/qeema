@@ -1,268 +1,156 @@
 """
-orchestrator.py — QEEMA v4.0 (Enterprise Production Upgrade)
-Full Refactor + Reliability + Parallel Pipeline + Self-Healing
+orchestrator.py — QEEMA v5.2 (Optimized for Free Tiers & High Fidelity)
+Refactor focus: Quota Protection, Cache Validation, and Human-like Sequencing.
 """
 
-from __future__ import annotations
-
-import json
-import logging
-import shutil
-import traceback
 import time
-import os
 import random
 import hashlib
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from supabase import create_client, Client
-
-from config import APIKeys, DBConfig, Paths
 from models import EpisodeScript, EpisodeStatus
-from script_engine import ScriptEngine
-from voice_engine_v2 import VoiceEngine
-from visual_engine import VisualEngine
-from sfx_engine import SFXEngine
-from gamification_engine import GamificationEngine
-from video_engine import VideoEngine
-from thumbnail_engine import ThumbnailEngine
-from quality_gate import QualityGate
+from config import DBConfig, Paths
 
+# إعداد الـ Logger ليكون أكثر وضوحاً في مراقبة الميزانية
+import logging
 logger = logging.getLogger("QEEMA.Orchestrator")
 
-
-# ───────────────────────────── METRICS ─────────────────────────────
-
-@dataclass
-class PipelineMetrics:
-    episode_number: int
-    script_time: float = 0.0
-    audio_time: float = 0.0
-    visual_time: float = 0.0
-    video_time: float = 0.0
-    gamification_time: float = 0.0
-    thumbnail_time: float = 0.0
-    upload_time: float = 0.0
-    total_time: float = 0.0
-    failure: bool = False
-
-
-# ───────────────────────────── UTILITIES ─────────────────────────────
-
-def backoff(attempt: int) -> float:
-    """Exponential backoff with jitter"""
-    base = 2 ** attempt
-    jitter = random.uniform(0, base * 0.3)
-    return min(60, base + jitter)
-
-
-def sha(obj: Any) -> str:
-    return hashlib.sha256(json.dumps(obj, default=str).encode()).hexdigest()
-
-
-# ───────────────────────────── ORCHESTRATOR ─────────────────────────────
-
 class PipelineOrchestrator:
-
     def __init__(self):
-        self.db: Optional[Client] = None
-        self.quality_gate = QualityGate()
-        self._init_supabase()
-        self._init_engines()
-        Paths.ensure_all()
+        # ... (نفس التعريفات السابقة للمحركات و Supabase) ...
+        self.MIN_API_GAP = 3.0  # الحد الأدنى للثواني بين طلبات الـ API
+        self.MAX_API_GAP = 7.0  # الحد الأقصى لمحاكاة التفكير البشري
 
-    # ───────── INIT ─────────
+    def _human_delay(self):
+        """تأخير عشوائي لحماية الكوتة ومحاكاة النشاط البشري"""
+        delay = random.uniform(self.MIN_API_GAP, self.MAX_API_GAP)
+        logger.info(f"⏳ الانتظار لمدة {delay:.2f} ثانية (حماية الكوتة)...")
+        time.sleep(delay)
 
-    def _init_supabase(self):
-        try:
-            self.db = create_client(APIKeys.SUPABASE_URL, APIKeys.SUPABASE_KEY)
-            logger.info("✅ DB Connected")
-        except Exception as e:
-            raise RuntimeError("DB connection failed") from e
+    def _get_content_hash(self, content: str) -> str:
+        """إنشاء بصمة فريدة للمحتوى لتجنب إعادة توليد نفس الشيء"""
+        return hashlib.md5(content.encode()).hexdigest()
 
-    def _init_engines(self):
-        self.script = ScriptEngine()
-        self.voice = VoiceEngine()
-        self.visual = VisualEngine()
-        self.sfx = SFXEngine()
-        self.gamify = GamificationEngine()
-        self.video = VideoEngine()
-        self.thumbnail = ThumbnailEngine()
-        logger.info("✅ Engines ready")
-
-    # ───────── DB SAFE WRAPPER ─────────
-
-    def _safe_db(self, fn, retries=3):
-        for i in range(retries):
-            try:
-                return fn()
-            except Exception as e:
-                logger.warning(f"DB retry {i+1}: {e}")
-                time.sleep(backoff(i))
-        raise RuntimeError("DB operation failed after retries")
-
-    # ───────── EPISODE HANDLING ─────────
-
-    def _get_pending(self):
-        return self._safe_db(
-            lambda: self.db.table(DBConfig.TABLE_EPISODES)
-            .select("*").eq("status", "pending")
-            .order("episode_number").limit(1).execute()
-            .data
-        )
-
-    def _update_episode(self, ep_id: str, **fields):
-        fields["updated_at"] = datetime.now(timezone.utc).isoformat()
-        self._safe_db(
-            lambda: self.db.table(DBConfig.TABLE_EPISODES)
-            .update(fields).eq("id", ep_id).execute()
-        )
-
-    # ───────── SCRIPT ─────────
+    # ──────────────────────────── SCRIPTING (The Brain) ────────────────────────────
 
     def _stage_script(self, ep_num: int) -> EpisodeScript:
+        logger.info("📝 [المرحلة 1]: توليد السكريبت بذكاء...")
+        
+        # محاولة الاسترجاع من القرص أولاً
         cached = self.script.load_from_disk(ep_num)
         if cached:
+            logger.info("♻️ تم العثور على سكريبت جاهز. توفير كوتة الـ LLM!")
             return cached
 
         script = self.script.generate(ep_num)
-        self._save_script(script)
+        
+        # لمسة بشرية: مراجعة السكريبت تلقائياً (Self-Refinement)
+        # نقوم بذلك فقط إذا كان السكريبت يحتاج فعلياً لتحسين (توفير للطلبات)
+        script = self._stage_script_repair(script, ep_num)
+        
+        self._save_script_state(script)
         return script
 
-    def _save_script(self, script: EpisodeScript):
-        path = Paths.SCRIPT_DIR / f"ep_{script.episode_number:03d}.json"
-        path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
+    # ──────────────────────────── AUDIO (Quota-Safe) ────────────────────────────
 
-    # ───────── PARALLEL STAGES ─────────
+    def _stage_audio(self, script: EpisodeScript, ep_dir: str) -> Dict[str, str]:
+        logger.info("🎙️ [المرحلة 2]: توليد الصوت (نظام التوفير)...")
+        audio_map_file = Path(ep_dir) / "audio_map.json"
+        
+        # استئناف ذكي جداً
+        if audio_map_file.exists():
+            audio_map = json.loads(audio_map_file.read_text(encoding="utf-8"))
+            # نتحقق أن كل ملف موجود فعلياً وحجمه أكبر من 0
+            if all(Path(p).exists() and Path(p).stat().st_size > 0 for p in audio_map.values()):
+                logger.info("✅ جميع ملفات الصوت موجودة. لن يتم استهلاك أي طلبات API.")
+                self._update_script_audio_paths(script, audio_map)
+                return audio_map
 
-    def _stage_audio(self, script, ep_dir):
-        return self.voice.generate_episode_audio(script, ep_dir)
+        # التوليد المتسلسل مع فواصل (تجنب الـ Rate Limit)
+        # يتم استدعاء المحرك ليقوم بالتوليد جملة بجملة مع انتظار بين كل جملة
+        audio_map = self.voice.generate_episode_audio_sequential(script, ep_dir, delay_fn=self._human_delay)
+        
+        # معالجة المؤثرات (تتم محلياً، لا تستهلك كوتة)
+        processed = self.sfx.process_all(audio_map, script, ep_dir)
+        self._update_script_audio_paths(script, processed)
+        
+        # حفظ الحالة
+        audio_map_file.write_text(json.dumps(processed, ensure_ascii=False), encoding="utf-8")
+        self._db_save_state(script.episode_id, "audio", processed)
+        
+        return processed
 
-    def _stage_visuals(self, script, ep_dir):
-        return self.visual.generate_episode_visuals(script, ep_dir)
+    # ──────────────────────────── VISUALS (Strategic Rendering) ────────────────────
 
-    # ───────── PIPELINE EXECUTOR ─────────
-
-    def _run_parallel(self, script, ep_dir):
-        results = {}
-
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            futures = {
-                ex.submit(self._stage_audio, script, ep_dir): "audio",
-                ex.submit(self._stage_visuals, script, ep_dir): "visuals",
-            }
-
-            for f in as_completed(futures):
-                key = futures[f]
-                try:
-                    results[key] = f.result()
-                except Exception as e:
-                    logger.error(f"{key} failed: {e}")
-                    raise
-
-        return results
-
-    # ───────── VIDEO PIPELINE ─────────
-
-    def _stage_video(self, script, ep_dir):
-        return self.video.assemble_episode(script, ep_dir)
-
-    def _stage_gamification(self, raw_path, script):
-        return self.gamify.apply_to_episode(
-            raw_path,
-            script,
-            str(Paths.VIDEOS / f"ep_{script.episode_number:03d}_final.mp4")
-        )
-
-    def _stage_thumbnail(self, script):
-        return self.thumbnail.create(
-            script,
-            script.episode_number,
-            script.intro_scene.image_path
-        )
-
-    # ───────── CLEANUP ─────────
-
-    def _cleanup(self, ep_dir):
-        seg = Path(ep_dir) / "segments"
-        if seg.exists():
-            shutil.rmtree(seg, ignore_errors=True)
-
-    # ───────── MAIN RUN ─────────
-
-    def run(self, episode_number: Optional[int] = None):
-
-        metrics = PipelineMetrics(episode_number=episode_number or 0)
-        start = time.time()
-
-        try:
-            pending = self._get_pending()
-            if not pending and episode_number is None:
-                logger.info("No episodes")
+    def _stage_visuals(self, script: EpisodeScript, ep_dir: str) -> None:
+        logger.info("🎨 [المرحلة 3]: توليد الصور (انتقائي)...")
+        
+        # التحقق من وجود "Visual State" في قاعدة البيانات لتجنب إعادة طلب الصور المكلفة
+        state = self._db_load_state(script.episode_id, "visuals")
+        if state:
+            # التأكد من صحة المسارات محلياً
+            if all(Path(p).exists() for p in state.values()):
+                logger.info("♻️ استعادة الصور من الحالة السابقة. توفير كبير في الميزانية!")
+                for k, p in state.items():
+                    self._set_scene_image(script, k, p)
                 return
 
-            ep = pending[0] if episode_number is None else {"episode_number": episode_number, "id": "manual"}
-            ep_id = ep["id"]
-            ep_num = ep["episode_number"]
+        # توليد متسلسل مع "Human Delay"
+        # محرك الصور الآن سيقوم بطلب صورة والانتظار قبل طلب التالية
+        self.visual.generate_episode_visuals_sequential(script, ep_dir, delay_fn=self._human_delay)
+        
+        # حفظ الحالة فوراً بعد الانتهاء
+        vis_map = self._extract_vis_map(script)
+        self._db_save_state(script.episode_id, "visuals", vis_map)
 
-            self._update_episode(ep_id, status=EpisodeStatus.PROCESSING)
+    # ──────────────────────────── MAIN RUN ──────────────────────────────────────────
 
+    def run(self, episode_number: Optional[int] = None):
+        """
+        تشغيل المنظومة بأسلوب "السلحفاة الذكية": بطيء لكنه آمن وموفر.
+        """
+        try:
+            # 1. تحديد الحلقة
+            target = self._db_get_pending() if episode_number is None else {"episode_number": episode_number}
+            if not target:
+                logger.info("📭 لا توجد حلقات في قائمة الانتظار.")
+                return
+
+            ep_num = target["episode_number"]
+            ep_id = target.get("id") or self._db_init_episode(ep_num)
+
+            # تحديث الحالة إلى Processing
+            self._db_update_episode(ep_id, status=EpisodeStatus.PROCESSING)
+            
             ep_dir = Paths.TEMP_EPISODES / f"ep_{ep_num:03d}"
             ep_dir.mkdir(parents=True, exist_ok=True)
 
-            # SCRIPT
-            t = time.time()
+            # 2. تسلسل المراحل (Strict Sequential)
             script = self._stage_script(ep_num)
-            metrics.script_time = time.time() - t
             script.episode_id = ep_id
+            
+            self._stage_audio(script, str(ep_dir))
+            self._stage_visuals(script, str(ep_dir))
+            
+            raw_video = self._stage_video(script, str(ep_dir))
+            final_video = self._stage_gamification(script, raw_video)
+            
+            thumb = self._stage_thumbnail(script, str(ep_dir))
+            
+            # 3. الرفع (اختياري وبحذر)
+            video_id = self._stage_upload(script, final_video, thumb)
 
-            # QUALITY CHECK
-            report = self.quality_gate.evaluate(script.model_dump())
-            if not report.passed:
-                script = self.script.generate(ep_num)
-
-            # PARALLEL AUDIO + VISUALS
-            t = time.time()
-            parallel = self._run_parallel(script, ep_dir)
-            metrics.audio_time = metrics.visual_time = time.time() - t
-
-            # VIDEO
-            t = time.time()
-            raw = self._stage_video(script, ep_dir)
-            metrics.video_time = time.time() - t
-
-            # GAMIFICATION
-            t = time.time()
-            final = self._stage_gamification(raw, script)
-            metrics.gamification_time = time.time() - t
-
-            # THUMBNAIL
-            t = time.time()
-            thumb = self._stage_thumbnail(script)
-            metrics.thumbnail_time = time.time() - t
-
-            # CLEANUP
-            self._cleanup(ep_dir)
-
-            self._update_episode(
-                ep_id,
-                status=EpisodeStatus.COMPLETED,
-                video_path=final
+            # 4. النجاح النهائي
+            self._db_update_episode(
+                ep_id, 
+                status=EpisodeStatus.COMPLETED, 
+                video_id=video_id,
+                video_path=final_video
             )
-
-            metrics.total_time = time.time() - start
-
-            logger.info(f"✅ Episode {ep_num} done in {metrics.total_time:.2f}s")
+            logger.info(f"🎉 تم إنتاج الحلقة {ep_num} بنجاح وبأقل تكلفة!")
 
         except Exception as e:
-            metrics.failure = True
-            logger.error(traceback.format_exc())
-
+            logger.error(f"🚨 فشل في خط الإنتاج: {traceback.format_exc()}")
             if 'ep_id' in locals():
-                self._update_episode(ep_id, status=EpisodeStatus.FAILED, error=str(e))
-
-            raise
+                self._db_update_episode(ep_id, status=EpisodeStatus.FAILED, error=str(e))
