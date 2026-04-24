@@ -33,10 +33,10 @@ class PromptBuilder:
 
 1. [الشيخ والعالم الأزهري]:
    - يضمن التفسير الصحيح، الدقيق، والموثوق للآيات، ويختر القيمة التربوية.
-   - يعتمد على نص الآية كما يرد في источ الموثوق.
+   - يعتمد على نص الآية كما يرد في المصادر الموثوقة.
 
 2. [أديب وكاتب الأطفال]:
-   - يحوّل التفسير إلى حكاية دافئة وukuوردة بلهجة مصرية بسيطة وراقية.
+   - يحوّل التفسير إلى حكاية دافئة ومشوقة بلهجة مصرية بسيطة وراقية.
    - يستخدم كلمات مثل: "يا حبايبي"، "شوّفوا الجمال"، "يلا بينا نركز".
    - يمنع استخدام اللهجات الشامية أو السورية.
    - كل جملة لا تتجاوز 20 كلمة، ويُفضّل أن تكون 10–15 كلمة فقط لتسريع الإيقاع.
@@ -85,10 +85,10 @@ class PromptBuilder:
     @staticmethod
     def repair_prompt(old_text: str, critiques: List[str]) -> str:
         """
-        يمكنك إرسال هذا النص مرة أخرى للنموذج نفسه مع إضافة:
-        "أعد كتابة JSON فقط مع إصلاح الأخطاء التالية: ..."
+        إعادة كتابة JSON مع إصلاح الأخطاء التي حددها QualityGate.
         """
-        return f"النص JSON أدناه يحتوي على بعض الأخطاء:
+        # ✅ التصحيح: استخدام ثلاث علامات اقتباس للسلسلة متعددة الأسطر
+        return f"""النص JSON أدناه يحتوي على بعض الأخطاء:
 {chr(10).join(f'- {c}' for c in critiques)}
 
 الرجاء إعادة كتابة JSON كامل، مع مراعاة أن:
@@ -98,7 +98,7 @@ class PromptBuilder:
 - حافظ على نفس البنية الدقيقة لـ EpisodeScript.
 
 النص الحالي:
-{old_text}"
+{old_text}"""
 
 
 class SceneRefiner:
@@ -130,20 +130,21 @@ class ScriptEngine:
         self.prompt_builder = PromptBuilder()
         self.scene_refiner = SceneRefiner()
 
-        # إضافة النماذج المحتملة
+        # إضافة النماذج المحتملة (تم تحديث أسماء النماذج)
         if os.getenv("GROK_API_KEY"):
             try:
-                self.adapters.append((GrokAdapter(os.getenv("GROK_API_KEY")), "grok-2-latest"))
+                self.adapters.append((GrokAdapter(os.getenv("GROK_API_KEY")), "grok-4.20-beta-0309-non-reasoning"))
             except Exception as e:
                 logger.warning("⚠️ Grok not available: %s", e)
 
         if APIKeys.GEMINI:
-            self.adapters.append((GeminiAdapter(APIKeys.GEMINI), "gemini-2.5-pro"))
             self.adapters.append((GeminiAdapter(APIKeys.GEMINI), "gemini-2.5-flash"))
+            self.adapters.append((GeminiAdapter(APIKeys.GEMINI), "gemini-2.5-pro"))
 
         if os.getenv("COHERE_API_KEY"):
+            # تحديث النماذج Cohere إلى الإصدارات المتاحة
+            self.adapters.append((CohereAdapter(os.getenv("COHERE_API_KEY")), "command-a-03-2025"))
             self.adapters.append((CohereAdapter(os.getenv("COHERE_API_KEY")), "command-r-plus-08-2024"))
-            self.adapters.append((CohereAdapter(os.getenv("COHERE_API_KEY")), "command-r-08-2024"))
 
         if os.getenv("ANTHROPIC_API_KEY"):
             self.adapters.append((AnthropicAdapter(os.getenv("ANTHROPIC_API_KEY")), "claude-3-opus-20240229"))
@@ -162,7 +163,7 @@ class ScriptEngine:
 {chr(10).join(f"[AYAH_{a.number}]" for a in verified_ayahs)}
 
 مطلوب توليد JSON دقيق لحلقة للأطفال عن سورة {info['name']}.
-اللغة الأساسية: {{العربية}}، مع ملاحظات بسيطة بالإنجليزية في الوصف البصري.
+اللغة الأساسية: العربية، مع ملاحظات بسيطة بالإنجليزية في الوصف البصري.
 استخدم نمط لجنة الخبراء كما وصف في النظام.
 
 أنت مُجبر بأن تُتبع أدق تفاصيل الهيكل والمعايير في الـQuality Gate."""
@@ -204,7 +205,7 @@ class ScriptEngine:
 
         script = self._build_script_object(episode_num, info, raw_data, verified_ayahs)
 
-        # يمكن حفظ نسخة مُنقّحة للتحسن في المستقبل
+        # حفظ نسخة من السكريبت
         save_path = Paths.SCRIPT_DIR / f"episode_{episode_num:03d}.json"
         save_path.parent.mkdir(parents=True, exist_ok=True)
         save_path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
@@ -253,7 +254,7 @@ class ScriptEngine:
             intro_text = str(s.get("intro_text", ""))
             explain_text = str(s.get("explain_text", ""))
 
-            # إصلاح الإيقاع هنا (أقصر من 20 كلمة، مع تحسين بسيط)
+            # إصلاح الإيقاع هنا (أقصر من 20 كلمة)
             intro_text = self.scene_refiner.refine_scene(intro_text, "intro")
             explain_text = self.scene_refiner.refine_scene(explain_text, "explain")
 
@@ -268,7 +269,7 @@ class ScriptEngine:
                     explain_text=explain_text,
                     visual_prompt=vis_prompt,
                     repetitions=3,
-                     duration_sec=15,
+                    duration_sec=15,
                 )
             )
 
