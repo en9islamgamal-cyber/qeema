@@ -1,15 +1,14 @@
 """
-config.py — VALUE / QEEMA v4.0
-إعدادات المشروع والثوابت.
+config.py — VALUE / QEEMA v4.0 (Master Configuration)
+يحتوي على جميع الثوابت والإعدادات المستخدمة في جميع ملفات المشروع.
 """
 
 import os
 from pathlib import Path
 from typing import Dict, List
 
-
 # ============================================================================
-# مفاتيح API
+# مفاتيح API (من متغيرات البيئة)
 # ============================================================================
 class APIKeys:
     GEMINI = os.getenv("GEMINI_API_KEY", "")
@@ -18,7 +17,10 @@ class APIKeys:
     GROK = os.getenv("GROK_API_KEY", "")
     SUPABASE_URL = os.getenv("SUPABASE_URL", "")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-    LEONARDO = os.getenv("LEONARDO_API_KEY", "")
+    LEONARDO_API_KEY = os.getenv("LEONARDO_API_KEY", "")
+    YOUTUBE_CLIENT_ID = os.getenv("YOUTUBE_CLIENT_ID", "")
+    YOUTUBE_CLIENT_SECRET = os.getenv("YOUTUBE_CLIENT_SECRET", "")
+    YOUTUBE_REFRESH_TOKEN = os.getenv("YOUTUBE_REFRESH_TOKEN", "")
     
     @classmethod
     def validate(cls) -> List[str]:
@@ -27,61 +29,43 @@ class APIKeys:
             missing.append("SUPABASE_URL")
         if not cls.SUPABASE_KEY:
             missing.append("SUPABASE_KEY")
-        # المفاتيح الأخرى اختيارية
         return missing
 
-
 # ============================================================================
-# مسارات المجلدات
+# مسارات المجلدات والملفات
 # ============================================================================
 class Paths:
-    # المجلد الجذر للمشروع
     ROOT = Path(__file__).parent
     
-    # مجلدات أساسية
     LOGS = ROOT / "logs"
     TEMP = ROOT / "temp"
     ASSETS = ROOT / "assets"
     OUTPUT = ROOT / "output"
     
-    # مجلدات فرعية تحت temp
     TEMP_EPISODES = TEMP / "episodes"
     TTS_CACHE = TEMP / "tts_cache"
     ASSEMBLY_DIR = TEMP / "assembly"
     
-    # مجلدات المخرجات
     VIDEOS = OUTPUT / "videos"
     THUMBNAILS = ASSETS / "thumbnails"
     FONTS = ASSETS / "fonts"
     OVERLAYS = ASSETS / "overlays"
     
-    # مسار حفظ السكريبتات (يمكن أن يكون تحت temp)
-    SCRIPT_DIR = TEMP_EPISODES   # أو TEMP / "scripts"
-    
-    # مسار اللوجو الرئيسي
+    SCRIPT_DIR = TEMP_EPISODES
     LOGO_PRIMARY = ASSETS / "logo.png"
     
     @classmethod
     def ensure_all(cls):
-        """إنشاء جميع المجلدات الضرورية إن لم تكن موجودة."""
         dirs = [
-            cls.LOGS,
-            cls.TEMP,
-            cls.TEMP_EPISODES,
-            cls.TTS_CACHE,
-            cls.ASSEMBLY_DIR,
-            cls.VIDEOS,
-            cls.THUMBNAILS,
-            cls.FONTS,
-            cls.OVERLAYS,
-            cls.SCRIPT_DIR,
+            cls.LOGS, cls.TEMP, cls.TEMP_EPISODES, cls.TTS_CACHE,
+            cls.ASSEMBLY_DIR, cls.VIDEOS, cls.THUMBNAILS,
+            cls.FONTS, cls.OVERLAYS, cls.SCRIPT_DIR,
         ]
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)
 
-
 # ============================================================================
-# تكوين الفيديو
+# إعدادات الفيديو (VideoEngine)
 # ============================================================================
 class VideoConfig:
     CODEC = "libx264"
@@ -91,19 +75,57 @@ class VideoConfig:
     PRESET = "medium"
     AUDIO_CODEC = "aac"
     AUDIO_BITRATE = "128k"
-
+    FPS = 30
+    RESOLUTION_WIDTH = 1920
+    RESOLUTION_HEIGHT = 1080
 
 # ============================================================================
-# تكوين قاعدة البيانات
+# إعدادات البصريات (VisualEngine)
+# ============================================================================
+class VisualConfig:
+    # الأبعاد
+    WIDTH = 1920
+    HEIGHT = 1080
+    # الألوان
+    BACKGROUND_COLOR = (34, 139, 34)  # أخضر غامق
+    TEXT_COLOR = (255, 255, 255)
+    STROKE_COLOR = (0, 0, 0)
+    STROKE_WIDTH = 2
+    # الخطوط
+    FONT_SIZE_TITLE = 80
+    FONT_SIZE_BODY = 50
+    FONT_PATH = str(Paths.FONTS / "NotoSansArabic-Bold.ttf") if (Paths.FONTS / "NotoSansArabic-Bold.ttf").exists() else None
+    # الصورة
+    OUTPUT_FORMAT = "JPEG"
+    OUTPUT_QUALITY = 90
+
+# ============================================================================
+# إعدادات الصوت (VoiceEngine)
+# ============================================================================
+class AudioConfig:
+    DEFAULT_VOICE = "ar-XA-Wavenet-A"
+    DEFAULT_SPEAKING_RATE = 0.95
+    DEFAULT_PITCH = -1.0
+    VOLUME_GAIN_DB = 0.0
+
+# ============================================================================
+# إعدادات المؤثرات الصوتية (SFXEngine)
+# ============================================================================
+class SFXConfig:
+    FADE_IN_DURATION = 0.3
+    FADE_OUT_DURATION = 0.3
+    NORMALIZATION_TARGET = -14.0
+    SAMPLE_RATE = 44100
+
+# ============================================================================
+# إعدادات قاعدة البيانات
 # ============================================================================
 class DBConfig:
     TABLE_EPISODES = "episodes"
     TABLE_PIPELINE_STATE = "pipeline_state"
-    # إضافة اسم الجدول إذا لزم الأمر
-
 
 # ============================================================================
-# منهج الحلقات (يمكنك توسيعه)
+# المنهج (سور القرآن)
 # ============================================================================
 CURRICULUM: Dict[int, Dict[str, object]] = {
     1: {"surah": 1, "name": "الفاتحة", "start": 1, "end": 7, "title": "فاتحة الكتاب"},
@@ -124,7 +146,6 @@ CURRICULUM: Dict[int, Dict[str, object]] = {
     16: {"surah": 100, "name": "العاديات", "start": 1, "end": 11, "title": "سورة العاديات"},
 }
 
-# في حالة طلب رقم سورة (surah number) من المنهج
 def get_surah_name(surah_number: int) -> str:
     for ep in CURRICULUM.values():
         if ep.get("surah") == surah_number:
