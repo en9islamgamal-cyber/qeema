@@ -1,11 +1,9 @@
 """
-gamification_engine.py — VALUE / QEEMA v4.0 (Production Grade)
+gamification_engine.py — VALUE / QEEMA v5.0 (AI Driven)
 
-محرك تلعيب احترافي:
-- Adaptive overlays
-- Smart encouragement timing
-- Fault-tolerant ffmpeg execution
-- Production-level video normalization
+- Multi-event AI gamification
+- Dynamic overlays
+- Production-grade ffmpeg pipeline
 """
 
 from __future__ import annotations
@@ -20,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
+from ai_director import AIDirector
+
 if TYPE_CHECKING:
     from script_engine import EpisodeScript
 
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 # =========================
-# CONFIGURATION LAYER
+# CONFIGURATION
 # =========================
 
 @dataclass(frozen=True)
@@ -70,7 +70,7 @@ ENCOURAGEMENTS = [
 
 
 # =========================
-# CORE ENGINE
+# ENGINE
 # =========================
 
 class GamificationEngine:
@@ -79,17 +79,17 @@ class GamificationEngine:
         self.font = Path(font_path) if font_path else None
         self.settings = GamificationSettings()
         self.profile = RenderProfile()
+        self.ai_director = AIDirector()
 
         if self.font and not self.font.exists():
             logger.warning("Font not found → disabling text")
             self.font = None
 
     # =========================
-    # VIDEO ANALYSIS
+    # PROBE
     # =========================
 
     def _probe(self, video: str):
-        """تحليل الفيديو (مدة + صوت + أبعاد)"""
         try:
             cmd = [
                 "ffprobe", "-v", "error",
@@ -98,13 +98,9 @@ class GamificationEngine:
                 video
             ]
             duration = float(sp.run(cmd, capture_output=True, text=True).stdout.strip())
-
             audio = self._has_audio(video)
 
-            return {
-                "duration": duration,
-                "has_audio": audio
-            }
+            return {"duration": duration, "has_audio": audio}
         except:
             return {"duration": 0, "has_audio": False}
 
@@ -120,7 +116,7 @@ class GamificationEngine:
         return bool(out)
 
     # =========================
-    # SMART TEXT ENGINE
+    # TEXT
     # =========================
 
     def _pick_text(self, script: Optional["EpisodeScript"]):
@@ -143,10 +139,10 @@ class GamificationEngine:
         return text.replace(":", "\\:").replace("'", "\\'")
 
     # =========================
-    # FILTER GRAPH BUILDER
+    # FILTER BUILDER
     # =========================
 
-    def _build_filters(self, duration, text, has_logo):
+    def _build_filters(self, duration, events, text, has_logo):
 
         s = self.settings
         parts = []
@@ -157,6 +153,7 @@ class GamificationEngine:
 
         current = "v0"
 
+        # Logo
         if has_logo:
             parts.append(
                 f"[1:v]scale={s.logo_size}:-1,format=rgba,colorchannelmixer=aa={s.logo_opacity}[wm]"
@@ -177,32 +174,43 @@ class GamificationEngine:
 
         current = "v3"
 
-        # Text
-        if self.font:
-            start = duration * 0.5
+        # 🔥 MULTI EVENTS
+        for i, event in enumerate(events):
+            start = event["time"]
             end = start + s.text_duration
 
-            alpha = f"if(lt(t\\,{start+s.fade}),(t-{start})/{s.fade},if(gt(t\\,{end-s.fade}),({end}-t)/{s.fade},1))"
+            alpha = (
+                f"if(lt(t\\,{start+s.fade}),(t-{start})/{s.fade},"
+                f"if(gt(t\\,{end-s.fade}),({end}-t)/{s.fade},1))"
+            )
+
+            event_text = self._pick_text(None)
 
             parts.append(
-                f"[{current}]drawtext=fontfile='{self.font}':text='{self._sanitize(text)}':"
+                f"[{current}]drawtext=fontfile='{self.font}':"
+                f"text='{self._sanitize(event_text)}':"
                 f"fontsize={s.font_size}:fontcolor=yellow:"
                 f"x=(W-text_w)/2:y=H*{s.text_y_ratio}:"
-                f"alpha='{alpha}':enable='between(t,{start},{end})'[vout]"
+                f"alpha='{alpha}':enable='between(t,{start},{end})'[v{i}]"
             )
-        else:
-            parts.append(f"[{current}]null[vout]")
+
+            current = f"v{i}"
+
+        parts.append(f"[{current}]null[vout]")
 
         return ";".join(parts)
 
     # =========================
-    # EXECUTION ENGINE
+    # EXECUTION
     # =========================
 
     def _run(self, cmd):
         try:
             res = sp.run(cmd, capture_output=True, text=True, timeout=self.settings.timeout)
-            return res.returncode == 0
+            if res.returncode != 0:
+                logger.error(res.stderr[-500:])
+                return False
+            return True
         except:
             return False
 
@@ -215,7 +223,7 @@ class GamificationEngine:
         return False
 
     # =========================
-    # MAIN API
+    # MAIN
     # =========================
 
     def apply_to_episode(self, video_path, script, output_path):
@@ -232,7 +240,8 @@ class GamificationEngine:
             shutil.copy(video, output)
             return str(output)
 
-        text = self._pick_text(script)
+        # 🧠 AI EVENTS
+        events = self.ai_director.decide_events(video_path, meta["duration"])
 
         has_logo = Path("assets/logo.png").exists()
 
@@ -241,7 +250,7 @@ class GamificationEngine:
         if has_logo:
             inputs += ["-i", "assets/logo.png"]
 
-        filters = self._build_filters(meta["duration"], text, has_logo)
+        filters = self._build_filters(meta["duration"], events, "", has_logo)
 
         cmd = inputs + [
             "-filter_complex", filters,
