@@ -86,10 +86,16 @@ class PipelineOrchestrator:
             return None
 
     def _db_update_episode(self, ep_id: str, **fields) -> None:
+        """
+        تحديث الحلقة في Supabase.
+        لا تقبل حقلاً اسمه 'error' لأنه غير موجود في الجدول.
+        """
         upd = fields.copy()
         upd["updated_at"] = datetime.now(timezone.utc).isoformat()
         if "status" in upd and hasattr(upd["status"], "value"):
             upd["status"] = upd["status"].value.lower()
+        # إزالة 'error' إذا وجد (لمنع الخطأ PGRST204)
+        upd.pop("error", None)
         try:
             self.db.table(DBConfig.TABLE_EPISODES).update(upd).eq("id", ep_id).execute()
         except Exception as e:
@@ -361,7 +367,8 @@ class PipelineOrchestrator:
             return True
         except Exception as e:
             logger.error(f"❌ فشلت الحلقة {episode_number}: {e}")
-            self._db_update_episode(ep_id, status="failed", error=str(e))
+            # لا نرسل 'error' إلى قاعدة البيانات لأن العمود غير موجود (نمنع تمريره)
+            self._db_update_episode(ep_id, status="failed")
             return False
 
     def run_next(self) -> bool:
