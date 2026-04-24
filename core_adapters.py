@@ -1,8 +1,6 @@
 """
-core_adapters.py — VALUE / QEEMA v3.0 (Enterprise Architecture)
-محولات النماذج (LLM Adapters)
-• تفعيل الـ Native JSON Mode في Grok و Gemini.
-• خوارزمية Bulletproof لاستخراج JSON من أي نص فوضوي.
+core_adapters.py — VALUE / QEEMA v4.0 (Enterprise)
+محولات النماذج اللغوية المتقدمة مع دعم JSON mode واستخراج ذكي وإعادة محاولة.
 """
 
 import logging
@@ -23,7 +21,7 @@ try:
     HAS_GEMINI = True
 except ImportError:
     HAS_GEMINI = False
-    logger.warning("google-genai not installed")
+    logger.warning("google-genai غير مثبتة")
 
 try:
     import cohere
@@ -45,13 +43,17 @@ except ImportError:
 
 
 def extract_json(text: str) -> Dict[str, Any]:
-    """استخراج JSON من النص الخام مهما كان فوضويًا"""
+    """
+    استخراج JSON من النص الخام مهما كان فوضويًا (بصلابة عالية).
+    يدعم:
+    - إزالة علامات markdown (```json ... ```)
+    - البحث عن أول { وآخر } أو [ و ]
+    - إصلاح الفواصل الزائدة
+    """
     if not text:
         raise json.JSONDecodeError("Empty text", text, 0)
-    # إزالة علامات markdown
     cleaned = re.sub(r"```(?:json)?\s*", "", text)
     cleaned = re.sub(r"\s*```", "", cleaned).strip()
-    # البحث عن أول { وآخر }
     start = cleaned.find('{')
     end = cleaned.rfind('}')
     if start == -1 or end == -1:
@@ -60,7 +62,6 @@ def extract_json(text: str) -> Dict[str, Any]:
         if start == -1 or end == -1:
             raise json.JSONDecodeError("No JSON object/array found", cleaned, 0)
     json_str = cleaned[start:end+1]
-    # إصلاح الفواصل الزائدة
     json_str = re.sub(r',\s*}', '}', json_str)
     json_str = re.sub(r',\s*]', ']', json_str)
     return json.loads(json_str)
@@ -74,7 +75,7 @@ class BaseAdapter(ABC):
 
     @abstractmethod
     def generate(self, prompt: str, system_instruction: Optional[str] = None, *args, **kwargs) -> str:
-        """توليد رد نصي. *args و **kwargs لاستيعاب أي وسائط إضافية دون خطأ"""
+        """توليد رد مع إمكانية تمرير وسائط إضافية دون خطأ"""
         pass
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
@@ -86,9 +87,6 @@ class BaseAdapter(ABC):
         return extract_json(response)
 
 
-# ----------------------------------------------------------------------
-# Gemini (أحدث نموذج: gemini-2.5-flash)
-# ----------------------------------------------------------------------
 class GeminiAdapter(BaseAdapter):
     def __init__(self, api_key: str, model_name: str = "gemini-2.5-flash"):
         super().__init__(api_key, model_name)
@@ -111,9 +109,6 @@ class GeminiAdapter(BaseAdapter):
         return response.text
 
 
-# ----------------------------------------------------------------------
-# Cohere (أحدث نموذج: command-a-03-2025)
-# ----------------------------------------------------------------------
 class CohereAdapter(BaseAdapter):
     def __init__(self, api_key: str, model_name: str = "command-a-03-2025"):
         super().__init__(api_key, model_name)
@@ -131,9 +126,6 @@ class CohereAdapter(BaseAdapter):
         return response.text
 
 
-# ----------------------------------------------------------------------
-# Anthropic (يتطلب رصيداً)
-# ----------------------------------------------------------------------
 class AnthropicAdapter(BaseAdapter):
     def __init__(self, api_key: str, model_name: str = "claude-3-opus-20240229"):
         super().__init__(api_key, model_name)
@@ -153,9 +145,6 @@ class AnthropicAdapter(BaseAdapter):
         return response.content[0].text
 
 
-# ----------------------------------------------------------------------
-# Grok (أحدث نموذج)
-# ----------------------------------------------------------------------
 class GrokAdapter(BaseAdapter):
     def __init__(self, api_key: str, model_name: str = "grok-4.20-beta-0309-non-reasoning"):
         super().__init__(api_key, model_name)
@@ -176,9 +165,6 @@ class GrokAdapter(BaseAdapter):
         return response.choices[0].message.content
 
 
-# ----------------------------------------------------------------------
-# مصنع المحولات
-# ----------------------------------------------------------------------
 def get_adapter(provider: str, api_key: str, model_name: Optional[str] = None) -> BaseAdapter:
     provider = provider.lower()
     if provider == "gemini":
