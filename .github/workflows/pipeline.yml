@@ -1,14 +1,20 @@
-name: "VALUE QEEMA Pipeline"
+name: "VALUE QEEMA Pipeline v5"
 
 on:
   schedule:
-    - cron: "0 3 * * 1,4"
+    - cron: "0 3 * * 1,4"   # 3am UTC = 6am Kuwait, الإثنين والخميس
   workflow_dispatch:
     inputs:
       episode_number:
-        description: "Episode number to produce (leave empty for auto)"
+        description: "Episode number to produce (leave empty for next pending)"
         required: false
         type: string
+      dry_run:
+        description: "Dry run (no YouTube upload)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 env:
   PYTHON_VERSION: "3.11"
@@ -18,36 +24,59 @@ jobs:
   pipeline:
     name: "Produce Episode"
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 240   # ⬆️ زيادة من 180 لـ 240 (Leonardo + ElevenLabs بياخدوا وقت)
 
     steps:
-      - name: "Step 1: Checkout Code"
+      - name: "🔍 Checkout Code"
         uses: actions/checkout@v4
 
-      - name: "Step 2: Setup Python"
+      - name: "🐍 Setup Python ${{ env.PYTHON_VERSION }}"
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
-      - name: "Step 3: Install System Dependencies"
+      - name: "📦 Install System Dependencies"
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg fonts-noto-core fonts-hosny-amiri libfreetype6-dev
+          sudo apt-get install -y \
+            ffmpeg \
+            fonts-noto-core \
+            fonts-noto-cjk \
+            fonts-hosny-amiri \
+            libfreetype6-dev \
+            libsndfile1
           echo "✅ System dependencies installed."
+          ffmpeg -version | head -n 1
 
-      - name: "Step 4: Create Required Directories"
+      - name: "📁 Create Required Directories"
         run: |
-          mkdir -p logs temp/episodes/tts_cache temp/assembly output/videos assets/thumbnails assets/fonts assets/overlays
-          echo "✅ Directories created."
+          mkdir -p logs \
+                   temp/episodes \
+                   temp/tts_cache \
+                   temp/assembly \
+                   output/videos \
+                   assets/thumbnails \
+                   assets/fonts \
+                   assets/overlays
+          # Copy bundled font if present
+          if [ -f "Amiri-Bold.ttf" ]; then
+            cp Amiri-Bold.ttf assets/fonts/
+            echo "✅ Amiri-Bold font copied to assets/fonts/"
+          fi
+          if [ -f "logo.png" ]; then
+            cp logo.png assets/
+            echo "✅ Logo copied to assets/"
+          fi
+          echo "✅ Directories ready."
 
-      - name: "Step 5: Install Python Packages"
+      - name: "🐍 Install Python Packages"
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt -q
           echo "✅ Python packages installed."
 
-      - name: "Step 6: Setup Google Cloud Credentials"
+      - name: "🔐 Setup Google Cloud Credentials"
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: |
@@ -59,47 +88,61 @@ jobs:
           echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_sa.json" >> $GITHUB_ENV
           echo "✅ Google Cloud Credentials configured."
 
-      - name: "Step 7: Run Pipeline with Intelligent Retry"
+      - name: "🚀 Run Pipeline with Intelligent Retry"
         env:
+          # 🔑 LLM keys
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+          # 🎙️ Voice — NEW: ElevenLabs primary
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_VOICE_ID: ${{ vars.ELEVENLABS_VOICE_ID }}
+          # 🎨 Image — Leonardo
+          LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
+          # 🗄️ Database
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
+          # 📺 YouTube
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          # 🧪 Dry-run support
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           ARGS=""
           if [ -n "${{ github.event.inputs.episode_number }}" ]; then
             ARGS="--episode ${{ github.event.inputs.episode_number }}"
           fi
-          
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+
           max_retries=3
           attempt=1
           success=false
-          
+
           until [ $attempt -gt $max_retries ]; do
-            echo "🚀 Attempt $attempt of $max_retries..."
+            echo "═══════════════════════════════════════"
+            echo "🚀 Attempt $attempt of $max_retries"
+            echo "═══════════════════════════════════════"
             if python -u main.py $ARGS; then
               echo "✅ Pipeline finished successfully!"
               success=true
               break
             else
-              echo "⚠️ Attempt $attempt failed. Retrying in 60 seconds..."
-              sleep 60
+              echo "⚠️ Attempt $attempt failed. Retrying in 90 seconds..."
+              sleep 90
               attempt=$((attempt + 1))
             fi
           done
-          
+
           if [ "$success" = false ]; then
             echo "❌ Pipeline failed after $max_retries attempts."
             exit 1
           fi
 
-      - name: "Step 8: Upload Artifacts"
+      - name: "📤 Upload Artifacts"
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -108,4 +151,6 @@ jobs:
             output/videos/*.mp4
             assets/thumbnails/*.jpg
             logs/*.log
+            temp/episodes/*/visuals/*.jpg
           retention-days: 21
+          if-no-files-found: warn
