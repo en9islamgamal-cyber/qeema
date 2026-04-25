@@ -1,331 +1,213 @@
 """
-script_engine.py — VALUE / QEEMA v5.0
-=========================================
-محرك السكريبت المحسّن:
-
-✅ Single-pass: برومبت واحد محكم يولّد كل السكريبت في مرة واحدة
-   (سكريبت + visual prompts + youtube metadata)
-✅ يستهلك LLM call واحد بدلًا من 4-5 (يحفظ الباقة)
-✅ Fallback ذكي: Gemini 2.5 Pro → Claude → Gemini Flash
-✅ Quality gate سريع
-✅ معالجة JSON robust
+script_engine.py — VALUE / QEEMA v3.0 (Enterprise Architecture)
+يحتوي على:
+- Prompt Builder: هندسة أوامر معمارية (التوليد الشامل من طلقة واحدة للحفاظ على الكوتة).
+- Model Registry & Fallback: محاولات ذكية مدعومة بـ Grok.
+- Self-Repair: نظام إصلاح ذاتي بناءً على نقد Quality Gate.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import json
 import logging
 import os
+import re
+import time
 from pathlib import Path
-from typing import Optional, List, Dict, Any
-
+from typing import Optional
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from config import APIKeys, CURRICULUM, Paths
 from models import (
-    AyahScene, AudioMood, EpisodeScript, NarratorScene, SceneType, VerifiedAyah
+    AyahScene, AudioMood, EpisodeScript, 
+    NarratorScene, SceneType, VerifiedAyah
 )
-from core_adapters import (
-    GeminiAdapter, CohereAdapter, AnthropicAdapter, GrokAdapter, extract_json
-)
+# استدعاء ملفات المنظومة الجديدة
+from core_adapters import GeminiAdapter, CohereAdapter, AnthropicAdapter, GrokAdapter
 from quality_gate import QualityGate
 
 logger = logging.getLogger(__name__)
 
-
-# ═══════════════════════════════════════════════════════════════
-# المحرك الموحّد لبرومبت واحد قوي
-# ═══════════════════════════════════════════════════════════════
-class UnifiedPromptBuilder:
-    """يبني برومبت واحد محكم — يولّد كل السكريبت في pass واحد."""
-
+class PromptBuilder:
     @staticmethod
-    def build_system() -> str:
-        return """أنت "كاتب سيناريو خبير لقناة دينية تعليمية للأطفال" بثلاثة أدوار مدمجة:
+    def get_system_prompt() -> str:
+        return """أنت "الجد أبو زياد"، حكّاء بارع، وعالم أزهري حنون. أنت لست يوتيوبر، بل أنت جد يجلس مع أحفاده ليروي لهم قصصاً قبل النوم تستند إلى القرآن الكريم (للأطفال 5-8 سنوات).
 
-[1] الشيخ المفسر: يضمن الصحة الشرعية والتفسير الموثوق (مستند للتفسير الميسر).
-[2] أديب الأطفال: يحوّل التفسير لقصة دافئة بلهجة مصرية بسيطة جدًا. كل جملة ≤ 18 كلمة. يستخدم تعابير: "يا حبايبي"، "يلا بينا"، "شوفوا"، "هتعرفوا".
-[3] المخرج البصري: يصف كل مشهد بالإنجليزية (flat 2D vector illustration, children's book style, pastel colors, warm lighting, friendly characters).
+[أمر صارم للحفاظ على الموارد - Single-Shot Generation]:
+عليك توليد سكريبت الحلقة بالكامل في "رد واحد شامل ومفصل". يُمنع منعاً باتاً اختصار السكريبت أو تخطي أي آية. يجب أن تحتوي مصفوفة "ayah_scenes" على مشهد كامل ومفصل لكل آية تم طلبها، دون أي حذف أو كسل.
 
-⚠️ قواعد صارمة:
-- أبدًا لا تستخدم تشكيل في نهايات الكلمات (يسبب صوتًا روبوتيًا في TTS).
-- تجنب الكلمات المعقدة. اللغة بسيطة كأنك تكلم طفل 6 سنوات.
-- كل آية تأخذ مشهدها الخاص بصورة منفصلة.
-- التفسير قصير وملموس (مثال أو موقف من حياة الطفل).
+[قواعد السرد المتقدمة]:
+1. الشرح القصصي (Storytelling): يُمنع التفسير المباشر الجاف. يجب أن يكون الشرح (explain_text) عبارة عن "قصة قصيرة" أو "موقف حياتي" لتبسيط معنى الآية (لا يقل عن 50 كلمة للآية).
+2. الانتقال الذكي للتلاوة: 
+   - التمهيد (intro_text): ينتهي بتهيئة الطفل لسماع القرآن: "تعالوا نغمض عينينا ونسمع ربنا بيقول إيه...".
+   - استقبال التلاوة: يبدأ الشرح (explain_text) دائماً بعبارة: "صدق الله العظيم"، ثم يبدأ السرد.
+3. الخاتمة الوجدانية: يُمنع استخدام عبارات اليوتيوب (اشتركوا، لايك). الخاتمة دعاء دافئ وقصة قبل النوم.
+4. اللهجة: عامية مصرية راقية ودافئة جداً.
+5. الأمانة: يُمنع كتابة نص الآيات القرآنية. استخدم المرجع [AYAH_X] فقط.
 
-🎯 الإخراج: JSON فقط، بدون أي شرح خارج JSON، بدون markdown."""
-
-    @staticmethod
-    def build_user(episode_num: int, info: dict, ayahs_text: str) -> str:
-        return f"""أنشئ سكريبت كامل للحلقة {episode_num} عن سورة {info['name']}.
-
-📿 آيات السورة (نص عثماني):
-{ayahs_text}
-
-🎬 المطلوب: JSON بالبنية التالية تمامًا (بدون أي تعديل في أسماء الحقول):
-
-{{
-  "title": "العنوان الداخلي",
-  "youtube_title": "عنوان جذاب للأطفال يحتوي على اسم السورة (≤60 حرف)",
-  "youtube_description": "وصف لمحتوى الحلقة، 2-3 جمل، يحفز الاشتراك",
-  "youtube_tags": ["تجويد للأطفال", "تفسير ميسر", "اسم السورة", "..."],
-
-  "intro_scene": {{
-    "narrator_text": "ترحيب دافئ + تشويق للسورة، 12-18 كلمة بدون تشكيل في النهايات.",
-    "visual_prompt": "flat 2D vector, warm grandfather with smiling kids, ..."
-  }},
-
+[Few-Shot JSON Example - التزم بهذا الهيكل تماماً]:
+{
+  "title": "حكاية سورة الإخلاص",
+  "youtube_title": "حواديت الجد أبو زياد | قصة سورة الإخلاص",
+  "youtube_description": "حكاية جميلة قبل النوم نتعلم فيها عن وحدانية الله...",
+  "intro_scene": {
+    "narrator_text": "يا هلا بحبايبي وأبطالي الصغيرين! وحشتوني جداً. مفيش أحلى من حكاية قبل النوم تنور قلبنا. النهاردة حكايتنا عن سورة ثوابها عظيم، سورة الإخلاص. جاهزين؟",
+    "visual_prompt": "Pixar 3D animation, wise grandfather with white beard, cozy magical room, attentive cute kids."
+  },
   "ayah_scenes": [
-    {{
-      "ayah_number": <رقم الآية>,
-      "intro_text": "تقديم سريع للآية، 8-15 كلمة، مثلاً: 'يلا نسمع الآية...'",
-      "explain_text": "تفسير مبسط بلغة طفل 6 سنوات + مثال من حياته اليومية، 14-20 كلمة بحد أقصى.",
-      "visual_prompt": "flat 2D vector illustration that shows the meaning of this specific ayah, children's book style, pastel"
-    }}
-    // … مشهد لكل آية في السورة
+    {
+      "ayah_number": 1,
+      "intro_text": "في يوم من الأيام، كان في ناس بيسألوا النبي: يا ترى ربنا شكله إيه؟ فربنا نزل الآية دي. تعالوا نغمض عينينا ونسمع بقلوبنا...",
+      "explain_text": "صدق الله العظيم. شفتوا يا حبايبي؟ الآية دي معناها إن ربنا 'أحد'، يعني واحد بس. تخيلوا لو في شمسين؟ الدنيا هتتحرق! الكون العظيم ده ليه خالق واحد بس، مفيش حد زيه أبداً.",
+      "visual_prompt": "Pixar 3D animation, glowing single star in night sky, children looking up in wonder."
+    }
   ],
+  "outro_scene": {
+    "narrator_text": "الحمد لله على نعمة ربنا. قبل ما ننام، نفتكر دايماً إن لينا رب بيحمينا. تصبحوا على خير يا أبطال.",
+    "visual_prompt": "Pixar 3D animation, grandfather tucking kids into bed, warm nightlight."
+  }
+}
 
-  "outro_scene": {{
-    "narrator_text": "خلاصة + دعوة للاشتراك بأسلوب طفولي، 12-18 كلمة.",
-    "visual_prompt": "flat 2D vector, kids waving, subscribe button, warm farewell scene"
-  }}
-}}
+أجب بـ JSON فقط يتضمن جميع الآيات المطلوبة دفعة واحدة."""
 
-🚨 محظور: التشكيل في نهايات الكلمات، الجمل الطويلة، الكلمات المعقدة، وصف 3D أو photo-realistic."""
-
-
-# ═══════════════════════════════════════════════════════════════
-# تنقية النص بعد التوليد
-# ═══════════════════════════════════════════════════════════════
-class SceneRefiner:
-    @staticmethod
-    def shorten(text: str, max_words: int = 20) -> str:
-        if not text:
-            return text
-        parts = text.strip().split()
-        if len(parts) > max_words:
-            return " ".join(parts[:max_words])
-        return text
-
-    @staticmethod
-    def refine(text: str, field_type: str) -> str:
-        defaults = {
-            "intro": "يلا نركز في الآية دي يا حبايبي",
-            "explain": "الآية دي بتعلمنا حاجة جميلة جدًا",
-            "outro": "اللقاء الجاي إن شاء الله",
-        }
-        if not text or len(text.strip()) < 5:
-            return defaults.get(field_type, "أهلاً بكم!")
-        return SceneRefiner.shorten(text)
-
-
-# ═══════════════════════════════════════════════════════════════
-# ScriptEngine
-# ═══════════════════════════════════════════════════════════════
 class ScriptEngine:
-    """نسخة v5: single-pass، نموذج قوي + fallback، ولا يستهلك الباقة."""
-
     def __init__(self):
-        self.adapters: List[tuple] = []
-        self.quality_gate = QualityGate()
-        self.prompt_builder = UnifiedPromptBuilder()
-        self.refiner = SceneRefiner()
-
-        # 🎯 ترتيب الأفضلية:
-        # 1. Gemini 2.5 Pro (الأقوى في الفهم والـ JSON الدقيق + رخيص نسبيًا)
-        # 2. Claude Opus (للسكريبتات الإبداعية الدافئة)
-        # 3. Gemini 2.5 Flash (سريع + رخيص جدًا كـ fallback أخير)
-        # 4. Cohere Command (fallback إضافي)
-
+        # تهيئة واجهات النماذج (Adapters)
+        self.adapters = []
+        
+        # 1. Grok كخيار أول (سريع جداً في توليد JSON شامل بدون كسل)
+        if os.getenv("GROK_API_KEY"):
+            try:
+                self.adapters.append((GrokAdapter(os.getenv("GROK_API_KEY")), "grok-2-latest"))
+            except Exception as e:
+                logger.warning(f"⚠️ لم يتم تهيئة Grok: {e}")
+                
+        # 2. خط الدفاع الثاني (Gemini)
         if APIKeys.GEMINI:
-            self.adapters.append((
-                GeminiAdapter(APIKeys.GEMINI, "gemini-2.5-pro"),
-                "gemini-2.5-pro",
-            ))
-            self.adapters.append((
-                GeminiAdapter(APIKeys.GEMINI, "gemini-2.5-flash"),
-                "gemini-2.5-flash",
-            ))
-
-        if APIKeys.ANTHROPIC:
-            # ✅ FIX: استخدام أحدث Claude (claude-3-opus-20240229 قديم!)
-            self.adapters.append((
-                AnthropicAdapter(APIKeys.ANTHROPIC, "claude-3-5-sonnet-20241022"),
-                "claude-3.5-sonnet",
-            ))
-
-        if APIKeys.COHERE:
-            self.adapters.append((
-                CohereAdapter(APIKeys.COHERE, "command-r-plus-08-2024"),
-                "command-r-plus",
-            ))
+            self.adapters.append((GeminiAdapter(APIKeys.GEMINI), "gemini-2.5-pro"))
+            self.adapters.append((GeminiAdapter(APIKeys.GEMINI), "gemini-2.5-flash"))
+            
+        # 3. خط الدفاع الثالث (Cohere)
+        if os.getenv("COHERE_API_KEY"):
+            self.adapters.append((CohereAdapter(os.getenv("COHERE_API_KEY")), "command-r-plus-08-2024"))
+            self.adapters.append((CohereAdapter(os.getenv("COHERE_API_KEY")), "command-r-08-2024"))
+            
+        # 4. خط الدفاع الأخير (Claude)
+        if os.getenv("ANTHROPIC_API_KEY"):
+            self.adapters.append((AnthropicAdapter(os.getenv("ANTHROPIC_API_KEY")), "claude-3-opus-20240229"))
 
         if not self.adapters:
-            raise ValueError("❌ لا توجد مفاتيح LLM متاحة (GEMINI/ANTHROPIC/COHERE)")
+            raise ValueError("لم يتم توفير أي مفاتيح API للنماذج.")
 
-        logger.info(f"✅ ScriptEngine initialized with {len(self.adapters)} adapters")
+        self.quality_gate = QualityGate()
+        self.prompt_builder = PromptBuilder()
 
-    # ─────────────────────────────────────────────────────────────
-    # 1) جلب آيات السورة من Quran API
-    # ─────────────────────────────────────────────────────────────
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
-    def _fetch_ayahs(self, info: dict) -> List[VerifiedAyah]:
-        ayahs = []
-        for n in range(info["start"], info["end"] + 1):
-            url = (
-                f"https://api.qurancdn.com/api/qdc/verses/by_key/"
-                f"{info['surah']}:{n}?words=false&fields=text_uthmani"
-            )
-            resp = requests.get(url, timeout=15).json()
-            ayahs.append(VerifiedAyah(
-                surah=info["surah"],
-                number=n,
-                text=resp["verse"]["text_uthmani"],
-                source="quran_api",
-            ))
-        logger.info(f"📿 تم تحميل {len(ayahs)} آيات لسورة {info['name']}")
-        return ayahs
-
-    # ─────────────────────────────────────────────────────────────
-    # 2) Single-pass: استدعاء واحد فقط لكل نموذج
-    # ─────────────────────────────────────────────────────────────
-    def _call_llm(self, episode_num: int, info: dict, ayahs: List[VerifiedAyah]) -> Optional[Dict[str, Any]]:
-        ayahs_text = "\n".join(f"  [{a.number}] {a.text}" for a in ayahs)
-        system = self.prompt_builder.build_system()
-        prompt = self.prompt_builder.build_user(episode_num, info, ayahs_text)
-
-        for adapter, name in self.adapters:
-            try:
-                logger.info(f"🚀 [LLM] Calling {name} (single-pass)...")
-                # نطلب JSON صراحة لو الـ adapter بيدعمه
-                response = adapter.generate(
-                    prompt,
-                    system,
-                    response_mime_type="application/json",
-                )
-                if not response:
-                    continue
-
-                # استخراج JSON
-                try:
-                    data = extract_json(response)
-                except Exception as e:
-                    logger.warning(f"⚠️ {name} JSON parse failed: {e}")
-                    continue
-
-                # Quality check
-                report = self.quality_gate.evaluate(data)
-                logger.info(f"📊 {name}: quality={report.overall_score:.1f}/100, passed={report.passed}")
-
-                if report.passed:
-                    logger.info(f"✅ {name} produced acceptable script")
-                    return data
-
-                # لو فشل، نسجل ونجرب التالي
-                logger.warning(f"⚠️ {name} below quality threshold, trying next...")
-                # نحفظ كـ best-effort لو كل النماذج فشلت
-                if report.overall_score >= 50:
-                    return data  # accept partial success
-
-            except Exception as e:
-                logger.error(f"❌ {name} failed: {e}")
-                continue
-
-        return None
-
-    # ─────────────────────────────────────────────────────────────
-    # 3) بناء كائن EpisodeScript
-    # ─────────────────────────────────────────────────────────────
-    def _build_script(self, ep_num: int, info: dict,
-                      data: Dict[str, Any],
-                      verified: List[VerifiedAyah]) -> EpisodeScript:
-        v_map = {a.number: a for a in verified}
-
-        # Ayah scenes
-        ayah_scenes = []
-        for i, s in enumerate(data.get("ayah_scenes", [])):
-            a_num = s.get("ayah_number", info["start"] + i)
-            if a_num not in v_map:
-                logger.warning(f"⚠️ Ayah {a_num} not in verified, skipping")
-                continue
-            ayah_scenes.append(AyahScene(
-                scene_id=10 + i,
-                ayah=v_map[a_num],
-                intro_text=self.refiner.refine(s.get("intro_text", ""), "intro"),
-                explain_text=self.refiner.refine(s.get("explain_text", ""), "explain"),
-                visual_prompt=s.get("visual_prompt", "flat vector graphic, minimal infographic, pastel colors"),
-                repetitions=3,
-                duration_sec=15,
-            ))
-
-        intro_data = data.get("intro_scene", {})
-        outro_data = data.get("outro_scene", {})
-
-        return EpisodeScript(
-            episode_number=ep_num,
-            surah_name=info["name"],
-            surah_number=info["surah"],
-            title=data.get("title", f"سورة {info['name']}"),
-            youtube_title=data.get("youtube_title", f"تفسير سورة {info['name']} للأطفال"),
-            youtube_description=data.get("youtube_description",
-                f"حلقة جديدة لتعليم الأطفال سورة {info['name']} بأسلوب مبسّط وممتع."),
-            youtube_tags=data.get("youtube_tags", [
-                "قرآن للأطفال", "تفسير ميسر", info["name"],
-                "تحفيظ القرآن", "تربية إسلامية", "VALUE", "قيمة"
-            ]),
-            intro_scene=NarratorScene(
-                scene_id=1,
-                scene_type=SceneType.INTRO,
-                duration_sec=8,
-                narrator_text=self.refiner.refine(intro_data.get("narrator_text", ""), "intro"),
-                visual_prompt=intro_data.get("visual_prompt",
-                    "flat 2D vector, kind grandfather with smiling kids, warm pastel colors"),
-                mood=AudioMood.INTRO,
-            ),
-            ayah_scenes=ayah_scenes,
-            mid_scenes=[],
-            outro_scene=NarratorScene(
-                scene_id=99,
-                scene_type=SceneType.OUTRO,
-                duration_sec=8,
-                narrator_text=self.refiner.refine(outro_data.get("narrator_text", ""), "outro"),
-                visual_prompt=outro_data.get("visual_prompt",
-                    "flat 2D vector, kids waving goodbye, subscribe button, warm farewell"),
-                mood=AudioMood.OUTRO,
-            ),
-            total_duration_sec=300,
-        )
-
-    # ─────────────────────────────────────────────────────────────
-    # 4) Public API
-    # ─────────────────────────────────────────────────────────────
     def generate(self, episode_num: int) -> EpisodeScript:
-        if episode_num not in CURRICULUM:
-            raise ValueError(f"الحلقة {episode_num} غير موجودة في المنهج")
-
         info = CURRICULUM[episode_num]
         verified_ayahs = self._fetch_ayahs(info)
-        data = self._call_llm(episode_num, info, verified_ayahs)
+        ayah_refs = "\n".join([f"[AYAH_{a.number}]" for a in verified_ayahs])
 
-        if not data:
-            raise RuntimeError("🚨 فشلت كافة نماذج LLM في إنتاج سكريبت قابل للاستخدام")
+        # توجيه صريح لإنتاج جميع الآيات دفعة واحدة لتوفير الكوتة
+        base_prompt = f"""السورة المطلوبة: {info['name']}
+من الآية: {info['start']} إلى الآية: {info['end']}
+المراجع:
+{ayah_refs}
 
-        script = self._build_script(episode_num, info, data, verified_ayahs)
+يجب توليد مشاهد لجميع هذه الآيات في رد واحد مفصل وشامل."""
 
-        # حفظ على القرص
+        system_prompt = self.prompt_builder.get_system_prompt()
+        raw_data = None
+
+        # 1. محاولة التوليد عبر النماذج المتوفرة
+        for adapter, model_name in self.adapters:
+            logger.info(f"🚀 استدعاء النموذج: {model_name}...")
+            try:
+                raw_data = adapter.generate(base_prompt, system_prompt, model_name)
+
+                # 2. تقييم الجودة
+                report = self.quality_gate.evaluate(raw_data)
+
+                # 3. الإصلاح الذاتي (Self-Repair) فقط في حالات الطوارئ القصوى
+                if not report.passed:
+                    logger.warning(f"⚠️ النموذج {model_name} فشل في معايير الجودة. بدء عملية الإصلاح الذاتي...")
+                    repair_prompt = f"لقد قمت بتوليد هذا الـ JSON سابقاً، ولكنه يحتوي على الأخطاء التالية:\n{chr(10).join(report.critiques)}\n\nالرجاء إعادة كتابة الـ JSON كاملاً مع إصلاح هذه الأخطاء، وتوسيع النصوص لتصبح قصصية ومفصلة.\nالنص الأصلي المعيب:\n{raw_data}"
+                    raw_data = adapter.generate(repair_prompt, system_prompt, model_name)
+                    report = self.quality_gate.evaluate(raw_data)
+
+                # إذا نجح بعد الإصلاح (أو من أول مرة)، نعتمد النتيجة
+                if report.passed:
+                    logger.info(f"🏆 تم اعتماد المخرج من {model_name} بنجاح.")
+                    break
+                else:
+                    logger.error(f"❌ فشل الإصلاح الذاتي لنموذج {model_name}. ننتقل للنموذج التالي.")
+                    raw_data = None # تصفير البيانات للمحاولة التالية
+
+            except Exception as e:
+                logger.error(f"خطأ في نموذج {model_name}: {str(e)}")
+                continue
+
+        if not raw_data:
+            raise RuntimeError("🚨 انهيار المنظومة: فشلت كافة النماذج في تقديم محتوى يطابق معايير الجودة.")
+
+        # 4. بناء الكائن النهائي
+        script = self._build_script_object(episode_num, info, raw_data, verified_ayahs)
+
+        # 5. الحفظ
         save_path = Paths.SCRIPT_DIR / f"episode_{episode_num:03d}.json"
         save_path.parent.mkdir(parents=True, exist_ok=True)
         save_path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
-
-        logger.info(f"🎉 سكريبت الحلقة {episode_num} ({info['name']}) جاهز")
         return script
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
+    def _fetch_ayahs(self, info):
+        ayahs = []
+        for n in range(info["start"], info["end"] + 1):
+            url = f"https://api.qurancdn.com/api/qdc/verses/by_key/{info['surah']}:{n}?words=false&fields=text_uthmani"
+            resp = requests.get(url).json()
+            ayahs.append(VerifiedAyah(surah=info["surah"], number=n, text=resp["verse"]["text_uthmani"], source="quran_api"))
+        return ayahs
+
+    def _build_script_object(self, ep_num, info, data, verified):
+        v_map = {a.number: a for a in verified}
+        ayah_scenes = []
+
+        for i, s in enumerate(data.get("ayah_scenes", [])):
+            a_num = s.get("ayah_number", info["start"] + i)
+            if a_num in v_map:
+                intro_text = str(s.get("intro_text", ""))
+                explain_text = str(s.get("explain_text", ""))
+                
+                ayah_scenes.append(AyahScene(
+                    scene_id=10 + i, ayah=v_map[a_num],
+                    intro_text=intro_text if len(intro_text) > 15 else "يا حبايب جدو، تعالوا نغمض عينينا ونسمع الآية العظيمة دي بقلوبنا...", 
+                    explain_text=explain_text if len(explain_text) > 30 else "صدق الله العظيم. الآية دي يا أبطال بتعلمنا قصة جميلة وحاجة عظيمة جداً لازم دايماً نحفظها في قلوبنا ونفتكرها كل يوم.",
+                    visual_prompt=str(s.get("visual_prompt", "Pixar 3D animation, highly detailed cinematic scene")),
+                    repetitions=3, duration_sec=35
+                ))
+
+        return EpisodeScript(
+            episode_number=ep_num, surah_name=info["name"], surah_number=info["surah"],
+            title=str(data.get("title", f"سورة {info['name']}")), 
+            youtube_title=str(data.get("youtube_title", f"تفسير سورة {info['name']}")), 
+            youtube_description=str(data.get("youtube_description", "")),
+            youtube_tags=[], total_duration_sec=300,
+            intro_scene=NarratorScene(
+                scene_id=1, scene_type=SceneType.INTRO, duration_sec=25, 
+                narrator_text=str(data.get("intro_scene", {}).get("narrator_text", "أهلاً بأبطالي!")), 
+                visual_prompt=str(data.get("intro_scene", {}).get("visual_prompt", "Pixar 3D grandfather")), 
+                mood=AudioMood.INTRO
+            ),
+            ayah_scenes=ayah_scenes, mid_scenes=[],
+            outro_scene=NarratorScene(
+                scene_id=99, scene_type=SceneType.OUTRO, duration_sec=25,
+                narrator_text=str(data.get("outro_scene", {}).get("narrator_text", "إلى اللقاء يا أبطال.")), 
+                visual_prompt=str(data.get("outro_scene", {}).get("visual_prompt", "Pixar 3D grandfather waving")), 
+                mood=AudioMood.OUTRO
+            )
+        )
 
     def load_from_disk(self, episode_num: int) -> Optional[EpisodeScript]:
         p = Paths.SCRIPT_DIR / f"episode_{episode_num:03d}.json"
-        if not p.exists():
-            return None
-        try:
-            return EpisodeScript.model_validate_json(p.read_text(encoding="utf-8"))
-        except Exception as e:
-            logger.error(f"❌ خطأ قراءة السكريبت: {e}")
-            return None
+        if p.exists():
+            return EpisodeScript.model_validate(json.loads(p.read_text(encoding="utf-8")))
+        return None
