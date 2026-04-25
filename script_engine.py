@@ -1,9 +1,14 @@
 """
-script_engine.py — VALUE / QEEMA v3.0 (Enterprise Architecture)
+script_engine.py — VALUE / QEEMA v3.1 (Enterprise Architecture)
 يحتوي على:
 - Prompt Builder: هندسة أوامر معمارية (التوليد الشامل من طلقة واحدة للحفاظ على الكوتة).
-- Model Registry & Fallback: محاولات ذكية مدعومة بـ Grok.
+- Model Registry & Fallback: محاولات ذكية مدعومة بـ Groq (مجاني وسريع).
 - Self-Repair: نظام إصلاح ذاتي بناءً على نقد Quality Gate.
+
+[CHANGELOG v3.1]
+- تصحيح: استبدال GrokAdapter (x.ai) بـ GroqAdapter (groq.com) الصحيح.
+- تصحيح: متغير البيئة GROK_API_KEY → GROQ_API_KEY.
+- تصحيح: الموديل grok-2-latest → llama-3.3-70b-versatile.
 """
 
 from __future__ import annotations
@@ -19,14 +24,15 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from config import APIKeys, CURRICULUM, Paths
 from models import (
-    AyahScene, AudioMood, EpisodeScript, 
+    AyahScene, AudioMood, EpisodeScript,
     NarratorScene, SceneType, VerifiedAyah
 )
-# استدعاء ملفات المنظومة الجديدة
-from core_adapters import GeminiAdapter, CohereAdapter, AnthropicAdapter, GrokAdapter
+# استدعاء ملفات المنظومة — تم استبدال GrokAdapter بـ GroqAdapter
+from core_adapters import GeminiAdapter, CohereAdapter, AnthropicAdapter, GroqAdapter
 from quality_gate import QualityGate
 
 logger = logging.getLogger(__name__)
+
 
 class PromptBuilder:
     @staticmethod
@@ -38,7 +44,7 @@ class PromptBuilder:
 
 [قواعد السرد المتقدمة]:
 1. الشرح القصصي (Storytelling): يُمنع التفسير المباشر الجاف. يجب أن يكون الشرح (explain_text) عبارة عن "قصة قصيرة" أو "موقف حياتي" لتبسيط معنى الآية (لا يقل عن 50 كلمة للآية).
-2. الانتقال الذكي للتلاوة: 
+2. الانتقال الذكي للتلاوة:
    - التمهيد (intro_text): ينتهي بتهيئة الطفل لسماع القرآن: "تعالوا نغمض عينينا ونسمع ربنا بيقول إيه...".
    - استقبال التلاوة: يبدأ الشرح (explain_text) دائماً بعبارة: "صدق الله العظيم"، ثم يبدأ السرد.
 3. الخاتمة الوجدانية: يُمنع استخدام عبارات اليوتيوب (اشتركوا، لايك). الخاتمة دعاء دافئ وقصة قبل النوم.
@@ -70,35 +76,47 @@ class PromptBuilder:
 
 أجب بـ JSON فقط يتضمن جميع الآيات المطلوبة دفعة واحدة."""
 
+
 class ScriptEngine:
     def __init__(self):
         # تهيئة واجهات النماذج (Adapters)
         self.adapters = []
-        
-        # 1. Grok كخيار أول (سريع جداً في توليد JSON شامل بدون كسل)
-        if os.getenv("GROK_API_KEY"):
+
+        # 1. Groq كخيار أول — مجاني، سريع جداً، يدعم JSON mode
+        #    المفتاح يبدأ بـ gsk_ — من console.groq.com
+        if os.getenv("GROQ_API_KEY"):
             try:
-                self.adapters.append((GrokAdapter(os.getenv("GROK_API_KEY")), "grok-2-latest"))
+                self.adapters.append(
+                    (GroqAdapter(os.getenv("GROQ_API_KEY")), "llama-3.3-70b-versatile")
+                )
+                logger.info("✅ Groq adapter جاهز (llama-3.3-70b-versatile)")
             except Exception as e:
-                logger.warning(f"⚠️ لم يتم تهيئة Grok: {e}")
-                
+                logger.warning(f"⚠️ لم يتم تهيئة Groq: {e}")
+
         # 2. خط الدفاع الثاني (Gemini)
         if APIKeys.GEMINI:
             self.adapters.append((GeminiAdapter(APIKeys.GEMINI), "gemini-2.5-pro"))
             self.adapters.append((GeminiAdapter(APIKeys.GEMINI), "gemini-2.5-flash"))
-            
+
         # 3. خط الدفاع الثالث (Cohere)
         if os.getenv("COHERE_API_KEY"):
-            self.adapters.append((CohereAdapter(os.getenv("COHERE_API_KEY")), "command-r-plus-08-2024"))
-            self.adapters.append((CohereAdapter(os.getenv("COHERE_API_KEY")), "command-r-08-2024"))
-            
-        # 4. خط الدفاع الأخير (Claude)
+            self.adapters.append(
+                (CohereAdapter(os.getenv("COHERE_API_KEY")), "command-r-plus-08-2024")
+            )
+            self.adapters.append(
+                (CohereAdapter(os.getenv("COHERE_API_KEY")), "command-r-08-2024")
+            )
+
+        # 4. خط الدفاع الأخير (Claude) — يحتاج رصيد مدفوع
         if os.getenv("ANTHROPIC_API_KEY"):
-            self.adapters.append((AnthropicAdapter(os.getenv("ANTHROPIC_API_KEY")), "claude-3-opus-20240229"))
+            self.adapters.append(
+                (AnthropicAdapter(os.getenv("ANTHROPIC_API_KEY")), "claude-3-opus-20240229")
+            )
 
         if not self.adapters:
             raise ValueError("لم يتم توفير أي مفاتيح API للنماذج.")
 
+        logger.info(f"✅ عدد النماذج المتاحة: {len(self.adapters)}")
         self.quality_gate = QualityGate()
         self.prompt_builder = PromptBuilder()
 
@@ -129,8 +147,17 @@ class ScriptEngine:
 
                 # 3. الإصلاح الذاتي (Self-Repair) فقط في حالات الطوارئ القصوى
                 if not report.passed:
-                    logger.warning(f"⚠️ النموذج {model_name} فشل في معايير الجودة. بدء عملية الإصلاح الذاتي...")
-                    repair_prompt = f"لقد قمت بتوليد هذا الـ JSON سابقاً، ولكنه يحتوي على الأخطاء التالية:\n{chr(10).join(report.critiques)}\n\nالرجاء إعادة كتابة الـ JSON كاملاً مع إصلاح هذه الأخطاء، وتوسيع النصوص لتصبح قصصية ومفصلة.\nالنص الأصلي المعيب:\n{raw_data}"
+                    logger.warning(
+                        f"⚠️ النموذج {model_name} فشل في معايير الجودة. "
+                        f"بدء عملية الإصلاح الذاتي..."
+                    )
+                    repair_prompt = (
+                        f"لقد قمت بتوليد هذا الـ JSON سابقاً، ولكنه يحتوي على الأخطاء التالية:\n"
+                        f"{chr(10).join(report.critiques)}\n\n"
+                        f"الرجاء إعادة كتابة الـ JSON كاملاً مع إصلاح هذه الأخطاء، "
+                        f"وتوسيع النصوص لتصبح قصصية ومفصلة.\n"
+                        f"النص الأصلي المعيب:\n{raw_data}"
+                    )
                     raw_data = adapter.generate(repair_prompt, system_prompt, model_name)
                     report = self.quality_gate.evaluate(raw_data)
 
@@ -139,15 +166,19 @@ class ScriptEngine:
                     logger.info(f"🏆 تم اعتماد المخرج من {model_name} بنجاح.")
                     break
                 else:
-                    logger.error(f"❌ فشل الإصلاح الذاتي لنموذج {model_name}. ننتقل للنموذج التالي.")
-                    raw_data = None # تصفير البيانات للمحاولة التالية
+                    logger.error(
+                        f"❌ فشل الإصلاح الذاتي لنموذج {model_name}. ننتقل للنموذج التالي."
+                    )
+                    raw_data = None  # تصفير البيانات للمحاولة التالية
 
             except Exception as e:
                 logger.error(f"خطأ في نموذج {model_name}: {str(e)}")
                 continue
 
         if not raw_data:
-            raise RuntimeError("🚨 انهيار المنظومة: فشلت كافة النماذج في تقديم محتوى يطابق معايير الجودة.")
+            raise RuntimeError(
+                "🚨 انهيار المنظومة: فشلت كافة النماذج في تقديم محتوى يطابق معايير الجودة."
+            )
 
         # 4. بناء الكائن النهائي
         script = self._build_script_object(episode_num, info, raw_data, verified_ayahs)
@@ -162,9 +193,19 @@ class ScriptEngine:
     def _fetch_ayahs(self, info):
         ayahs = []
         for n in range(info["start"], info["end"] + 1):
-            url = f"https://api.qurancdn.com/api/qdc/verses/by_key/{info['surah']}:{n}?words=false&fields=text_uthmani"
+            url = (
+                f"https://api.qurancdn.com/api/qdc/verses/by_key/"
+                f"{info['surah']}:{n}?words=false&fields=text_uthmani"
+            )
             resp = requests.get(url).json()
-            ayahs.append(VerifiedAyah(surah=info["surah"], number=n, text=resp["verse"]["text_uthmani"], source="quran_api"))
+            ayahs.append(
+                VerifiedAyah(
+                    surah=info["surah"],
+                    number=n,
+                    text=resp["verse"]["text_uthmani"],
+                    source="quran_api"
+                )
+            )
         return ayahs
 
     def _build_script_object(self, ep_num, info, data, verified):
@@ -176,32 +217,59 @@ class ScriptEngine:
             if a_num in v_map:
                 intro_text = str(s.get("intro_text", ""))
                 explain_text = str(s.get("explain_text", ""))
-                
+
                 ayah_scenes.append(AyahScene(
-                    scene_id=10 + i, ayah=v_map[a_num],
-                    intro_text=intro_text if len(intro_text) > 15 else "يا حبايب جدو، تعالوا نغمض عينينا ونسمع الآية العظيمة دي بقلوبنا...", 
-                    explain_text=explain_text if len(explain_text) > 30 else "صدق الله العظيم. الآية دي يا أبطال بتعلمنا قصة جميلة وحاجة عظيمة جداً لازم دايماً نحفظها في قلوبنا ونفتكرها كل يوم.",
-                    visual_prompt=str(s.get("visual_prompt", "Pixar 3D animation, highly detailed cinematic scene")),
-                    repetitions=3, duration_sec=35
+                    scene_id=10 + i,
+                    ayah=v_map[a_num],
+                    intro_text=(
+                        intro_text if len(intro_text) > 15
+                        else "يا حبايب جدو، تعالوا نغمض عينينا ونسمع الآية العظيمة دي بقلوبنا..."
+                    ),
+                    explain_text=(
+                        explain_text if len(explain_text) > 30
+                        else "صدق الله العظيم. الآية دي يا أبطال بتعلمنا قصة جميلة وحاجة عظيمة جداً "
+                             "لازم دايماً نحفظها في قلوبنا ونفتكرها كل يوم."
+                    ),
+                    visual_prompt=str(
+                        s.get("visual_prompt", "Pixar 3D animation, highly detailed cinematic scene")
+                    ),
+                    repetitions=3,
+                    duration_sec=35
                 ))
 
         return EpisodeScript(
-            episode_number=ep_num, surah_name=info["name"], surah_number=info["surah"],
-            title=str(data.get("title", f"سورة {info['name']}")), 
-            youtube_title=str(data.get("youtube_title", f"تفسير سورة {info['name']}")), 
+            episode_number=ep_num,
+            surah_name=info["name"],
+            surah_number=info["surah"],
+            title=str(data.get("title", f"سورة {info['name']}")),
+            youtube_title=str(data.get("youtube_title", f"تفسير سورة {info['name']}")),
             youtube_description=str(data.get("youtube_description", "")),
-            youtube_tags=[], total_duration_sec=300,
+            youtube_tags=[],
+            total_duration_sec=300,
             intro_scene=NarratorScene(
-                scene_id=1, scene_type=SceneType.INTRO, duration_sec=25, 
-                narrator_text=str(data.get("intro_scene", {}).get("narrator_text", "أهلاً بأبطالي!")), 
-                visual_prompt=str(data.get("intro_scene", {}).get("visual_prompt", "Pixar 3D grandfather")), 
+                scene_id=1,
+                scene_type=SceneType.INTRO,
+                duration_sec=25,
+                narrator_text=str(
+                    data.get("intro_scene", {}).get("narrator_text", "أهلاً بأبطالي!")
+                ),
+                visual_prompt=str(
+                    data.get("intro_scene", {}).get("visual_prompt", "Pixar 3D grandfather")
+                ),
                 mood=AudioMood.INTRO
             ),
-            ayah_scenes=ayah_scenes, mid_scenes=[],
+            ayah_scenes=ayah_scenes,
+            mid_scenes=[],
             outro_scene=NarratorScene(
-                scene_id=99, scene_type=SceneType.OUTRO, duration_sec=25,
-                narrator_text=str(data.get("outro_scene", {}).get("narrator_text", "إلى اللقاء يا أبطال.")), 
-                visual_prompt=str(data.get("outro_scene", {}).get("visual_prompt", "Pixar 3D grandfather waving")), 
+                scene_id=99,
+                scene_type=SceneType.OUTRO,
+                duration_sec=25,
+                narrator_text=str(
+                    data.get("outro_scene", {}).get("narrator_text", "إلى اللقاء يا أبطال.")
+                ),
+                visual_prompt=str(
+                    data.get("outro_scene", {}).get("visual_prompt", "Pixar 3D grandfather waving")
+                ),
                 mood=AudioMood.OUTRO
             )
         )
