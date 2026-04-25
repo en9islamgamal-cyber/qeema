@@ -26,8 +26,7 @@ from supabase import create_client, Client
 from config import APIKeys, DBConfig, Paths
 from models import EpisodeScript, EpisodeStatus
 from script_engine import ScriptEngine
-from voice_engine import VoiceEngine                      # ✅ NEW (no _v2)
-from visual_engine import VisualEngine
+from voice_engine_v2 import VoiceEngine                   # ✅ NEW (v2)from visual_engine import VisualEngine
 from sfx_engine import SFXEngine
 from gamification_engine import GamificationEngine
 from video_engine import VideoEngine
