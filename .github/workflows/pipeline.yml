@@ -24,7 +24,7 @@ jobs:
   pipeline:
     name: "Produce Episode"
     runs-on: ubuntu-22.04
-    timeout-minutes: 240   # ⬆️ زيادة من 180 لـ 240 (Leonardo + ElevenLabs بياخدوا وقت)
+    timeout-minutes: 240
 
     steps:
       - name: "🔍 Checkout Code"
@@ -59,7 +59,6 @@ jobs:
                    assets/thumbnails \
                    assets/fonts \
                    assets/overlays
-          # Copy bundled font if present
           if [ -f "Amiri-Bold.ttf" ]; then
             cp Amiri-Bold.ttf assets/fonts/
             echo "✅ Amiri-Bold font copied to assets/fonts/"
@@ -91,23 +90,23 @@ jobs:
       - name: "🚀 Run Pipeline with Intelligent Retry"
         env:
           # 🔑 LLM keys
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+          GEMINI_API_KEY:    ${{ secrets.GEMINI_API_KEY }}
+          COHERE_API_KEY:    ${{ secrets.COHERE_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
-          # 🎙️ Voice — NEW: ElevenLabs primary
-          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
+          # 🎙️ Voice
+          ELEVENLABS_API_KEY:  ${{ secrets.ELEVENLABS_API_KEY }}
           ELEVENLABS_VOICE_ID: ${{ vars.ELEVENLABS_VOICE_ID }}
-          # 🎨 Image — Leonardo
+          # 🎨 Image
           LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
           # 🗄️ Database
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           # 📺 YouTube
-          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_ID:     ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-          # 🧪 Dry-run support
+          # 🧪 Dry-run
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           ARGS=""
