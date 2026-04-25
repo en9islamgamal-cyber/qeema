@@ -17,4 +17,5 @@ python-dotenv>=1.0.0
 Pillow>=10.3.0
 arabic-reshaper>=3.0.0
 python-bidi>=0.4.2
-python-json-logger>=2.0.0   # اختياري، لكن يضيف JSON logging
+python-json-logger>=2.0.0
+numpy>=1.26.0
