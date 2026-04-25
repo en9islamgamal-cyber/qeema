@@ -2,15 +2,14 @@ name: "VALUE QEEMA Pipeline v5"
 
 on:
   schedule:
-    - cron: "0 3 * * 1,4"   # 3am UTC = 6am Kuwait, الإثنين والخميس
+    - cron: "0 3 * * 1,4"
   workflow_dispatch:
     inputs:
       episode_number:
-        description: "Episode number to produce (leave empty for next pending)"
+        description: "Episode number (leave empty for next pending)"
         required: false
         type: string
       dry_run:
-        description: "Dry run (no YouTube upload)"
         required: false
         default: "false"
         type: choice
@@ -24,132 +23,74 @@ jobs:
   pipeline:
     name: "Produce Episode"
     runs-on: ubuntu-22.04
-    timeout-minutes: 240
+    timeout-minutes: 300
 
     steps:
-      - name: "🔍 Checkout Code"
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: "🐍 Setup Python ${{ env.PYTHON_VERSION }}"
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
-      - name: "📦 Install System Dependencies"
+      - name: "📦 System Dependencies"
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y \
-            ffmpeg \
-            fonts-noto-core \
-            fonts-noto-cjk \
-            fonts-hosny-amiri \
-            libfreetype6-dev \
-            libsndfile1
-          echo "✅ System dependencies installed."
+          sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-cjk fonts-hosny-amiri libfreetype6-dev libsndfile1
           ffmpeg -version | head -n 1
 
-      - name: "📁 Create Required Directories"
+      - name: "📁 Directories"
         run: |
-          mkdir -p logs \
-                   temp/episodes \
-                   temp/tts_cache \
-                   temp/assembly \
-                   output/videos \
-                   assets/thumbnails \
-                   assets/fonts \
-                   assets/overlays
-          if [ -f "Amiri-Bold.ttf" ]; then
-            cp Amiri-Bold.ttf assets/fonts/
-            echo "✅ Amiri-Bold font copied to assets/fonts/"
-          fi
-          if [ -f "logo.png" ]; then
-            cp logo.png assets/
-            echo "✅ Logo copied to assets/"
-          fi
-          echo "✅ Directories ready."
+          mkdir -p logs temp/episodes temp/tts_cache temp/assembly output/videos assets/thumbnails assets/fonts assets/overlays assets/brand
+          [ -f "Amiri-Bold.ttf" ] && cp Amiri-Bold.ttf assets/fonts/
+          [ -f "logo.png" ] && cp logo.png assets/
 
-      - name: "🐍 Install Python Packages"
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt -q
-          echo "✅ Python packages installed."
+      - name: "🐍 Python Packages"
+        run: pip install -r requirements.txt -q
 
-      - name: "🔐 Setup Google Cloud Credentials"
+      - name: "🔐 Google Cloud"
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: |
-          if [ -z "$GCP_SA_KEY" ]; then
-            echo "❌ Error: GCP_SA_KEY is missing in GitHub Secrets!"
-            exit 1
-          fi
           echo "$GCP_SA_KEY" > /tmp/gcp_sa.json
           echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_sa.json" >> $GITHUB_ENV
-          echo "✅ Google Cloud Credentials configured."
 
-      - name: "🚀 Run Pipeline with Intelligent Retry"
+      - name: "🚀 Run Pipeline"
         env:
-          # 🔑 LLM keys
-          GEMINI_API_KEY:    ${{ secrets.GEMINI_API_KEY }}
-          COHERE_API_KEY:    ${{ secrets.COHERE_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
-          # 🎙️ Voice
+          GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_2:    ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3:    ${{ secrets.GEMINI_API_KEY_3 }}
+          COHERE_API_KEY:      ${{ secrets.COHERE_API_KEY }}
+          LEONARDO_API_KEY:    ${{ secrets.LEONARDO_API_KEY }}
           ELEVENLABS_API_KEY:  ${{ secrets.ELEVENLABS_API_KEY }}
           ELEVENLABS_VOICE_ID: ${{ vars.ELEVENLABS_VOICE_ID }}
-          # 🎨 Image
-          LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
-          # 🗄️ Database
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          # 📺 YouTube
+          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
           YOUTUBE_CLIENT_ID:     ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-          # 🧪 Dry-run
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           ARGS=""
-          if [ -n "${{ github.event.inputs.episode_number }}" ]; then
-            ARGS="--episode ${{ github.event.inputs.episode_number }}"
-          fi
-          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            ARGS="$ARGS --dry-run"
-          fi
-
-          max_retries=3
-          attempt=1
-          success=false
-
+          [ -n "${{ github.event.inputs.episode_number }}" ] && ARGS="--episode ${{ github.event.inputs.episode_number }}"
+          [ "${{ github.event.inputs.dry_run }}" = "true" ] && ARGS="$ARGS --dry-run"
+          max_retries=3; attempt=1; success=false
           until [ $attempt -gt $max_retries ]; do
-            echo "═══════════════════════════════════════"
-            echo "🚀 Attempt $attempt of $max_retries"
-            echo "═══════════════════════════════════════"
-            if python -u main.py $ARGS; then
-              echo "✅ Pipeline finished successfully!"
-              success=true
-              break
-            else
-              echo "⚠️ Attempt $attempt failed. Retrying in 90 seconds..."
-              sleep 90
-              attempt=$((attempt + 1))
-            fi
+            echo "🚀 Attempt $attempt/$max_retries"
+            if python -u main.py $ARGS; then success=true; break
+            else echo "⚠️ Retry in 90s..."; sleep 90; attempt=$((attempt+1)); fi
           done
+          [ "$success" = false ] && exit 1
 
-          if [ "$success" = false ]; then
-            echo "❌ Pipeline failed after $max_retries attempts."
-            exit 1
-          fi
-
-      - name: "📤 Upload Artifacts"
+      - name: "📤 Artifacts"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: episode-results-${{ github.run_number }}
+          name: episode-${{ github.run_number }}
           path: |
             output/videos/*.mp4
             assets/thumbnails/*.jpg
             logs/*.log
-            temp/episodes/*/visuals/*.jpg
           retention-days: 21
           if-no-files-found: warn
