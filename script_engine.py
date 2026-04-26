@@ -4,7 +4,7 @@ script_engine.py — VALUE / QEEMA v9.0 (Load Balancer & Psychological Engine)
 يقوم بتقسيم الحلقة إلى مهام صغيرة جداً وتوزيعها على كافة مفاتيح الـ API المتاحة.
 """
 import json, logging, os, re, requests
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from config import CURRICULUM, Paths
 from models import EpisodeScript, AyahScene, NarratorScene, SceneType, VerifiedAyah
 from core_adapters import GeminiAdapter, GroqAdapter
@@ -24,34 +24,58 @@ class ScriptEngine:
             if k: self.adapters.append((GeminiAdapter(k), "gemini-2.5-flash"))
         if os.getenv("GROQ_API_KEY"):
             self.adapters.append((GroqAdapter(os.getenv("GROQ_API_KEY")), "llama-3.3-70b-versatile"))
-        
+
         if not self.adapters: raise RuntimeError("❌ لا توجد مفاتيح API!")
 
-    def _call_ai(self, prompt: str, system: str) -> dict:
-        """تبديل المفتاح فوراً عند كل طلب لضمان استمرارية الكوتة"""
+    def _call_ai(self, prompt: str, system: str, attempt: int = 1) -> dict:
+        """تبديل المفتاح فوراً عند كل طلب لضمان استمرارية الكوتة، مع حماية من التكرار اللانهائي"""
+        # إذا جربنا كل المفاتيح المتاحة وفشلت، يجب أن نتوقف ونرمي الخطأ
+        if attempt > len(self.adapters):
+            logger.error("❌ فشلت جميع مفاتيح الـ API المتاحة!")
+            raise RuntimeError("All API keys failed or quota exceeded.")
+
         adapter, model = self.adapters[self.ptr]
         self.ptr = (self.ptr + 1) % len(self.adapters)
-        
+
         try:
             res = adapter.generate(prompt, system, model)
             # استخراج الـ JSON بذكاء
             cleaned = re.search(r'\{.*\}', res, re.DOTALL).group()
             return json.loads(cleaned)
         except Exception as e:
-            logger.warning(f"⚠️ فشل {model}، جاري المحاولة مع المفتاح التالي...")
-            return self._call_ai(prompt, system)
+            logger.warning(f"⚠️ فشل {model} (المحاولة {attempt}/{len(self.adapters)})، جاري المحاولة مع المفتاح التالي...")
+            return self._call_ai(prompt, system, attempt + 1)
+
+    def load_from_disk(self, ep_num: int) -> EpisodeScript | None:
+        """
+        يتحقق مما إذا كان السكريبت قد تم توليده وحفظه مسبقاً،
+        ويقوم بتحميله لتجنب استهلاك الكوتة وإعادة التوليد.
+        """
+        save_path = Paths.SCRIPT_DIR / f"episode_{ep_num:03d}.json"
+        
+        if save_path.exists():
+            try:
+                logger.info(f"✅ تم العثور على سكريبت الحلقة {ep_num} محفوظاً. جاري التحميل...")
+                data = json.loads(save_path.read_text(encoding="utf-8"))
+                return EpisodeScript(**data)
+            except Exception as e:
+                logger.error(f"❌ خطأ أثناء قراءة ملف السكريبت للحلقة {ep_num}: {e}")
+                return None
+        
+        logger.info(f"ℹ️ لم يتم العثور على سكريبت مسبق للحلقة {ep_num}. سيتم التوليد من الصفر.")
+        return None
 
     def generate(self, ep_num: int) -> EpisodeScript:
         info = CURRICULUM[ep_num]
         ayahs = self._fetch_ayahs(info)
-        
+
         system_msg = """أنت 'الجد أبو زياد'، تحكي لأحفادك (5-8 سنوات). 
 [الدليل السيكولوجي]: استخدم الترغيب، الحب، القصص الواقعية البسيطة. 
 تجنب كلمات العقاب. اجعل الطفل يشعر أن الله يحبه جداً. 
 أجب بـ JSON فقط باللغة العربية، والـ visual_prompt بالإنجليزية."""
 
         logger.info(f"🚀 بدء توليد حلقة سورة {info['name']} بتقنية التجزئة...")
-        
+
         # 1. المقدمة
         intro_data = self._call_ai(f"اكتب مقدمة دافئة لسورة {info['name']}. أجب بـ JSON: title, youtube_title, youtube_description, intro_text, visual_prompt.", system_msg)
 
@@ -73,7 +97,7 @@ class ScriptEngine:
             ayah_scenes=ayah_scenes,
             outro_scene=NarratorScene(scene_id=99, scene_type=SceneType.OUTRO, narrator_text=outro_data['narrator_text'], visual_prompt=outro_data['visual_prompt'])
         )
-        
+
         save_path = Paths.SCRIPT_DIR / f"episode_{ep_num:03d}.json"
         save_path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
         return script
