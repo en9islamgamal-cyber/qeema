@@ -1,14 +1,14 @@
-# VALUE / QEEMA Pipeline — Python Dependencies
-# ================================================
-# v9.1: أُضيف Playwright لمحرك الرندرة السينمائي
+# VALUE / QEEMA Pipeline — Python Dependencies (v10.0)
+# ======================================================
+# Procedural Cinematic Edition
 
 # LLM Providers
 google-genai>=1.17.0
 anthropic>=0.40.0
 cohere>=5.5.0
-openai>=1.14.0          # يُستخدم أيضاً لـ Groq API (OpenAI-compatible)
+openai>=1.14.0          # used also for Groq
 
-# Google Cloud
+# Google Cloud (TTS fallback)
 google-api-python-client>=2.130.0
 google-auth>=2.29.0
 google-auth-oauthlib>=1.2.0
@@ -26,18 +26,18 @@ aiohttp>=3.9.5
 # Resilience
 tenacity>=8.3.0
 
-# Data & Validation
+# Validation
 pydantic>=2.7.0
 python-dotenv>=1.0.0
 numpy>=1.26.0
 
-# Media & Image Processing
+# Image (للـ thumbnail)
 Pillow>=10.3.0
 
-# ✅ v9.1: محرك الرندرة السينمائي (HTML5 Canvas + CSS animations)
+# ✅ Procedural rendering engine
 playwright>=1.45.0
 
-# Arabic Text Rendering
+# Arabic
 arabic-reshaper>=3.0.0
 python-bidi>=0.4.2
 
