@@ -1,15 +1,17 @@
-name: "VALUE QEEMA Pipeline v5"
+name: "VALUE QEEMA Pipeline v8 (Cinematic Edition)"
 
 on:
   schedule:
+    # يعمل تلقائياً يومي الإثنين والخميس الساعة 3 فجراً بتوقيت جرينتش
     - cron: "0 3 * * 1,4"
   workflow_dispatch:
     inputs:
       episode_number:
-        description: "Episode number (leave empty for next pending)"
+        description: "رقم الحلقة (اتركه فارغاً للحلقة المعلقة التالية)"
         required: false
         type: string
       dry_run:
+        description: "تشغيل تجريبي (بدون رفع ليوتيوب)"
         required: false
         default: "false"
         type: choice
@@ -21,19 +23,21 @@ env:
 
 jobs:
   pipeline:
-    name: "Produce Episode"
+    name: "🎬 Produce Cinematic Episode"
     runs-on: ubuntu-22.04
-    timeout-minutes: 300
+    timeout-minutes: 360 # تمت زيادة الوقت تحسباً للرندرة السينمائية بـ 60FPS
 
     steps:
-      - uses: actions/checkout@v4
+      - name: "📥 Checkout Repository"
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: "🐍 Setup Python"
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
-      - name: "📦 System Dependencies"
+      - name: "📦 System Dependencies (FFmpeg & Fonts)"
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
@@ -46,17 +50,21 @@ jobs:
           ffmpeg -version | head -n 1
           echo "✅ System dependencies installed."
 
-      - name: "📁 Directories"
+      - name: "📁 Create Project Directories"
         run: |
           mkdir -p logs \
                    temp/episodes \
                    temp/tts_cache \
                    temp/assembly \
+                   temp/web_renders \
+                   temp/html_templates \
                    output/videos \
                    assets/thumbnails \
                    assets/fonts \
                    assets/overlays \
-                   assets/brand
+                   assets/brand \
+                   assets/quran_audio
+          
           if [ -f "Amiri-Bold.ttf" ]; then
             cp Amiri-Bold.ttf assets/fonts/
             echo "✅ Amiri font copied"
@@ -67,13 +75,18 @@ jobs:
           fi
           echo "✅ Directories ready."
 
-      - name: "🐍 Python Packages"
+      - name: "⚙️ Install Python Packages & Playwright Engine"
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt -q
-          echo "✅ Python packages installed."
+          # تثبيت محرك الرندرة السينمائي
+          pip install playwright
+          playwright install chromium
+          # السطر الأهم: تثبيت مكتبات النظام الداعمة للمتصفح المخفي
+          sudo playwright install-deps chromium
+          echo "✅ Python packages and Web Render Engine installed."
 
-      - name: "🔐 Google Cloud"
+      - name: "🔐 Configure Google Cloud TTS"
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: |
@@ -85,7 +98,7 @@ jobs:
           echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_sa.json" >> $GITHUB_ENV
           echo "✅ Google Cloud configured."
 
-      - name: "🚀 Run Pipeline"
+      - name: "🚀 Run QEEMA Cinematic Pipeline"
         env:
           GROQ_API_KEY:          ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
@@ -134,14 +147,15 @@ jobs:
             exit 1
           fi
 
-      - name: "📤 Artifacts"
+      - name: "📤 Upload Artifacts (Videos, Scripts & Logs)"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: episode-${{ github.run_number }}
+          name: qeema-episode-${{ github.run_number }}
           path: |
             output/videos/*.mp4
             assets/thumbnails/*.jpg
+            temp/episodes/*.json
             logs/*.log
           retention-days: 21
           if-no-files-found: warn
