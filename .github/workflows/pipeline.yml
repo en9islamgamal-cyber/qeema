@@ -1,0 +1,172 @@
+name: "VALUE QEEMA Pipeline v10 (Procedural Cinematic)"
+
+on:
+  schedule:
+    # يعمل تلقائياً يومي الإثنين والخميس الساعة 3 فجراً بتوقيت جرينتش
+    - cron: "0 3 * * 1,4"
+  workflow_dispatch:
+    inputs:
+      episode_number:
+        description: "رقم الحلقة (اتركه فارغاً للحلقة المعلقة التالية)"
+        required: false
+        type: string
+      dry_run:
+        description: "تشغيل تجريبي (بدون رفع ليوتيوب)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+env:
+  PYTHON_VERSION: "3.11"
+  TZ: "Asia/Kuwait"
+
+jobs:
+  pipeline:
+    name: "🎬 Produce Cinematic Episode (Procedural)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: "📥 Checkout Repository"
+        uses: actions/checkout@v4
+
+      - name: "🐍 Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: "📦 System Dependencies (FFmpeg & Fonts)"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            ffmpeg \
+            fonts-noto-core \
+            fonts-noto-cjk \
+            fonts-hosny-amiri \
+            libfreetype6-dev \
+            libsndfile1
+          ffmpeg -version | head -n 1
+          echo "✅ System dependencies installed."
+
+      - name: "📁 Create Project Directories"
+        run: |
+          mkdir -p logs \
+                   temp/episodes \
+                   temp/tts_cache \
+                   temp/assembly \
+                   temp/web_renders \
+                   temp/html_templates \
+                   output/videos \
+                   assets/thumbnails \
+                   assets/fonts \
+                   assets/overlays \
+                   assets/branding \
+                   assets/quran_audio
+          
+          if [ -f "Amiri-Bold.ttf" ]; then
+            cp Amiri-Bold.ttf assets/fonts/
+            echo "✅ Amiri font copied"
+          fi
+          if [ -f "logo.png" ]; then
+            cp logo.png assets/
+            echo "✅ Logo copied"
+          fi
+          echo "✅ Directories ready."
+
+      - name: "💾 Cache Playwright Browsers"
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-v1
+
+      - name: "⚙️ Install Python Packages & Playwright Engine"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -q
+          # محرك الرندرة الإجرائي (Three.js + HTML5 Canvas)
+          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "✅ Browsers loaded from cache. Installing system deps only..."
+            playwright install-deps chromium
+          else
+            echo "📥 Fresh install: downloading browsers + system deps..."
+            playwright install --with-deps chromium
+          fi
+          echo "✅ Python packages and Procedural Render Engine installed."
+
+      - name: "🔐 Configure Google Cloud TTS"
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          if [ -z "$GCP_SA_KEY" ]; then
+            echo "⚠️ GCP_SA_KEY missing — Google TTS fallback won't work (ElevenLabs only)"
+          else
+            echo "$GCP_SA_KEY" > /tmp/gcp_sa.json
+            echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_sa.json" >> $GITHUB_ENV
+            echo "✅ Google Cloud configured."
+          fi
+
+      - name: "🚀 Run QEEMA Procedural Pipeline"
+        env:
+          GROQ_API_KEY:          ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_2:      ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3:      ${{ secrets.GEMINI_API_KEY_3 }}
+          COHERE_API_KEY:        ${{ secrets.COHERE_API_KEY }}
+          LEONARDO_API_KEY:      ${{ secrets.LEONARDO_API_KEY }}
+          ELEVENLABS_API_KEY:    ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_VOICE_ID:   ${{ vars.ELEVENLABS_VOICE_ID || 'UR972wNGq3zluze0LoIp' }}
+          SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:          ${{ secrets.SUPABASE_KEY }}
+          YOUTUBE_CLIENT_ID:     ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          DRY_RUN:               ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.episode_number }}" ]; then
+            ARGS="--episode ${{ github.event.inputs.episode_number }}"
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+
+          max_retries=3
+          attempt=1
+          success=false
+
+          until [ $attempt -gt $max_retries ]; do
+            echo "═══════════════════════════════════════"
+            echo "🚀 Attempt $attempt of $max_retries"
+            echo "═══════════════════════════════════════"
+            if python -u main.py $ARGS; then
+              echo "✅ Pipeline finished successfully!"
+              success=true
+              break
+            else
+              echo "⚠️ Attempt $attempt failed. Retrying in 90 seconds..."
+              sleep 90
+              attempt=$((attempt + 1))
+            fi
+          done
+
+          if [ "$success" = false ]; then
+            echo "❌ Pipeline failed after $max_retries attempts."
+            exit 1
+          fi
+
+      - name: "📤 Upload Artifacts (Videos, Scripts & Logs)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qeema-episode-${{ github.run_number }}
+          path: |
+            output/videos/*.mp4
+            assets/thumbnails/*.jpg
+            temp/episodes/*.json
+            temp/html_templates/*.html
+            logs/*.log
+          retention-days: 21
+          if-no-files-found: warn
