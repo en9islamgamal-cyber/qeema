@@ -1,4 +1,3 @@
-```python
 """
 models.py — VALUE / QEEMA v8.0 (Enterprise Data & NLP Engine)
 ================================================================
@@ -156,6 +155,3 @@ class PipelineState(BaseModel):
     episode_id: Optional[str] = None
     episode_number: int
     status: EpisodeStatus = EpisodeStatus.PENDING
-
-
-```
