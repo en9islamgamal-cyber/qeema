@@ -75,15 +75,27 @@ jobs:
           fi
           echo "✅ Directories ready."
 
+      - name: "💾 Cache Playwright Browsers"
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-v1
+
       - name: "⚙️ Install Python Packages & Playwright Engine"
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt -q
-          # تثبيت محرك الرندرة السينمائي
+          # تثبيت Playwright (مكتبة Python)
           pip install playwright
-          playwright install chromium
-          # السطر الأهم: تثبيت مكتبات النظام الداعمة للمتصفح المخفي
-          sudo playwright install-deps chromium
+          # تثبيت محرك الرندرة + مكتبات النظام في خطوة واحدة (الطريقة الرسمية)
+          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "✅ Browsers loaded from cache. Installing system deps only..."
+            playwright install-deps chromium
+          else
+            echo "📥 Fresh install: downloading browsers + system deps..."
+            playwright install --with-deps chromium
+          fi
           echo "✅ Python packages and Web Render Engine installed."
 
       - name: "🔐 Configure Google Cloud TTS"
