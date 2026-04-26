@@ -1,7 +1,6 @@
 # VALUE / QEEMA Pipeline — Python Dependencies
 # ================================================
-# [v3.1] لا تغيير — openai package يكفي لـ Groq (OpenAI-compatible endpoint)
-# Groq لا يحتاج package منفصل — يستخدم openai مع base_url مختلف
+# v9.1: أُضيف Playwright لمحرك الرندرة السينمائي
 
 # LLM Providers
 google-genai>=1.17.0
@@ -34,6 +33,9 @@ numpy>=1.26.0
 
 # Media & Image Processing
 Pillow>=10.3.0
+
+# ✅ v9.1: محرك الرندرة السينمائي (HTML5 Canvas + CSS animations)
+playwright>=1.45.0
 
 # Arabic Text Rendering
 arabic-reshaper>=3.0.0
