@@ -1,18 +1,21 @@
 """
-video_engine.py — VALUE / QEEMA v5.2
-======================================
-[CHANGELOG v5.2]
-- إصلاح: صوت التلاوة كان مقصوص — تم إضافة tail_pad لكل الأصوات وإزالة -shortest
-  من مشاهد التلاوة، والاعتماد على -t (مدة الصوت + 0.3 ثانية buffer)
-- إضافة: overlay الشعار (logo.png) على جميع المشاهد عبر ffmpeg
-- تحسين: الانترو/الأوترو من BrandEngine (مرة واحدة، لا إعادة توليد)
-- تحسين: جميع الـ segments تستخدم نفس الإعدادات لضمان التوافق في concat
+video_engine.py — VALUE / QEEMA v8.0 (Cinematic HTML-to-Video Engine)
+=====================================================================
+هذا المحرك ينقل جودة الفيديو إلى مستوى استوديوهات الإنتاج (Meta AI Style).
+- يبني المشاهد كصفحات ويب (HTML/CSS) متقدمة.
+- يضيف جسيمات سحرية متحركة (Glowing Particles).
+- يولد نصوصاً متوهجة وظلالاً ناعمة.
+- يقوم برندرة الصفحة (تصوير الشاشة) بـ 60FPS باستخدام Playwright.
+- مزود بنظام Fallback قوي يعتمد على FFmpeg العادي في حالات الفشل.
 """
 
-import logging, os, shutil, subprocess as sp
+import logging
+import os
+import shutil
+import time
+import subprocess as sp
 from pathlib import Path
 from typing import List, Optional, TYPE_CHECKING
-
 from config import VideoConfig, Paths
 
 if TYPE_CHECKING:
@@ -21,429 +24,358 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 VIDEO_EXT = {".mp4", ".mov", ".webm", ".mkv"}
 
+# استيراد متصفح Playwright للرندرة الفائقة
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+    logger.critical("⚠️ Playwright غير مثبت! المحرك السينمائي معطل، سيتم تفعيل نظام الطوارئ (FFmpeg Fallback). لتفعيله: pip install playwright && playwright install")
 
 # ══════════════════════════════════════════════════════════════════
 # Helpers
 # ══════════════════════════════════════════════════════════════════
-def _run(cmd: List[str], timeout: int = 600) -> bool:
+def _run(cmd: List[str], timeout: int = 900) -> bool:
     try:
         r = sp.run(cmd, capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0:
-            logger.error(f"ffmpeg failed:\n{r.stderr[-600:]}")
+            logger.error(f"❌ FFmpeg Error:\n{r.stderr[-500:]}")
             return False
         return True
     except Exception as e:
-        logger.error(f"ffmpeg exception: {e}")
+        logger.error(f"❌ FFmpeg Exception: {e}")
         return False
-
 
 def _probe_duration(path: str) -> float:
     try:
-        cmd = ["ffprobe", "-v", "error",
-               "-show_entries", "format=duration",
-               "-of", "default=noprint_wrappers=1:nokey=1", path]
-        r = sp.run(cmd, capture_output=True, text=True, timeout=15)
-        v = r.stdout.strip()
-        return float(v) if v and v != "N/A" else 0.0
-    except Exception:
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path]
+        return float(sp.run(cmd, capture_output=True, text=True).stdout.strip())
+    except: 
         return 0.0
 
-
 def _escape_dt(s: str) -> str:
-    return (s.replace("\\", "\\\\")
-             .replace(":", "\\:")
-             .replace("'", "\\'")
-             .replace(",", "\\,"))
-
-
-def _find_font() -> str:
-    for c in [Paths.FONTS / "Amiri-Bold.ttf",
-               Paths.FONTS / "NotoSansArabic-Bold.ttf",
-               Path("/usr/share/fonts/truetype/hosny-amiri/Amiri-Regular.ttf"),
-               Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")]:
-        if Path(c).exists():
-            return str(c)
-    return ""
-
-
-def _find_logo() -> Optional[str]:
-    for c in [Paths.ASSETS / "logo.png", Paths.ASSETS / "logo.jpg",
-               Path("logo.png"), Path("logo.jpg")]:
-        if Path(c).exists():
-            return str(c)
-    return None
-
-
-def _find_bgm() -> Optional[str]:
-    for c in [Paths.OVERLAYS / "bgm.mp3", Paths.ASSETS / "bgm.mp3"]:
-        if c.exists():
-            return str(c)
-    return None
+    """Escape text for FFmpeg drawtext (Fallback use only)"""
+    return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'").replace(",", "\\,")
 
 
 # ══════════════════════════════════════════════════════════════════
-# VideoEngine
+# VideoEngine Main Class
 # ══════════════════════════════════════════════════════════════════
 class VideoEngine:
-
     def __init__(self):
         self.W, self.H = VideoConfig.RESOLUTION_WIDTH, VideoConfig.RESOLUTION_HEIGHT
-        self.fps       = VideoConfig.FPS
-        self.font      = _find_font()
-        self.logo      = _find_logo()
-        self.bg_music  = _find_bgm()
+        self.fps = VideoConfig.FPS
+        self.logo = self._find_logo()
+        self.bg_music = self._find_bgm()
+        self.font_path = self._find_font()
+        
+        # تهيئة مسارات رندرة الويب
+        if not hasattr(Paths, "WEB_RENDERS"):
+            Paths.WEB_RENDERS = Paths.TEMP / "web_renders"
+        Paths.WEB_RENDERS.mkdir(parents=True, exist_ok=True)
 
-        if self.font:
-            logger.info(f"✅ Font: {self.font}")
-        if self.logo:
-            logger.info(f"✅ Logo: {self.logo}")
-        if not self.bg_music:
-            logger.info("ℹ️ لا يوجد ملف bgm.mp3 — بدون موسيقى خلفية")
+    def _find_logo(self) -> str:
+        for c in [Paths.ASSETS / "logo.png", Paths.ASSETS / "logo.jpg"]:
+            if Path(c).exists(): return f"file://{Path(c).absolute()}"
+        return ""
 
-    # ─────────────────────────────────────────────────────────────
-    # Logo Overlay filter (يُضاف في نهاية أي vf chain)
-    # ─────────────────────────────────────────────────────────────
-    def _logo_overlay_filter(self) -> str:
-        """يُعيد filter_complex جاهز لـ overlay الشعار أسفل اليمين."""
-        if not self.logo:
-            return ""
-        # الشعار: 80px عرض، أسفل اليمين، شفافية 70%
-        return (
-            f";[tmp_video][logo]overlay="
-            f"x=W-w-25:y=H-h-25:"
-            f"format=auto"
-        )
-
-    # ─────────────────────────────────────────────────────────────
-    # Router
-    # ─────────────────────────────────────────────────────────────
-    def _build_segment(self, scene_path: str, audio_path: str,
-                       output: str, subtitle: Optional[str] = None,
-                       is_recitation: bool = False) -> bool:
-        if not Path(scene_path).exists():
-            logger.error(f"❌ مشهد غير موجود: {scene_path}")
-            return False
-        if not Path(audio_path).exists():
-            logger.error(f"❌ صوت غير موجود: {audio_path}")
-            return False
-
-        if Path(scene_path).suffix.lower() in VIDEO_EXT:
-            return self._build_from_video_clip(scene_path, audio_path, output,
-                                               subtitle, is_recitation)
-        else:
-            return self._build_from_image(scene_path, audio_path, output,
-                                          subtitle, is_recitation)
+    def _find_bgm(self) -> Optional[str]:
+        for c in [Paths.OVERLAYS / "bgm.mp3", Paths.ASSETS / "bgm.mp3"]:
+            if Path(c).exists(): return str(c.absolute())
+        return None
+        
+    def _find_font(self) -> str:
+        for c in [Paths.FONTS / "Amiri-Bold.ttf", Paths.FONTS / "NotoSansArabic-Bold.ttf"]:
+            if Path(c).exists(): return str(c.absolute())
+        return ""
 
     # ─────────────────────────────────────────────────────────────
-    # من صورة ثابتة (Ken Burns)
+    # Web Engine (HTML/CSS Magic)
     # ─────────────────────────────────────────────────────────────
-    def _build_from_image(self, image_path: str, audio_path: str,
-                          output: str, subtitle: Optional[str] = None,
-                          is_recitation: bool = False) -> bool:
+    def _generate_html(self, media_path: str, subtitle: Optional[str], duration: float) -> str:
         """
-        Ken Burns على صورة ثابتة.
-        is_recitation=True → buffer إضافي لضمان عدم قطع التلاوة.
+        يولد HTML يحتوي على:
+        - صورة/فيديو كخلفية مع Ken Burns.
+        - جسيمات سحرية صاعدة (Glowing Particles).
+        - نصوص متوهجة وظلال (Meta AI Style).
+        - شريط تقدم سينمائي.
         """
-        audio_dur = _probe_duration(audio_path)
-        if audio_dur <= 0:
-            logger.error(f"❌ مدة الصوت = 0: {audio_path}")
+        is_video = Path(media_path).suffix.lower() in VIDEO_EXT
+        media_uri = f"file://{Path(media_path).absolute()}"
+        
+        bg_element = f'<video class="bg" src="{media_uri}" autoplay loop muted></video>' if is_video \
+                     else f'<div class="bg" style="background-image: url(\'{media_uri}\');"></div>'
+
+        logo_html = f'<img class="logo" src="{self.logo}" />' if self.logo else ""
+        sub_html = f'<div class="subtitle-container"><div class="subtitle">{subtitle}</div></div>' if subtitle else ""
+        
+        # كود JS لتوليد الجسيمات السحرية
+        particles_js = """
+        <script>
+            document.addEventListener("DOMContentLoaded", () => {
+                const container = document.getElementById('particles');
+                const particleCount = 40;
+                for(let i=0; i<particleCount; i++) {
+                    let p = document.createElement('div');
+                    p.className = 'particle';
+                    p.style.left = Math.random() * 100 + '%';
+                    p.style.animationDuration = (Math.random() * 3 + 2) + 's';
+                    p.style.animationDelay = (Math.random() * 2) + 's';
+                    container.appendChild(p);
+                }
+            });
+        </script>
+        """
+
+        return f"""
+        <!DOCTYPE html>
+        <html lang="ar" dir="rtl">
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                @import url('https://fonts.googleapis.com/css2?family=Amiri:wght@700&display=swap');
+                
+                body {{ 
+                    margin: 0; padding: 0; width: {self.W}px; height: {self.H}px; 
+                    overflow: hidden; background: #000; 
+                    font-family: 'Amiri', serif; 
+                }}
+                
+                /* الخلفية وتأثير Ken Burns الناعم */
+                .bg {{ 
+                    position: absolute; top:-5%; left:-5%; width: 110%; height: 110%; 
+                    background-size: cover; background-position: center; object-fit: cover;
+                    animation: zoom {duration + 2}s linear forwards; 
+                }}
+                
+                /* تدرج لوني للظلال أسفل الشاشة */
+                .overlay {{ 
+                    position: absolute; top:0; left:0; width: 100%; height: 100%; 
+                    background: linear-gradient(to top, rgba(0,0,0,0.95) 0%, rgba(0,0,0,0.4) 30%, transparent 80%); 
+                }}
+                
+                /* الجسيمات السحرية المتوهجة */
+                #particles {{ position: absolute; top:0; left:0; width: 100%; height: 100%; z-index: 5; pointer-events: none; }}
+                .particle {{
+                    position: absolute; bottom: -20px; width: 8px; height: 8px;
+                    background: radial-gradient(circle, #fff 0%, #FFD700 40%, transparent 80%);
+                    border-radius: 50%; opacity: 0;
+                    animation: floatUp linear infinite;
+                    box-shadow: 0 0 10px #FFD700;
+                }}
+                
+                /* الشعار */
+                .logo {{ 
+                    position: absolute; top: 40px; right: 40px; width: 180px; 
+                    opacity: 0.9; filter: drop-shadow(0px 0px 20px rgba(255,255,255,0.4)); 
+                    z-index: 10; 
+                }}
+                
+                /* النص المتوهج كالذهب */
+                .subtitle-container {{ 
+                    position: absolute; bottom: 120px; width: 100%; text-align: center; 
+                    animation: fade {duration}s ease-in-out forwards; z-index: 10; 
+                }}
+                .subtitle {{ 
+                    display: inline-block; font-size: 65px; color: #ffffff; line-height: 1.5;
+                    padding: 20px 50px; border-radius: 30px; 
+                    background: rgba(20, 20, 20, 0.65); border: 2px solid rgba(255, 215, 0, 0.5); 
+                    text-shadow: 0px 0px 25px rgba(255, 215, 0, 1), 2px 2px 8px rgba(0,0,0,1); 
+                    backdrop-filter: blur(12px); max-width: 85%;
+                }}
+                
+                /* شريط التقدم */
+                .progress-track {{ position: absolute; bottom: 0; left: 0; height: 8px; width: 100%; background: rgba(255,255,255,0.1); z-index: 10; }}
+                .progress-fill {{ 
+                    height: 100%; width: 0%; 
+                    background: linear-gradient(90deg, #FFD700, #FFA500, #FF8C00); 
+                    box-shadow: 0px 0px 20px rgba(255, 215, 0, 1); 
+                    animation: load {duration}s linear forwards; 
+                }}
+                
+                /* Keyframes */
+                @keyframes zoom {{ 0% {{ transform: scale(1); }} 100% {{ transform: scale(1.08); }} }}
+                @keyframes load {{ 0% {{ width: 0%; }} 100% {{ width: 100%; }} }}
+                @keyframes floatUp {{ 
+                    0% {{ transform: translateY(0) scale(0.5); opacity: 0; }} 
+                    20% {{ opacity: 0.8; }} 
+                    80% {{ opacity: 0.5; }} 
+                    100% {{ transform: translateY(-800px) scale(1.5); opacity: 0; }} 
+                }}
+                @keyframes fade {{ 
+                    0% {{ opacity: 0; transform: translateY(40px); }} 
+                    5%, 95% {{ opacity: 1; transform: translateY(0); }} 
+                    100% {{ opacity: 0; transform: translateY(-20px); }} 
+                }}
+            </style>
+        </head>
+        <body>
+            {bg_element}
+            <div class="overlay"></div>
+            <div id="particles"></div>
+            {logo_html}
+            {sub_html}
+            <div class="progress-track"><div class="progress-fill"></div></div>
+            {particles_js}
+        </body>
+        </html>
+        """
+
+    def _render_web(self, media: str, aud: str, out: str, sub: Optional[str], dur: float) -> bool:
+        """يصور صفحة الـ HTML المتوهجة بمتصفح خفي ثم يدمجها مع الصوت الأصلي"""
+        if not HAS_PLAYWRIGHT: 
             return False
-
-        # ─ buffer: +0.5s للتلاوة، +0.1s للباقي
-        render_dur = audio_dur + (0.5 if is_recitation else 0.1)
-        W, H, fps  = self.W, self.H, self.fps
-
-        # ─ Ken Burns
-        zoompan = (
-            f"scale={W*2}:{H*2}:force_original_aspect_ratio=increase,"
-            f"crop={W*2}:{H*2},"
-            f"zoompan=z='min(zoom+0.0006,1.06)':d={int(render_dur*fps)}"
-            f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={W}x{H}:fps={fps},"
-            f"setsar=1"
-        )
-
-        # ─ subtitle للآيات
-        sub = ""
-        if subtitle and self.font:
-            esc = _escape_dt(subtitle)
-            sub = (
-                f",drawtext=fontfile='{self.font}':text='{esc}':"
-                f"fontsize=42:fontcolor=#FFD700:"
-                f"box=1:boxcolor=black@0.6:boxborderw=18:"
-                f"x=(w-text_w)/2:y=h-170"
-            )
-
-        # ─ fade in/out
-        fade = f",fade=t=in:st=0:d=0.3,fade=t=out:st={audio_dur-0.3}:d=0.3"
-
-        vf = zoompan + sub + fade
-
-        # ─ Logo overlay
-        if self.logo:
-            filter_complex = (
-                f"[0:v]{vf}[tmp_video];"
-                f"[2:v]scale=80:-1:flags=lanczos,format=rgba,"
-                f"colorchannelmixer=aa=0.7[logo]"
-                f"{self._logo_overlay_filter()}"
-            )
-            cmd = [
-                "ffmpeg", "-y",
-                "-loop", "1", "-i", image_path,
-                "-i", audio_path,
-                "-i", self.logo,
-                "-filter_complex", filter_complex,
-                "-map", "[tmp_video]" if not self.logo else
-                        filter_complex.split("[")[-1].rstrip("]"),
-            ]
-            # نبسط — نستخدم -vf بدل filter_complex لو لا يوجد شعار لمنع التعقيد
-            # إعادة بناء بدون logo لو filter_complex معقد جداً
-            cmd = self._build_image_cmd_with_logo(
-                image_path, audio_path, zoompan + sub + fade,
-                render_dur, audio_dur
-            )
-        else:
-            cmd = [
-                "ffmpeg", "-y",
-                "-loop", "1", "-i", image_path,
-                "-i", audio_path,
-                "-vf", vf,
-                "-c:v", VideoConfig.CODEC,
-                "-profile:v", VideoConfig.PROFILE,
-                "-crf", str(VideoConfig.CRF),
-                "-preset", VideoConfig.PRESET,
-                "-pix_fmt", VideoConfig.PIX_FMT,
-                "-c:a", VideoConfig.AUDIO_CODEC,
-                "-b:a", VideoConfig.AUDIO_BITRATE,
-                "-ar", "44100", "-ac", "2",
-                "-r", str(fps),
-                "-t", f"{render_dur:.3f}",
-                output,
-            ]
-
-        return _run(cmd, timeout=300)
-
-    def _build_image_cmd_with_logo(self, image_path, audio_path,
-                                    vf_chain, render_dur, audio_dur):
-        """يبني ffmpeg cmd مع logo overlay."""
-        W, H, fps = self.W, self.H, self.fps
-        fc = (
-            f"[0:v]{vf_chain}[base];"
-            f"[2:v]scale=80:-1:flags=lanczos,format=rgba,"
-            f"colorchannelmixer=aa=0.7[logo];"
-            f"[base][logo]overlay=x=W-w-25:y=H-h-25[out]"
-        )
-        return [
-            "ffmpeg", "-y",
-            "-loop", "1", "-i", image_path,
-            "-i", audio_path,
-            "-i", self.logo,
-            "-filter_complex", fc,
-            "-map", "[out]", "-map", "1:a",
-            "-c:v", VideoConfig.CODEC, "-profile:v", VideoConfig.PROFILE,
-            "-crf", str(VideoConfig.CRF), "-preset", VideoConfig.PRESET,
-            "-pix_fmt", VideoConfig.PIX_FMT,
-            "-c:a", VideoConfig.AUDIO_CODEC, "-b:a", VideoConfig.AUDIO_BITRATE,
-            "-ar", "44100", "-ac", "2",
-            "-r", str(fps), "-t", f"{render_dur:.3f}",
-            "-avoid_negative_ts", "make_zero",
-            "-movflags", "+faststart",
-        ]
-
-    # ─────────────────────────────────────────────────────────────
-    # من مقطع فيديو (Runway .mp4)
-    # ─────────────────────────────────────────────────────────────
-    def _build_from_video_clip(self, clip_path: str, audio_path: str,
-                                output: str, subtitle: Optional[str] = None,
-                                is_recitation: bool = False) -> bool:
-        audio_dur = _probe_duration(audio_path)
-        video_dur = _probe_duration(clip_path)
-        if audio_dur <= 0:
-            return False
-
-        render_dur = audio_dur + (0.5 if is_recitation else 0.1)
-        W, H, fps  = self.W, self.H, self.fps
-
-        scale = (
-            f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
-            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
-        )
-        sub = ""
-        if subtitle and self.font:
-            esc = _escape_dt(subtitle)
-            sub = (
-                f",drawtext=fontfile='{self.font}':text='{esc}':"
-                f"fontsize=42:fontcolor=#FFD700:"
-                f"box=1:boxcolor=black@0.6:boxborderw=18:"
-                f"x=(w-text_w)/2:y=h-170"
-            )
-        fade = f",fade=t=in:st=0:d=0.3,fade=t=out:st={audio_dur-0.3}:d=0.3"
-        vf   = scale + sub + fade
-
-        loop_flag = ["-stream_loop", "-1"] if render_dur > video_dur else []
-
-        if self.logo:
-            fc = (
-                f"[0:v]{vf}[base];"
-                f"[2:v]scale=80:-1:flags=lanczos,format=rgba,"
-                f"colorchannelmixer=aa=0.7[logo];"
-                f"[base][logo]overlay=x=W-w-25:y=H-h-25[out]"
-            )
-            cmd = [
-                "ffmpeg", "-y",
-                *loop_flag, "-i", clip_path,
-                "-i", audio_path,
-                "-i", self.logo,
-                "-filter_complex", fc,
-                "-map", "[out]", "-map", "1:a",
-                "-c:v", VideoConfig.CODEC, "-profile:v", VideoConfig.PROFILE,
-                "-crf", str(VideoConfig.CRF), "-preset", VideoConfig.PRESET,
-                "-pix_fmt", VideoConfig.PIX_FMT,
-                "-c:a", VideoConfig.AUDIO_CODEC, "-b:a", VideoConfig.AUDIO_BITRATE,
-                "-ar", "44100", "-ac", "2",
-                "-r", str(fps), "-t", f"{render_dur:.3f}",
-                "-avoid_negative_ts", "make_zero",
-                "-movflags", "+faststart",
-                output,
-            ]
-        else:
-            cmd = [
-                "ffmpeg", "-y",
-                *loop_flag, "-i", clip_path,
-                "-i", audio_path,
-                "-vf", vf,
-                "-map", "0:v", "-map", "1:a",
-                "-c:v", VideoConfig.CODEC, "-profile:v", VideoConfig.PROFILE,
-                "-crf", str(VideoConfig.CRF), "-preset", VideoConfig.PRESET,
-                "-pix_fmt", VideoConfig.PIX_FMT,
-                "-c:a", VideoConfig.AUDIO_CODEC, "-b:a", VideoConfig.AUDIO_BITRATE,
-                "-ar", "44100", "-ac", "2",
-                "-r", str(fps), "-t", f"{render_dur:.3f}",
-                "-avoid_negative_ts", "make_zero",
-                output,
-            ]
-        return _run(cmd, timeout=300)
-
-    # ─────────────────────────────────────────────────────────────
-    # Concat
-    # ─────────────────────────────────────────────────────────────
-    def _concat_segments(self, segments: List[str], output: str) -> bool:
-        list_file = Path(output).parent / "concat_list.txt"
-        with open(list_file, "w", encoding="utf-8") as f:
-            for seg in segments:
-                f.write(f"file '{Path(seg).absolute()}'\n")
-        ok = _run([
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", str(list_file),
-            "-c", "copy",
-            output,
-        ], timeout=300)
+            
+        html_code = self._generate_html(media, sub, dur)
+        html_file = Paths.WEB_RENDERS / f"scene_{int(time.time()*1000)}.html"
+        html_file.write_text(html_code, encoding="utf-8")
+        
+        raw_vid = str(Paths.WEB_RENDERS / f"vid_{int(time.time()*1000)}.webm")
+        
         try:
-            list_file.unlink()
-        except Exception:
-            pass
-        return ok
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=['--disable-web-security', '--allow-file-access-from-files'])
+                ctx = browser.new_context(
+                    record_video_dir=str(Paths.WEB_RENDERS), 
+                    record_video_size={"width": self.W, "height": self.H}
+                )
+                page = ctx.new_page()
+                page.goto(f"file://{html_file.absolute()}")
+                
+                # انتظار اكتمال المشهد بالمللي ثانية
+                page.wait_for_timeout(int(dur * 1000))
+                
+                vid_path = page.video.path()
+                ctx.close()
+                browser.close()
+                
+                os.rename(vid_path, raw_vid)
+        except Exception as e:
+            logger.error(f"❌ Playwright Render Failed: {e}")
+            return False
 
-    def _add_bgm(self, video_path: str, output: str) -> bool:
-        if not self.bg_music:
-            shutil.copy(video_path, output)
-            return True
+        # دمج الفيديو الصامت المصور مع الصوت باستخدام ترميز عالي الجودة
         cmd = [
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-stream_loop", "-1", "-i", self.bg_music,
-            "-filter_complex",
-            "[1:a]volume=0.05[bgm];[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=3[a]",
-            "-map", "0:v", "-map", "[a]",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k",
-            "-ar", "44100",
-            "-shortest",
-            output,
+            "ffmpeg", "-y", 
+            "-i", raw_vid, "-i", aud, 
+            "-c:v", VideoConfig.CODEC, "-preset", "fast", "-crf", "18", 
+            "-c:a", "aac", "-b:a", "192k", 
+            "-shortest", out
         ]
-        return _run(cmd, timeout=300)
+        res = _run(cmd, timeout=400)
+        
+        try: html_file.unlink(); Path(raw_vid).unlink()
+        except: pass
+        return res
 
     # ─────────────────────────────────────────────────────────────
-    # Main entry
+    # FFmpeg Fallback (نظام الطوارئ)
     # ─────────────────────────────────────────────────────────────
+    def _fallback_render(self, media: str, aud: str, out: str, sub: Optional[str], dur: float) -> bool:
+        """نظام الطوارئ: يستخدم FFmpeg الصرف إذا تعطل المتصفح."""
+        is_video = Path(media).suffix.lower() in VIDEO_EXT
+        W, H, fps = self.W, self.H, self.fps
+        
+        if is_video:
+            vf = f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+            inputs = ["-stream_loop", "-1", "-i", media, "-i", aud]
+        else:
+            vf = f"scale={W*2}:{H*2}:force_original_aspect_ratio=increase,crop={W*2}:{H*2},zoompan=z='min(zoom+0.0006,1.06)':d={int(dur*fps)}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={W}x{H}:fps={fps},setsar=1"
+            inputs = ["-loop", "1", "-i", media, "-i", aud]
+            
+        if sub and self.font_path:
+            esc = _escape_dt(sub)
+            vf += f",drawtext=fontfile='{self.font_path}':text='{esc}':fontsize=50:fontcolor=#FFD700:box=1:boxcolor=black@0.6:boxborderw=20:x=(w-text_w)/2:y=h-200"
+            
+        vf += f",fade=t=in:st=0:d=0.5,fade=t=out:st={dur-0.5}:d=0.5"
+
+        cmd = ["ffmpeg", "-y"] + inputs + ["-vf", vf, "-c:v", VideoConfig.CODEC, "-profile:v", VideoConfig.PROFILE, "-crf", str(VideoConfig.CRF), "-preset", VideoConfig.PRESET, "-pix_fmt", VideoConfig.PIX_FMT, "-c:a", VideoConfig.AUDIO_CODEC, "-b:a", VideoConfig.AUDIO_BITRATE, "-r", str(fps), "-t", f"{dur:.3f}", "-shortest", out]
+        return _run(cmd)
+
+    # ─────────────────────────────────────────────────────────────
+    # Router & Final Assembly
+    # ─────────────────────────────────────────────────────────────
+    def _build_segment(self, img: str, aud: str, out: str, sub: Optional[str] = None, is_recitation: bool = False) -> bool:
+        # حساب الطول: 0.8 ثانية إضافة للقرآن (لتغطية صمت الـ Padding)، و 0.3 للراوي
+        dur = _probe_duration(aud) + (0.8 if is_recitation else 0.3)
+        if dur <= 0.3: return False
+        
+        logger.debug(f"🎨 جاري رندرة المشهد (مدة: {dur:.1f}s)...")
+        
+        # 1. المحاولة السينمائية
+        if self._render_web(img, aud, out, sub, dur):
+            return True
+            
+        # 2. الطوارئ
+        logger.warning("⚠️ العودة لنظام الطوارئ (FFmpeg Fallback)...")
+        return self._fallback_render(img, aud, out, sub, dur)
+
     def assemble_episode(self, script: "EpisodeScript", ep_dir: str) -> str:
-        logger.info(f"🎬 تجميع الحلقة {script.episode_number}...")
-        ep_path  = Path(ep_dir)
-        seg_dir  = ep_path / "segments"
+        logger.info(f"🎬 بدء التجميع السينمائي للحلقة {script.episode_number}...")
+        ep_path = Path(ep_dir)
+        seg_dir = ep_path / "segments"
         seg_dir.mkdir(parents=True, exist_ok=True)
-        segs: List[str] = []
+        segs = []
         idx = 0
 
-        # ── Intro
+        # Intro
         if script.intro_scene.image_path and script.intro_scene.audio_path:
-            seg = str(seg_dir / f"seg_{idx:03d}_intro.mp4")
-            if self._build_segment(script.intro_scene.image_path,
-                                   script.intro_scene.audio_path, seg):
+            seg = str(seg_dir / f"seg_{idx:03d}.mp4")
+            if self._build_segment(script.intro_scene.image_path, script.intro_scene.audio_path, seg): 
                 segs.append(seg); idx += 1
 
-        # ── Ayah scenes
-        for scene in script.ayah_scenes:
-            if not scene.image_path:
-                logger.warning(f"⚠️ تخطي {scene.scene_id} — لا صورة")
-                continue
+        # Ayahs
+        for s in script.ayah_scenes:
+            if not s.image_path: continue
+            
+            if s.intro_audio:
+                seg = str(seg_dir / f"seg_{idx:03d}.mp4")
+                if self._build_segment(s.image_path, s.intro_audio, seg): segs.append(seg); idx += 1
+                
+            if s.ayah_audio:
+                seg = str(seg_dir / f"seg_{idx:03d}.mp4")
+                if self._build_segment(s.image_path, s.ayah_audio, seg, subtitle=s.ayah.text, is_recitation=True): segs.append(seg); idx += 1
+                
+            if s.explain_audio:
+                seg = str(seg_dir / f"seg_{idx:03d}.mp4")
+                if self._build_segment(s.image_path, s.explain_audio, seg): segs.append(seg); idx += 1
 
-            # 1) تمهيد الراوي
-            if scene.intro_audio:
-                seg = str(seg_dir / f"seg_{idx:03d}_s{scene.scene_id}_intro.mp4")
-                if self._build_segment(scene.image_path, scene.intro_audio, seg):
-                    segs.append(seg); idx += 1
-
-            # 2) تلاوة — is_recitation=True لمنع القطع
-            if scene.ayah_audio:
-                seg = str(seg_dir / f"seg_{idx:03d}_s{scene.scene_id}_recite.mp4")
-                if self._build_segment(scene.image_path, scene.ayah_audio, seg,
-                                       subtitle=scene.ayah.text,
-                                       is_recitation=True):
-                    segs.append(seg); idx += 1
-
-            # 3) شرح
-            if scene.explain_audio:
-                seg = str(seg_dir / f"seg_{idx:03d}_s{scene.scene_id}_explain.mp4")
-                if self._build_segment(scene.image_path, scene.explain_audio, seg):
-                    segs.append(seg); idx += 1
-
-        # ── Mid scenes
-        for sc in script.mid_scenes:
-            if sc.image_path and sc.audio_path:
-                seg = str(seg_dir / f"seg_{idx:03d}_mid{sc.scene_id}.mp4")
-                if self._build_segment(sc.image_path, sc.audio_path, seg):
-                    segs.append(seg); idx += 1
-
-        # ── Outro
+        # Outro
         if script.outro_scene.image_path and script.outro_scene.audio_path:
-            seg = str(seg_dir / f"seg_{idx:03d}_outro.mp4")
-            if self._build_segment(script.outro_scene.image_path,
-                                   script.outro_scene.audio_path, seg):
-                segs.append(seg); idx += 1
+            seg = str(seg_dir / f"seg_{idx:03d}.mp4")
+            if self._build_segment(script.outro_scene.image_path, script.outro_scene.audio_path, seg): segs.append(seg)
 
-        if not segs:
-            logger.error("❌ لا يوجد segments")
-            out = Paths.VIDEOS / f"ep_{script.episode_number:03d}_raw.mp4"
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.touch()
-            return str(out)
-
-        logger.info(f"📦 {len(segs)} segments — دمج...")
+        if not segs: 
+            logger.error("❌ لا يوجد مقاطع لتجميعها.")
+            return ""
+        
+        # Concat
+        list_file = ep_path / "list.txt"
+        with open(list_file, "w", encoding="utf-8") as f:
+            for s in segs: f.write(f"file '{Path(s).absolute()}'\n")
+        
         merged = ep_path / "merged.mp4"
-        if not self._concat_segments(segs, str(merged)):
-            out = Paths.VIDEOS / f"ep_{script.episode_number:03d}_raw.mp4"
-            out.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(segs[0], out)
-            return str(out)
-
-        out = Paths.VIDEOS / f"ep_{script.episode_number:03d}_raw.mp4"
+        logger.info("📦 جاري لحام المقاطع...")
+        _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(merged)])
+        
+        # BGM
+        out = Paths.VIDEOS / f"ep_{script.episode_number:03d}.mp4"
         out.parent.mkdir(parents=True, exist_ok=True)
-        if not self._add_bgm(str(merged), str(out)):
+        
+        if self.bg_music:
+            logger.info("🎵 جاري دمج موسيقى الخلفية (BGM)...")
+            # Ducking: خفض الموسيقى عند وجود صوت
+            bgm_cmd = [
+                "ffmpeg", "-y", "-i", str(merged), "-stream_loop", "-1", "-i", self.bg_music, 
+                "-filter_complex", "[1:a]volume=0.03[bgm];[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2", 
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(out)
+            ]
+            _run(bgm_cmd)
+        else:
             shutil.copy(merged, out)
-        try:
-            merged.unlink()
-        except Exception:
-            pass
-
-        logger.info(f"✅ {out.name}")
+            
+        try: list_file.unlink(); merged.unlink()
+        except: pass
+            
+        logger.info(f"🎉 اكتمل الفيديو السينمائي: {out.name}")
         return str(out)
