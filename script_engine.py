@@ -155,15 +155,14 @@ class ScriptEngine:
         try:
             res = adapter.generate(prompt, system, model)
             
-            # التنظيف من علامات الماركداون التي تفسد الـ JSON
             res = res.replace("```json", "").replace("```", "").strip()
             
-            match = re.search(r'\{[\s\S]*\}', res) # [\s\S] أكثر استقراراً من DOTALL في بعض البيئات
+            match = re.search(r'\{[\s\S]*\}', res)
             if not match:
                 raise ValueError("لم يتم العثور على هيكل JSON في الرد.")
             
             cleaned = match.group()
-            cleaned = re.sub(r',\s*}', '}', cleaned) # مسح الفواصل الزائدة في نهاية الـ JSON
+            cleaned = re.sub(r',\s*}', '}', cleaned)
             cleaned = re.sub(r',\s*]', ']', cleaned)
             return json.loads(cleaned)
             
@@ -200,7 +199,7 @@ class ScriptEngine:
         )
         intro_data = self._call_ai(intro_prompt, EGYPTIAN_SYSTEM_PROMPT)
 
-        # 2) الآيات (مع حماية صارمة ضد تخطي أي آية)
+        # 2) الآيات
         ayah_scenes = []
         for i, a in enumerate(ayahs):
             logger.info(f"📖 معالجة الآية {a.number}...")
@@ -211,7 +210,6 @@ class ScriptEngine:
             )
             
             success = False
-            # محاولة توليد الآية بحد أقصى 3 مرات لضمان عدم تخطيها
             for attempt in range(3):
                 try:
                     a_data = self._call_ai(ayah_prompt, EGYPTIAN_SYSTEM_PROMPT)
@@ -231,11 +229,10 @@ class ScriptEngine:
                         keywords=keywords,
                     ))
                     success = True
-                    break # نجحت المحاولة، اخرج من لوب الإعادة
+                    break 
                 except Exception as e:
                     logger.error(f"❌ فشل توليد الآية {a.number} (محاولة {attempt + 1}/3): {e}")
             
-            # منع تحريف القرآن: إذا فشلت كل المحاولات للآية، يجب إيقاف الحلقة بالكامل
             if not success:
                 raise RuntimeError(f"⚠️ فشل نهائي في توليد الآية {a.number}. لا يمكن إنتاج حلقة ناقصة الآيات!")
 
@@ -246,7 +243,6 @@ class ScriptEngine:
         )
         outro_data = self._call_ai(outro_prompt, EGYPTIAN_SYSTEM_PROMPT)
 
-        # تحديد visual_scene للـ intro & outro
         intro_vscene = pick_visual_scene(intro_data.get('intro_text', '') + " " + info['name'])
         outro_vscene = VisualScene.SKY
 
@@ -285,13 +281,13 @@ class ScriptEngine:
         return script
 
     def _fetch_ayahs(self, info: dict) -> List[VerifiedAyah]:
-        """ترقية: جلب السورة بالكامل في طلب واحد لتفادي حظر الشبكة وتسريع النظام"""
+        """ترقية: جلب السورة بالكامل في طلب واحد"""
         surah_num = info["surah"]
         start_ayah = info["start"]
         end_ayah = info["end"]
         
-        # جلب الآيات في طلب واحد (لحد 300 آية، كافي جداً)
-        url = f"[https://api.qurancdn.com/api/qdc/verses/by_chapter/](https://api.qurancdn.com/api/qdc/verses/by_chapter/){surah_num}?words=false&fields=text_uthmani&per_page=300"
+        # الرابط النظيف (تأكدنا من عدم وجود أقواس Markdown)
+        url = f"https://api.qurancdn.com/api/qdc/verses/by_chapter/{surah_num}?words=false&fields=text_uthmani&per_page=300"
         
         try:
             response = requests.get(url, timeout=15)
@@ -300,16 +296,13 @@ class ScriptEngine:
             
             ayahs = []
             for verse in data.get("verses", []):
-                # استخراج رقم الآية من حقل verse_key (مثال: "114:5" -> 5)
                 ayah_num = int(verse["verse_key"].split(":")[1])
                 
-                # الفلترة المحلية (Locally) للآيات المطلوبة فقط
                 if start_ayah <= ayah_num <= end_ayah:
                     text = verse.get("text_uthmani", "")
                     if text:
                         ayahs.append(VerifiedAyah(surah=surah_num, number=ayah_num, text=text))
             
-            # التحقق من أن العدد المسترجع يطابق العدد المطلوب هندسياً
             expected_count = end_ayah - start_ayah + 1
             if len(ayahs) != expected_count:
                 logger.warning(f"⚠️ عدد الآيات المسترجعة ({len(ayahs)}) لا يطابق المطلوب ({expected_count}) في سورة {info['name']}.")
