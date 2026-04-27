@@ -9,7 +9,6 @@ config.py — VALUE / QEEMA v10.0 (Procedural Cinematic Edition)
 
 import os
 from pathlib import Path
-from typing import Dict, List  # <-- السطر ده اللي كان ناقص وبيعمل المشكلة
 
 # ════════════════════════════════════════════════════════════════
 # 1. مفاتيح API
@@ -32,7 +31,7 @@ class APIKeys:
     YOUTUBE_REFRESH_TOKEN = os.getenv("YOUTUBE_REFRESH_TOKEN", "")
 
     @classmethod
-    def validate(cls) -> List[str]:
+    def validate(cls) -> list[str]:
         missing = []
         if not cls.SUPABASE_URL: missing.append("SUPABASE_URL")
         if not cls.SUPABASE_KEY: missing.append("SUPABASE_KEY")
@@ -204,7 +203,7 @@ class ProceduralConfig:
 # ════════════════════════════════════════════════════════════════
 # 7. المنهج (جزء عم كاملاً)
 # ════════════════════════════════════════════════════════════════
-CURRICULUM: Dict[int, Dict[str, object]] = {
+CURRICULUM: dict[int, dict[str, object]] = {
     1:  {"surah": 1,   "name": "الفاتحة",  "start": 1, "end": 7},
     2:  {"surah": 114, "name": "الناس",    "start": 1, "end": 6},
     3:  {"surah": 113, "name": "الفلق",    "start": 1, "end": 5},
@@ -221,4 +220,36 @@ CURRICULUM: Dict[int, Dict[str, object]] = {
     14: {"surah": 102, "name": "التكاثر",  "start": 1, "end": 8},
     15: {"surah": 101, "name": "القارعة",  "start": 1, "end": 11},
     16: {"surah": 100, "name": "العاديات", "start": 1, "end": 11},
-    17: {"surah": 99,  "name": "الزلزلة",  "start": 1
+    17: {"surah": 99,  "name": "الزلزلة",  "start": 1, "end": 8},
+    18: {"surah": 98,  "name": "البينة",   "start": 1, "end": 8},
+    19: {"surah": 97,  "name": "القدر",    "start": 1, "end": 5},
+    20: {"surah": 96,  "name": "العلق",    "start": 1, "end": 19},
+    21: {"surah": 95,  "name": "التين",    "start": 1, "end": 8},
+    22: {"surah": 94,  "name": "الشرح",    "start": 1, "end": 8},
+    23: {"surah": 93,  "name": "الضحى",    "start": 1, "end": 11},
+    24: {"surah": 92,  "name": "الليل",    "start": 1, "end": 21},
+    25: {"surah": 91,  "name": "الشمس",    "start": 1, "end": 15},
+    26: {"surah": 90,  "name": "البلد",    "start": 1, "end": 20},
+    27: {"surah": 89,  "name": "الفجر",    "start": 1, "end": 30},
+    28: {"surah": 88,  "name": "الغاشية",  "start": 1, "end": 26},
+    29: {"surah": 87,  "name": "الأعلى",   "start": 1, "end": 19},
+    30: {"surah": 86,  "name": "الطارق",   "start": 1, "end": 17},
+    31: {"surah": 85,  "name": "البروج",   "start": 1, "end": 22},
+    32: {"surah": 84,  "name": "الانشقاق", "start": 1, "end": 25},
+    33: {"surah": 83,  "name": "المطففين", "start": 1, "end": 36},
+    34: {"surah": 82,  "name": "الانفطار", "start": 1, "end": 19},
+    35: {"surah": 81,  "name": "التكوير",  "start": 1, "end": 29},
+    36: {"surah": 80,  "name": "عبس",      "start": 1, "end": 42},
+    37: {"surah": 79,  "name": "النازعات", "start": 1, "end": 46},
+    38: {"surah": 78,  "name": "النبأ",    "start": 1, "end": 40},
+}
+
+
+# ════════════════════════════════════════════════════════════════
+# 8. قاعدة البيانات
+# ════════════════════════════════════════════════════════════════
+class DBConfig:
+    TABLE_EPISODES = "episodes"
+    TABLE_PIPELINE_STATE = "pipeline_state"
+    COLUMN_ID = "id"
+    COLUMN_STATUS = "status"
