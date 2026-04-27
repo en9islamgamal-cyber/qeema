@@ -4,7 +4,7 @@ script_engine.py — VALUE / QEEMA v10.0 (Egyptian Dialect + Semantic Visual Pic
 - لهجة مصرية خالصة (مش شامية، مش فصحى ثقيلة)
 - اختيار visual_scene تلقائي بناءً على محتوى الآية
 - استخراج keywords للـ word-level animations
-- Load balancer للـ APIs
+- Load balancer للـ APIs مع حماية كاملة من الأعطال
 """
 import json
 import logging
@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 # ════════════════════════════════════════════════════════════════
 # Semantic mapping: keywords → VisualScene
-# يستخدم لاختيار المشهد الإجرائي المناسب لكل آية
 # ════════════════════════════════════════════════════════════════
 SCENE_KEYWORDS: Dict[VisualScene, List[str]] = {
     VisualScene.GARDEN: [
@@ -85,25 +84,21 @@ def pick_visual_scene(text: str) -> VisualScene:
 
     if not scores:
         return VisualScene.ABSTRACT_WARM
-    # رجّع الأعلى score
     return max(scores, key=scores.get)
 
 
 def extract_keywords(text: str, max_words: int = 5) -> List[str]:
     """يستخرج كلمات مفتاحية من النص للـ animations."""
-    # كلمات stop words
     stop = {"في", "من", "إلى", "على", "عن", "مع", "هو", "هي",
             "هم", "أن", "إن", "كان", "يكون", "ذا", "ذلك", "هذا",
             "هذه", "كل", "ما", "لا", "ثم", "أو", "و", "ف", "ال"}
-    # امسح علامات الترقيم
     clean = re.sub(r'[،.؟!:؛"\'\(\)\[\]\{\}]', ' ', text)
     words = [w for w in clean.split() if w and w not in stop and len(w) > 2]
-    # خد أهم الكلمات
     return words[:max_words]
 
 
 # ════════════════════════════════════════════════════════════════
-# Egyptian System Prompt — لهجة مصرية أصيلة
+# Egyptian System Prompt
 # ════════════════════════════════════════════════════════════════
 EGYPTIAN_SYSTEM_PROMPT = """أنت "الجد أبو زياد"، حكواتي مصري الأصل، تحكي للأطفال المصريين (5-8 سنوات).
 
@@ -116,19 +111,19 @@ EGYPTIAN_SYSTEM_PROMPT = """أنت "الجد أبو زياد"، حكواتي م�
 [نمط السرد]:
 - جملة قصيرة (8-15 كلمة).
 - نبرة دافئة كأنك تحكي قصة قبل النوم.
-- استخدم التشبيهات البسيطة من حياة الطفل (مثل: "زي ما إنت بتحب ماما").
+- استخدم التشبيهات البسيطة من حياة الطفل.
 - تجنب كلمات العقاب (نار، عذاب، جحيم) — استبدلها بـ "اللي مش بيسمع كلام ربنا".
 - لا تكرر نفس الكلمة في فقرة واحدة.
 
 [النظام التربوي]:
 - اجعل الطفل يحس إن ربنا بيحبه جداً.
-- ربط كل آية بموقف يومي بسيط (المدرسة، الأهل، اللعب، الأكل).
+- ربط كل آية بموقف يومي بسيط.
 - الترغيب أهم من الترهيب.
 
 [التنسيق]:
 - أجب بـ JSON صالح فقط.
 - النصوص العربية بالعامية المصرية.
-- الـ visual_prompt قصير بالإنجليزية (للأرشفة فقط — لن يُستخدم).
+- الـ visual_prompt قصير بالإنجليزية (للأرشفة فقط).
 """
 
 
@@ -150,27 +145,33 @@ class ScriptEngine:
         logger.info(f"✅ Script Engine: {len(self.adapters)} adapters loaded")
 
     def _call_ai(self, prompt: str, system: str, retries: int = 0) -> dict:
-        """تبديل المفتاح فوراً عند كل طلب."""
+        """تبديل المفتاح فوراً عند كل طلب مع تنظيف متقدم للمخرجات."""
         if retries > len(self.adapters) * 2:
-            raise RuntimeError("فشلت كل محاولات LLM")
+            raise RuntimeError("فشلت كل محاولات LLM في تقديم مخرج JSON صالح.")
 
         adapter, model = self.adapters[self.ptr]
         self.ptr = (self.ptr + 1) % len(self.adapters)
 
         try:
             res = adapter.generate(prompt, system, model)
-            match = re.search(r'\{.*\}', res, re.DOTALL)
+            
+            # التنظيف من علامات الماركداون التي تفسد الـ JSON
+            res = res.replace("```json", "").replace("```", "").strip()
+            
+            match = re.search(r'\{[\s\S]*\}', res) # [\s\S] أكثر استقراراً من DOTALL في بعض البيئات
             if not match:
-                raise ValueError("لم يتم العثور على JSON")
+                raise ValueError("لم يتم العثور على هيكل JSON في الرد.")
+            
             cleaned = match.group()
-            cleaned = re.sub(r',\s*}', '}', cleaned)
+            cleaned = re.sub(r',\s*}', '}', cleaned) # مسح الفواصل الزائدة في نهاية الـ JSON
             cleaned = re.sub(r',\s*]', ']', cleaned)
             return json.loads(cleaned)
+            
         except Exception as e:
-            logger.warning(f"⚠️ {model} فشل: {e} | محاولة التالي...")
+            logger.warning(f"⚠️ {model} فشل: {e} | محاولة المفتاح التالي...")
             return self._call_ai(prompt, system, retries + 1)
 
-    def load_from_disk(self, ep_num: int) -> EpisodeScript:
+    def load_from_disk(self, ep_num: int) -> EpisodeScript | None:
         """تحميل سكريبت موجود من الـ disk."""
         save_path = Paths.SCRIPT_DIR / f"episode_{ep_num:03d}.json"
         if not save_path.exists():
@@ -179,10 +180,13 @@ class ScriptEngine:
             data = json.loads(save_path.read_text(encoding="utf-8"))
             return EpisodeScript.model_validate(data)
         except Exception as e:
-            logger.warning(f"⚠️ فشل تحميل السكريبت من القرص: {e}")
+            logger.warning(f"⚠️ فشل تحميل السكريبت من القرص للحلقة {ep_num}: {e}")
             return None
 
     def generate(self, ep_num: int) -> EpisodeScript:
+        if ep_num not in CURRICULUM:
+            raise ValueError(f"❌ بيانات الحلقة {ep_num} غير موجودة في CURRICULUM!")
+            
         info = CURRICULUM[ep_num]
         ayahs = self._fetch_ayahs(info)
 
@@ -196,39 +200,44 @@ class ScriptEngine:
         )
         intro_data = self._call_ai(intro_prompt, EGYPTIAN_SYSTEM_PROMPT)
 
-        # 2) الآيات
+        # 2) الآيات (مع حماية صارمة ضد تخطي أي آية)
         ayah_scenes = []
         for i, a in enumerate(ayahs):
-            logger.info(f"📖 الآية {a.number}...")
+            logger.info(f"📖 معالجة الآية {a.number}...")
             ayah_prompt = (
                 f"الآية: {a.text}\n"
                 "اشرحها بالعامية المصرية لطفل صغير. اربطها بموقف من حياته اليومية. "
                 "أجب بـ JSON بالحقول: intro_text (max 25 words), explain_text (max 35 words), visual_prompt."
             )
-            try:
-                a_data = self._call_ai(ayah_prompt, EGYPTIAN_SYSTEM_PROMPT)
+            
+            success = False
+            # محاولة توليد الآية بحد أقصى 3 مرات لضمان عدم تخطيها
+            for attempt in range(3):
+                try:
+                    a_data = self._call_ai(ayah_prompt, EGYPTIAN_SYSTEM_PROMPT)
 
-                # ✅ اختيار visual_scene تلقائي بناءً على محتوى الآية + الشرح
-                combined = f"{a.text} {a_data.get('explain_text', '')}"
-                vscene = pick_visual_scene(combined)
-                keywords = extract_keywords(a_data.get('explain_text', ''))
+                    combined = f"{a.text} {a_data.get('explain_text', '')}"
+                    vscene = pick_visual_scene(combined)
+                    keywords = extract_keywords(a_data.get('explain_text', ''))
 
-                ayah_scenes.append(AyahScene(
-                    scene_id=10 + i,
-                    ayah=a,
-                    intro_text=a_data.get('intro_text', ''),
-                    explain_text=a_data.get('explain_text', ''),
-                    visual_prompt=a_data.get('visual_prompt', ''),
-                    visual_scene=vscene,
-                    palette=MOOD_PALETTES.get("warm", "warm_sunset"),
-                    keywords=keywords,
-                ))
-            except Exception as e:
-                logger.error(f"❌ فشل توليد الآية {a.number}: {e}")
-                continue
-
-        if not ayah_scenes:
-            raise RuntimeError("لم يتم توليد أي مشهد آية صالح")
+                    ayah_scenes.append(AyahScene(
+                        scene_id=10 + i,
+                        ayah=a,
+                        intro_text=a_data.get('intro_text', ''),
+                        explain_text=a_data.get('explain_text', ''),
+                        visual_prompt=a_data.get('visual_prompt', ''),
+                        visual_scene=vscene,
+                        palette=MOOD_PALETTES.get("warm", "warm_sunset"),
+                        keywords=keywords,
+                    ))
+                    success = True
+                    break # نجحت المحاولة، اخرج من لوب الإعادة
+                except Exception as e:
+                    logger.error(f"❌ فشل توليد الآية {a.number} (محاولة {attempt + 1}/3): {e}")
+            
+            # منع تحريف القرآن: إذا فشلت كل المحاولات للآية، يجب إيقاف الحلقة بالكامل
+            if not success:
+                raise RuntimeError(f"⚠️ فشل نهائي في توليد الآية {a.number}. لا يمكن إنتاج حلقة ناقصة الآيات!")
 
         # 3) الخاتمة
         outro_prompt = (
@@ -239,7 +248,7 @@ class ScriptEngine:
 
         # تحديد visual_scene للـ intro & outro
         intro_vscene = pick_visual_scene(intro_data.get('intro_text', '') + " " + info['name'])
-        outro_vscene = VisualScene.SKY  # خاتمة بسماء النجوم دائماً
+        outro_vscene = VisualScene.SKY
 
         script = EpisodeScript(
             episode_number=ep_num,
@@ -272,18 +281,41 @@ class ScriptEngine:
         save_path = Paths.SCRIPT_DIR / f"episode_{ep_num:03d}.json"
         save_path.parent.mkdir(parents=True, exist_ok=True)
         save_path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
-        logger.info(f"✅ السكريبت محفوظ: {save_path}")
+        logger.info(f"✅ السكريبت محفوظ بنجاح: {save_path}")
         return script
 
     def _fetch_ayahs(self, info: dict) -> List[VerifiedAyah]:
-        ayahs = []
-        for n in range(info["start"], info["end"] + 1):
-            url = f"https://api.qurancdn.com/api/qdc/verses/by_key/{info['surah']}:{n}?words=false&fields=text_uthmani"
-            try:
-                d = requests.get(url, timeout=15).json()
-                text = d.get("verse", {}).get("text_uthmani", "")
-                if text:
-                    ayahs.append(VerifiedAyah(surah=info["surah"], number=n, text=text))
-            except Exception as e:
-                logger.error(f"❌ فشل تنزيل الآية {info['surah']}:{n}: {e}")
-        return ayahs
+        """ترقية: جلب السورة بالكامل في طلب واحد لتفادي حظر الشبكة وتسريع النظام"""
+        surah_num = info["surah"]
+        start_ayah = info["start"]
+        end_ayah = info["end"]
+        
+        # جلب الآيات في طلب واحد (لحد 300 آية، كافي جداً)
+        url = f"[https://api.qurancdn.com/api/qdc/verses/by_chapter/](https://api.qurancdn.com/api/qdc/verses/by_chapter/){surah_num}?words=false&fields=text_uthmani&per_page=300"
+        
+        try:
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            
+            ayahs = []
+            for verse in data.get("verses", []):
+                # استخراج رقم الآية من حقل verse_key (مثال: "114:5" -> 5)
+                ayah_num = int(verse["verse_key"].split(":")[1])
+                
+                # الفلترة المحلية (Locally) للآيات المطلوبة فقط
+                if start_ayah <= ayah_num <= end_ayah:
+                    text = verse.get("text_uthmani", "")
+                    if text:
+                        ayahs.append(VerifiedAyah(surah=surah_num, number=ayah_num, text=text))
+            
+            # التحقق من أن العدد المسترجع يطابق العدد المطلوب هندسياً
+            expected_count = end_ayah - start_ayah + 1
+            if len(ayahs) != expected_count:
+                logger.warning(f"⚠️ عدد الآيات المسترجعة ({len(ayahs)}) لا يطابق المطلوب ({expected_count}) في سورة {info['name']}.")
+                
+            return ayahs
+            
+        except Exception as e:
+            logger.error(f"❌ فشل جلب آيات سورة {surah_num} من الخادم: {e}")
+            raise RuntimeError(f"Network error while fetching Quran data: {e}")
