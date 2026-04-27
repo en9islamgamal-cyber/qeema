@@ -79,7 +79,7 @@ class PipelineOrchestrator:
             r = (
                 self.db.table(DBConfig.TABLE_EPISODES)
                 .select("*")
-                .eq("status", "pending")
+                .ilike("status", "pending")  # ✅ تم التعديل هنا لتجاهل حالة الأحرف
                 .order("episode_number")
                 .limit(1)
                 .execute()
