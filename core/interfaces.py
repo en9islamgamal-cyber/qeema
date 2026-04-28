@@ -1,184 +1,142 @@
 """
-core/interfaces.py — VALUE / QEEMA v11.0 (Production)
-=======================================================
-Abstract interfaces (Ports) for all engines.
-Following Hexagonal Architecture: domain doesn't know about implementations.
-
-Why:
-- Testability: نقدر نـ inject mock implementations
-- Flexibility: نقدر نغير TTS provider بدون لمس orchestrator
-- Documentation: العقد بين الطبقات واضح
-- Type safety: mypy يقدر يكشف الأخطاء قبل runtime
+core/interfaces.py — VALUE / QEEMA v12.0 (High-Performance Enterprise)
+======================================================================
+Core Ports (Interfaces) defining the system boundary.
+- Pydantic V2 for high-speed runtime validation.
+- Async/Await native protocols for non-blocking I/O.
+- Generic Result Wrappers for consistent error propagation.
 """
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Protocol
+from enum import Enum
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable, TypeVar, Generic
+from pydantic import BaseModel, Field, ConfigDict, HttpUrl
+from datetime import datetime
 
+T = TypeVar("T")
 
 # ════════════════════════════════════════════════════════════════
-# 1. LLM (Script Generation)
+# 0. Core Models (Pydantic V2)
 # ════════════════════════════════════════════════════════════════
+
+class BaseDomainModel(BaseModel):
+    """قاعدة البيانات الأساسية لضمان أداء عالي في الـ Serialization."""
+    model_config = ConfigDict(
+        frozen=True,
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        validate_assignment=True
+    )
+
+# ════════════════════════════════════════════════════════════════
+# 1. LLM Port (Script Generation)
+# ════════════════════════════════════════════════════════════════
+
+@runtime_checkable
 class LLMProvider(Protocol):
-    """Any LLM that can generate JSON responses."""
-
+    """
+    بروتوكول غير متزامن للتعامل مع النماذج اللغوية.
+    يدعم الـ Structured Output لضمان توافق السكريبت مع الـ Schema.
+    """
     name: str
 
-    def generate_json(
+    async def generate_json_async(
         self,
         prompt: str,
         system_instruction: Optional[str] = None,
         *,
-        temperature: float = 0.7,
-        max_tokens: int = 4096,
+        schema: Optional[Dict[str, Any]] = None,
+        temperature: float = 0.3, # قيم منخفضة لضمان الالتزام بالـ JSON
+        max_tokens: int = 4000,
     ) -> Dict[str, Any]:
+        """توليد JSON مع ضمان الالتزام بالهيكل المطلوب."""
         ...
 
+# ════════════════════════════════════════════════════════════════
+# 2. TTS Port (Speech Synthesis)
+# ════════════════════════════════════════════════════════════════
 
-# ════════════════════════════════════════════════════════════════
-# 2. TTS (Speech Synthesis)
-# ════════════════════════════════════════════════════════════════
-@dataclass(frozen=True)
-class TTSRequest:
-    text: str
+class TTSRequest(BaseDomainModel):
+    text: str = Field(..., min_length=1)
     output_path: str
     voice_id: Optional[str] = None
     language: str = "ar"
+    extra_params: Dict[str, Any] = Field(default_factory=dict)
 
-
-@dataclass(frozen=True)
-class TTSResult:
+class TTSResult(BaseDomainModel):
     output_path: str
-    duration_sec: float
+    duration_sec: float = Field(..., gt=0)
     provider: str
     voice_id: str
     cached: bool = False
-
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 class TTSProvider(ABC):
-    """Abstract TTS provider."""
-
+    """واجهة برمجية موحدة لمحركات الصوت (ElevenLabs, Edge, etc.)"""
     name: str
-    supports_arabic: bool = True
 
     @abstractmethod
-    def synthesize(self, request: TTSRequest) -> TTSResult:
+    async def synthesize_async(self, request: TTSRequest) -> TTSResult:
+        """تحويل النص إلى صوت بشكل غير متزامن."""
         ...
 
     @abstractmethod
-    def health_check(self) -> bool:
-        """Quick check if provider is operational."""
+    async def health_check_async(self) -> bool:
         ...
 
-
 # ════════════════════════════════════════════════════════════════
-# 3. Quran Audio (CDN sources)
+# 3. Visual Rendering Port (Procedural)
 # ════════════════════════════════════════════════════════════════
-@dataclass(frozen=True)
-class QuranAudioRequest:
-    surah: int
-    ayah: int
-    output_path: str
-    reciter: str = "alafasy"
 
-
-@dataclass(frozen=True)
-class QuranAudioResult:
-    output_path: str
-    duration_sec: float
-    source: str
-    cached: bool = False
-
-
-class QuranAudioSource(ABC):
-    """Single CDN source for Quranic recitation."""
-
-    name: str
-    base_url: str
-
-    @abstractmethod
-    def fetch(self, request: QuranAudioRequest) -> QuranAudioResult:
-        ...
-
-    @abstractmethod
-    def supports(self, reciter: str) -> bool:
-        ...
-
-
-# ════════════════════════════════════════════════════════════════
-# 4. Visual Renderer (Procedural)
-# ════════════════════════════════════════════════════════════════
-@dataclass(frozen=True)
-class SceneRenderRequest:
-    scene_type: str            # garden, sky, mosque, ...
-    palette: str               # warm_sunset, calm_blue, ...
-    text: Optional[str]        # narrator text (optional for ayah)
-    duration_sec: float
+class SceneRenderRequest(BaseDomainModel):
+    scene_id: int
+    scene_type: str = Field(..., pattern=r"^(garden|sky|house|mosque|ocean|desert|mountains)$")
+    palette: str
+    text: Optional[str] = None
+    duration_sec: float = Field(..., gt=0)
     is_ayah: bool = False
-    keywords: List[str] = None  # type: ignore
-    output_path: str = ""
+    keywords: List[str] = Field(default_factory=list)
+    output_path: str
 
-
-@dataclass(frozen=True)
-class SceneRenderResult:
+class SceneRenderResult(BaseDomainModel):
     output_path: str
     duration_sec: float
-    width: int
-    height: int
-
+    width: int = 1920
+    height: int = 1080
+    render_time_ms: float
 
 class VisualRenderer(ABC):
-    """Renders a scene to a video file."""
-
+    """المحرك المسؤول عن تحويل الـ HTML/CSS إلى فيديو (Playwright/GPU)."""
+    
     @abstractmethod
-    def render(self, request: SceneRenderRequest, audio_path: str) -> SceneRenderResult:
+    async def render_async(self, request: SceneRenderRequest, audio_path: str) -> SceneRenderResult:
         ...
 
     @abstractmethod
-    def warmup(self) -> None:
-        """Pre-load any expensive resources (e.g., browser pool)."""
+    async def __aenter__(self) -> VisualRenderer:
+        """إعداد الموارد (Browser Pool) بشكل غير متزامن."""
         ...
 
     @abstractmethod
-    def shutdown(self) -> None:
-        """Clean up resources."""
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """إغلاق نظيف للموارد."""
         ...
-
 
 # ════════════════════════════════════════════════════════════════
-# 5. Video Assembly
+# 4. Storage & State Port (Repository Pattern)
 # ════════════════════════════════════════════════════════════════
-class VideoAssembler(ABC):
-    """Concatenates segments into final video."""
 
-    @abstractmethod
-    def concat(
-        self,
-        segments: List[str],
-        output_path: str,
-        *,
-        re_encode: bool = False,
-    ) -> str:
-        ...
-
-    @abstractmethod
-    def get_duration(self, video_path: str) -> float:
-        ...
-
-
-# ════════════════════════════════════════════════════════════════
-# 6. Storage / Persistence
-# ════════════════════════════════════════════════════════════════
 class EpisodeRepository(ABC):
-    """CRUD for episodes."""
-
+    """عزل منطق قاعدة البيانات (Supabase) عن منطق العمل."""
+    
     @abstractmethod
-    def get_or_create(self, episode_number: int) -> Dict[str, Any]:
+    async def get_or_create_async(self, episode_number: int) -> Dict[str, Any]:
         ...
 
     @abstractmethod
-    def update_status(
+    async def update_status_async(
         self,
         episode_id: str,
         status: str,
@@ -187,62 +145,43 @@ class EpisodeRepository(ABC):
         ...
 
     @abstractmethod
-    def get_pending(self) -> Optional[Dict[str, Any]]:
+    async def save_pipeline_state_async(self, episode_id: str, stage: str, data: Dict[str, Any]) -> None:
+        """حفظ الحالة التفصيلية لكل مرحلة لتمكين الاستئناف (Resumability)."""
         ...
-
-    @abstractmethod
-    def save_state(self, episode_id: str, stage: str, state: Dict[str, Any]) -> None:
-        ...
-
-    @abstractmethod
-    def get_state(self, episode_id: str, stage: str) -> Optional[Dict[str, Any]]:
-        ...
-
 
 # ════════════════════════════════════════════════════════════════
-# 7. Uploader
+# 5. Delivery Port (YouTube Uploader)
 # ════════════════════════════════════════════════════════════════
-@dataclass(frozen=True)
-class UploadRequest:
+
+class UploadRequest(BaseDomainModel):
     video_path: str
-    title: str
+    title: str = Field(..., max_length=100)
     description: str
-    tags: List[str]
+    tags: List[str] = Field(default_factory=list, max_length=15)
     thumbnail_path: Optional[str] = None
-    privacy: str = "public"
-    made_for_kids: bool = True
-
-
-@dataclass(frozen=True)
-class UploadResult:
-    video_id: str
-    video_url: str
-    thumbnail_uploaded: bool
-
 
 class VideoUploader(ABC):
-    """Uploads to a video platform."""
-
+    """واجهة رفع الفيديو (YouTube API)."""
+    
     @abstractmethod
-    def upload(self, request: UploadRequest) -> UploadResult:
+    async def upload_async(self, request: UploadRequest) -> str:
+        """يرجع رابط الفيديو أو المعرف (Video ID)."""
         ...
 
+# ════════════════════════════════════════════════════════════════
+# 6. Quality Control Port (The Judge)
+# ════════════════════════════════════════════════════════════════
 
-# ════════════════════════════════════════════════════════════════
-# 8. Quality Gate
-# ════════════════════════════════════════════════════════════════
-@dataclass
-class QualityReport:
+class QualityReport(BaseDomainModel):
     passed: bool
-    overall_score: float
+    overall_score: float = Field(..., ge=0, le=100)
     field_scores: Dict[str, float]
     critiques: List[str]
-    details: Dict[str, Any] = None  # type: ignore
-
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 class QualityValidator(ABC):
-    """Validates artifacts against quality rules."""
-
+    """فحص السكريبت أو الفيديو قبل المتابعة في الـ Pipeline."""
+    
     @abstractmethod
-    def validate(self, artifact: Any) -> QualityReport:
+    async def validate_async(self, artifact: Any) -> QualityReport:
         ...
