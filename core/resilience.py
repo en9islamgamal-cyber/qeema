@@ -1,17 +1,11 @@
 """
-core/resilience.py — VALUE / QEEMA v11.0 (Production)
-=======================================================
-Resilience patterns for distributed systems:
-  - Smart retry with exponential backoff + jitter
-  - Circuit breaker (prevent cascading failures)
-  - Rate limiter (token bucket)
-  - Bulkhead (isolation between providers)
-
-Why:
-- النظام بيتعامل مع 5+ APIs خارجية (Gemini, Groq, ElevenLabs, Quran CDNs, YouTube)
-- أي API منهم ممكن يقع → لازم نعزل التأثير (Bulkhead)
-- النداءات المتكررة الفاشلة بتاكل quota → Circuit Breaker
-- بعض الـ APIs ليها rate limits صارمة → Rate Limiter
+core/resilience.py — VALUE / QEEMA v12.0 (High-Performance Production)
+======================================================================
+Advanced Resilience Patterns:
+  ✅ Async-Aware Smart Retry (Exponential Backoff + Jitter)
+  ✅ State-Machine Circuit Breaker (OPEN, CLOSED, HALF_OPEN)
+  ✅ Non-Blocking Token Bucket Rate Limiter
+  ✅ Async Provider Pool (Failover & Load Balancing)
 """
 from __future__ import annotations
 
@@ -22,8 +16,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import wraps
-from threading import Lock
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar, List, Set
 
 from core.exceptions import (
     PermanentError,
@@ -33,12 +26,10 @@ from core.exceptions import (
 )
 
 logger = logging.getLogger(__name__)
-
 T = TypeVar("T")
 
-
 # ════════════════════════════════════════════════════════════════
-# 1. Retry with exponential backoff + jitter
+# 1. High-Performance Async Retry Decorator
 # ════════════════════════════════════════════════════════════════
 @dataclass
 class RetryConfig:
@@ -47,54 +38,17 @@ class RetryConfig:
     max_delay: float = 30.0
     exponential_base: float = 2.0
     jitter: bool = True
-    retry_on: tuple = (TransientError,)  # only retry these
-    skip_on: tuple = (PermanentError,)   # never retry these
-
+    retry_on: tuple = (TransientError, ConnectionError, asyncio.TimeoutError)
+    skip_on: tuple = (PermanentError,)
 
 def retry_with_backoff(config: Optional[RetryConfig] = None):
     """
-    Decorator: smart retry with exponential backoff + jitter.
-
-    Why jitter? لو 100 client بيـ retry في نفس الوقت بعد فشل APIcommon
-    بيعملوا "thundering herd". الـ jitter بيوزّع الـ retries.
+    مُزخرف (Decorator) ذكي يدعم العمليات التزامنية وغير التزامنية.
+    يستخدم خوارزمية Full Jitter لمنع ظاهرة 'Thundering Herd'.
     """
     cfg = config or RetryConfig()
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        def wrapper(*args, **kwargs) -> T:
-            last_exc: Optional[Exception] = None
-            for attempt in range(1, cfg.max_attempts + 1):
-                try:
-                    return func(*args, **kwargs)
-                except cfg.skip_on as e:
-                    logger.error(f"❌ {func.__name__}: permanent error, no retry: {e}")
-                    raise
-                except cfg.retry_on as e:
-                    last_exc = e
-                    if attempt == cfg.max_attempts:
-                        break
-
-                    # Honor server's Retry-After header if available
-                    server_delay = getattr(e, "retry_after", None)
-                    if server_delay is not None:
-                        delay = min(server_delay, cfg.max_delay)
-                    else:
-                        delay = min(
-                            cfg.initial_delay * (cfg.exponential_base ** (attempt - 1)),
-                            cfg.max_delay,
-                        )
-                        if cfg.jitter:
-                            delay *= 0.5 + random.random()  # 50%-150% of computed
-
-                    logger.warning(
-                        f"⚠️ {func.__name__}: attempt {attempt}/{cfg.max_attempts} failed "
-                        f"({type(e).__name__}: {e}). Retry in {delay:.1f}s"
-                    )
-                    time.sleep(delay)
-            assert last_exc is not None
-            raise last_exc
-
         @wraps(func)
         async def async_wrapper(*args, **kwargs) -> T:
             last_exc: Optional[Exception] = None
@@ -102,304 +56,147 @@ def retry_with_backoff(config: Optional[RetryConfig] = None):
                 try:
                     return await func(*args, **kwargs)
                 except cfg.skip_on as e:
-                    logger.error(f"❌ {func.__name__}: permanent error, no retry: {e}")
+                    logger.error(f"❌ {func.__name__}: Permanent failure: {e}")
                     raise
                 except cfg.retry_on as e:
                     last_exc = e
-                    if attempt == cfg.max_attempts:
-                        break
-                    server_delay = getattr(e, "retry_after", None)
-                    delay = (
-                        min(server_delay, cfg.max_delay)
-                        if server_delay is not None
-                        else min(
-                            cfg.initial_delay * (cfg.exponential_base ** (attempt - 1)),
-                            cfg.max_delay,
-                        )
-                    )
-                    if cfg.jitter and server_delay is None:
-                        delay *= 0.5 + random.random()
-                    logger.warning(
-                        f"⚠️ {func.__name__}: attempt {attempt}/{cfg.max_attempts} → wait {delay:.1f}s"
-                    )
-                    await asyncio.sleep(delay)
-            assert last_exc is not None
+                    if attempt == cfg.max_attempts: break
+                    
+                    # حساب التأخير باستخدام Exponential Backoff + Jitter
+                    delay = min(cfg.max_delay, cfg.initial_delay * (cfg.exponential_base ** (attempt - 1)))
+                    if cfg.jitter:
+                        delay = random.uniform(cfg.initial_delay, delay)
+                    
+                    logger.warning(f"⚠️ {func.__name__}: Attempt {attempt} failed. Retrying in {delay:.1f}s...")
+                    await asyncio.sleep(delay) # NON-BLOCKING SLEEP
+            
             raise last_exc
 
-        # Pick sync vs async based on coroutine
-        if asyncio.iscoroutinefunction(func):
-            return async_wrapper  # type: ignore
-        return wrapper
-
+        return async_wrapper # نركز هنا على الـ Async كمعيار للمشروع
     return decorator
 
-
 # ════════════════════════════════════════════════════════════════
-# 2. Circuit Breaker
+# 2. State-Machine Circuit Breaker
 # ════════════════════════════════════════════════════════════════
 class CircuitState(Enum):
-    CLOSED = "closed"        # طبيعي، النداءات بتمر
-    OPEN = "open"            # كل النداءات مرفوضة (الخدمة مكسورة)
-    HALF_OPEN = "half_open"  # محاولة استكشاف لو الخدمة رجعت
+    CLOSED = "closed"      # يعمل طبيعياً
+    OPEN = "open"          # معطل (لحماية النظام)
+    HALF_OPEN = "half_open" # وضع الاختبار
 
-
-@dataclass
-class CircuitBreakerConfig:
-    failure_threshold: int = 5            # بعد كام فشل نقفل الدائرة
-    recovery_timeout: float = 60.0        # كام ثانية ننتظر قبل الـ HALF_OPEN
-    success_threshold: int = 2            # كام نجاح متتالي في HALF_OPEN لنرجع CLOSED
 
 
 class CircuitBreaker:
     """
-    Per-provider circuit breaker.
-
-    Why: لو ElevenLabs وقع، مفيش لازمة نضيع 3 retries × 30 ثانية لكل request جديد.
-    الـ breaker بيرفض النداء فوراً ويرجع fallback.
+    قاطع الدائرة البرمجي: يمنع استنزاف الموارد عند تعطل API معين.
     """
-
-    def __init__(self, name: str, config: Optional[CircuitBreakerConfig] = None):
+    def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 60.0):
         self.name = name
-        self.cfg = config or CircuitBreakerConfig()
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
         self._state = CircuitState.CLOSED
-        self._failure_count = 0
-        self._success_count = 0
-        self._opened_at: Optional[float] = None
-        self._lock = Lock()
+        self._failures = 0
+        self._last_failure_time = 0
+        self._lock = asyncio.Lock()
 
-    @property
-    def state(self) -> CircuitState:
-        with self._lock:
-            # Auto-transition OPEN → HALF_OPEN after timeout
-            if (
-                self._state == CircuitState.OPEN
-                and self._opened_at is not None
-                and time.time() - self._opened_at >= self.cfg.recovery_timeout
-            ):
-                self._state = CircuitState.HALF_OPEN
-                self._success_count = 0
-                logger.info(f"🔄 [{self.name}] Circuit: OPEN → HALF_OPEN (probing)")
-            return self._state
+    async def __aenter__(self):
+        async with self._lock:
+            if self._state == CircuitState.OPEN:
+                if time.monotonic() - self._last_failure_time > self.recovery_timeout:
+                    self._state = CircuitState.HALF_OPEN
+                    logger.info(f"🔄 [{self.name}] Circuit HALF-OPEN: Testing service...")
+                else:
+                    raise ProviderUnavailableError(self.name, "Circuit is OPEN")
+        return self
 
-    def record_success(self) -> None:
-        with self._lock:
-            if self._state == CircuitState.HALF_OPEN:
-                self._success_count += 1
-                if self._success_count >= self.cfg.success_threshold:
-                    self._state = CircuitState.CLOSED
-                    self._failure_count = 0
-                    logger.info(f"✅ [{self.name}] Circuit: HALF_OPEN → CLOSED (recovered)")
-            elif self._state == CircuitState.CLOSED:
-                self._failure_count = 0
-
-    def record_failure(self) -> None:
-        with self._lock:
-            self._failure_count += 1
-            if self._state == CircuitState.HALF_OPEN:
-                self._state = CircuitState.OPEN
-                self._opened_at = time.time()
-                logger.warning(f"🚨 [{self.name}] Circuit: HALF_OPEN → OPEN (probe failed)")
-            elif (
-                self._state == CircuitState.CLOSED
-                and self._failure_count >= self.cfg.failure_threshold
-            ):
-                self._state = CircuitState.OPEN
-                self._opened_at = time.time()
-                logger.error(
-                    f"🚨 [{self.name}] Circuit: CLOSED → OPEN "
-                    f"(failures={self._failure_count})"
-                )
-
-    def call(self, func: Callable[..., T], *args, **kwargs) -> T:
-        if self.state == CircuitState.OPEN:
-            raise ProviderUnavailableError(
-                self.name,
-                f"Circuit breaker OPEN; will retry at {self._opened_at + self.cfg.recovery_timeout}",
-            )
-        try:
-            result = func(*args, **kwargs)
-            self.record_success()
-            return result
-        except Exception as e:
-            # Only count transient errors as circuit failures
-            if isinstance(e, (TransientError, ConnectionError, TimeoutError)):
-                self.record_failure()
-            raise
-
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        async with self._lock:
+            if exc_type is None: # نجاح
+                self._failures = 0
+                self._state = CircuitState.CLOSED
+            elif issubclass(exc_type, (TransientError, ConnectionError)):
+                self._failures += 1
+                self._last_failure_time = time.monotonic()
+                if self._failures >= self.failure_threshold:
+                    self._state = CircuitState.OPEN
+                    logger.critical(f"🚨 [{self.name}] Circuit OPENED! Too many failures.")
 
 # ════════════════════════════════════════════════════════════════
-# 3. Rate Limiter (Token Bucket)
+# 3. Async Token Bucket (The Governor)
 # ════════════════════════════════════════════════════════════════
 class TokenBucketRateLimiter:
     """
-    Token bucket: rate=N tokens/sec, burst=B.
-
-    Why token bucket vs sliding window?
-    - بيسمح بـ bursts مؤقتة (لو الـ APIs بطيئة في وقت تاني نقدر نلحقهم)
-    - أبسط في الكود وأسرع
+    خوارزمية إدارة الكوتة (Token Bucket).
+    تسمح بـ Bursts مؤقتة مع الحفاظ على معدل ثابت (Steady Rate).
     """
+    def __init__(self, rate_per_min: float, capacity: int):
+        self.rate = rate_per_min / 60.0
+        self.capacity = capacity
+        self.tokens = float(capacity)
+        self.last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
 
-    def __init__(self, rate_per_sec: float, burst: int):
-        self.rate = rate_per_sec
-        self.capacity = burst
-        self._tokens = float(burst)
-        self._last_refill = time.monotonic()
-        self._lock = Lock()
+    async def acquire(self, amount: float = 1.0):
+        async with self._lock:
+            now = time.monotonic()
+            # Refill tokens
+            elapsed = now - self.last_refill
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+            self.last_refill = now
 
-    def acquire(self, tokens: int = 1, timeout: float = 30.0) -> bool:
-        deadline = time.monotonic() + timeout
-        while True:
-            with self._lock:
-                now = time.monotonic()
-                # Refill
-                elapsed = now - self._last_refill
-                self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
-                self._last_refill = now
+            if self.tokens < amount:
+                wait_time = (amount - self.tokens) / self.rate
+                logger.debug(f"⏳ Throttling: waiting {wait_time:.2f}s for tokens")
+                await asyncio.sleep(wait_time)
+                # إعادة الملء بعد الانتظار
+                self.tokens = amount 
+            
+            self.tokens -= amount
+            return True
 
-                if self._tokens >= tokens:
-                    self._tokens -= tokens
-                    return True
-
-                # How long until enough tokens?
-                wait_for = (tokens - self._tokens) / self.rate
-
-            if time.monotonic() + wait_for > deadline:
-                return False
-            time.sleep(min(wait_for, 0.5))
 
 
 # ════════════════════════════════════════════════════════════════
-# 4. Provider Pool with health tracking (Bulkhead)
+# 4. Enterprise Provider Pool (The Bulkhead)
 # ════════════════════════════════════════════════════════════════
-@dataclass
-class ProviderHealth:
-    name: str
-    breaker: CircuitBreaker
-    rate_limiter: Optional[TokenBucketRateLimiter] = None
-    total_calls: int = 0
-    total_failures: int = 0
-    total_latency_sec: float = 0.0
-
-    @property
-    def success_rate(self) -> float:
-        if self.total_calls == 0:
-            return 1.0
-        return 1.0 - (self.total_failures / self.total_calls)
-
-    @property
-    def avg_latency_ms(self) -> float:
-        if self.total_calls == 0:
-            return 0.0
-        return (self.total_latency_sec / self.total_calls) * 1000
-
-
 class ProviderPool:
     """
-    Pool of equivalent providers (e.g., 3 Gemini keys).
-    Routes traffic with awareness of health & rate limits.
-
-    Strategies:
-    - "round_robin": الافتراضي
-    - "least_used": أقل استخدام
-    - "fastest": أسرع response time
+    مجمع المزودين: يدير استراتيجيات الـ Failover والـ Load Balancing.
+    لو سقط Gemini 1، ينتقل تلقائياً لـ Gemini 2 أو Groq.
     """
-
-    def __init__(self, name: str, strategy: str = "round_robin"):
+    def __init__(self, name: str):
         self.name = name
-        self.strategy = strategy
-        self._providers: list[ProviderHealth] = []
-        self._next_idx = 0
-        self._lock = Lock()
+        self.providers: List[Dict] = []
+        self._current_idx = 0
 
-    def register(
-        self,
-        name: str,
-        breaker_config: Optional[CircuitBreakerConfig] = None,
-        rate_limit: Optional[tuple[float, int]] = None,  # (rate/sec, burst)
-    ) -> None:
-        breaker = CircuitBreaker(name, breaker_config)
-        limiter = TokenBucketRateLimiter(*rate_limit) if rate_limit else None
-        with self._lock:
-            self._providers.append(ProviderHealth(name, breaker, limiter))
-        logger.info(f"📡 [{self.name}] Registered provider: {name}")
+    def add_provider(self, name: str, adapter: Any, rpm: int = 30):
+        self.providers.append({
+            "name": name,
+            "adapter": adapter,
+            "breaker": CircuitBreaker(name),
+            "limiter": TokenBucketRateLimiter(rpm, capacity=int(rpm*0.2 + 1))
+        })
 
-    def _pick_provider(self) -> Optional[ProviderHealth]:
-        with self._lock:
-            available = [
-                p for p in self._providers
-                if p.breaker.state != CircuitState.OPEN
-            ]
-            if not available:
-                return None
-
-            if self.strategy == "least_used":
-                return min(available, key=lambda p: p.total_calls)
-            if self.strategy == "fastest":
-                return min(available, key=lambda p: p.avg_latency_ms or float("inf"))
-
-            # round_robin
-            self._next_idx = (self._next_idx + 1) % len(available)
-            return available[self._next_idx]
-
-    def execute(
-        self,
-        func: Callable[[str], T],
-        max_attempts: Optional[int] = None,
-    ) -> T:
+    async def execute(self, task_fn: Callable, *args, **kwargs):
         """
-        Execute func across pool with automatic failover.
-        func receives provider name and returns result.
+        خوارزمية التنفيذ التكيفي:
+        تجرب كافة المزودين المتاحين قبل إعلان الفشل النهائي.
         """
-        attempts = max_attempts or len(self._providers)
-        last_exc: Optional[Exception] = None
-        tried: set[str] = set()
+        last_error = None
+        # نحاول مع كل المزودين (Round Robin Failover)
+        for _ in range(len(self.providers)):
+            p = self.providers[self._current_idx]
+            self._current_idx = (self._current_idx + 1) % len(self.providers)
 
-        for _ in range(attempts):
-            provider = self._pick_provider()
-            if provider is None:
-                raise ProviderUnavailableError(
-                    self.name, "all providers unavailable (circuits open)"
-                )
-            if provider.name in tried:
-                continue
-            tried.add(provider.name)
-
-            # Rate limit gate
-            if provider.rate_limiter and not provider.rate_limiter.acquire(timeout=5.0):
-                logger.warning(f"⏱️ [{provider.name}] rate-limited, trying next")
-                continue
-
-            start = time.monotonic()
-            provider.total_calls += 1
             try:
-                result = provider.breaker.call(func, provider.name)
-                provider.total_latency_sec += time.monotonic() - start
-                return result
-            except RateLimitError as e:
-                provider.total_failures += 1
-                logger.warning(f"⏱️ [{provider.name}] rate-limited by server: {e}")
-                last_exc = e
-            except (TransientError, Exception) as e:
-                provider.total_failures += 1
-                last_exc = e
-                logger.warning(f"⚠️ [{provider.name}] failed: {e}, trying next")
+                async with p["breaker"]:
+                    await p["limiter"].acquire()
+                    return await task_fn(p["adapter"], *args, **kwargs)
+            except (ProviderUnavailableError, RateLimitError) as e:
+                last_error = e
+                continue # جرب المزود التالي فوراً
+            except Exception as e:
+                last_error = e
+                logger.error(f"❌ Provider [{p['name']}] failed: {e}")
+                continue
 
-        if last_exc:
-            raise last_exc
-        raise ProviderUnavailableError(self.name, "no providers succeeded")
-
-    def health_report(self) -> dict:
-        with self._lock:
-            return {
-                "pool": self.name,
-                "providers": [
-                    {
-                        "name": p.name,
-                        "state": p.breaker.state.value,
-                        "calls": p.total_calls,
-                        "success_rate": round(p.success_rate, 3),
-                        "avg_latency_ms": round(p.avg_latency_ms, 1),
-                    }
-                    for p in self._providers
-                ],
-            }
+        raise ProviderUnavailableError(self.name, f"All providers exhausted. Last error: {last_error}")
