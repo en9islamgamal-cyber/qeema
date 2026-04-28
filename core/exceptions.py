@@ -1,42 +1,49 @@
 """
-core/exceptions.py — VALUE / QEEMA v11.0 (Production)
-======================================================
-Custom exception hierarchy for clean error handling.
-
-Why:
-- التمييز بين الأخطاء المؤقتة (transient) والدائمة (permanent)
-- Retry logic ذكي بناءً على نوع الخطأ
-- Logging مهيكل (structured) مع context
-
-Hierarchy:
-  QeemaError (base)
-   ├── TransientError (retry-able)
-   │    ├── RateLimitError
-   │    ├── NetworkError
-   │    └── TimeoutError
-   ├── PermanentError (don't retry)
-   │    ├── AuthenticationError
-   │    ├── ValidationError
-   │    └── ConfigurationError
-   └── PipelineError
-        ├── ScriptGenerationError
-        ├── AudioGenerationError
-        ├── VisualRenderError
-        └── UploadError
+core/exceptions.py — VALUE / QEEMA v12.0 (Enterprise Intelligence)
+==================================================================
+Advanced Exception System with:
+  ✅ Observability: Integrated Trace ID and Timestamps.
+  ✅ Recovery Metadata: Suggestions for the Orchestrator on how to recover.
+  ✅ Saga Support: Tracking which stage needs compensation or rollback.
+  ✅ Semantic Classification: Granular categorization for AI-driven logs.
 """
 from __future__ import annotations
-from typing import Optional, Dict, Any
+
+import uuid
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+
+class ErrorSeverity(Enum):
+    DEBUG = "DEBUG"
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    CRITICAL = "CRITICAL"  # يتطلب تدخل بشري فوري أو إغلاق النظام
+
+
+class RecoveryStrategy(Enum):
+    RETRY_IMMEDIATE = "retry_immediate"
+    RETRY_WITH_BACKOFF = "retry_with_backoff"
+    SWITCH_PROVIDER = "switch_provider"  # الانتقال من Gemini لـ Groq مثلاً
+    ABORT_EPISODE = "abort_episode"     # فشل الحلقة الحالية فقط
+    SHUTDOWN_SYSTEM = "shutdown_system" # فشل بنيوي يمنع عمل النظام
 
 
 class QeemaError(Exception):
-    """Base exception for all QEEMA pipeline errors."""
-
+    """
+    النواة الذكية لكافة الأخطاء في النظام.
+    كل خطأ هو عبارة عن 'صندوق معلومات' كامل للمهندس المسؤول.
+    """
     def __init__(
         self,
         message: str,
         *,
         episode_number: Optional[int] = None,
         stage: Optional[str] = None,
+        severity: ErrorSeverity = ErrorSeverity.ERROR,
+        recovery: RecoveryStrategy = RecoveryStrategy.RETRY_WITH_BACKOFF,
         context: Optional[Dict[str, Any]] = None,
         cause: Optional[Exception] = None,
     ):
@@ -44,127 +51,109 @@ class QeemaError(Exception):
         self.message = message
         self.episode_number = episode_number
         self.stage = stage
+        self.severity = severity
+        self.recovery = recovery
         self.context = context or {}
         self.cause = cause
+        self.timestamp = datetime.now(timezone.utc).isoformat()
+        self.trace_id = str(uuid.uuid4()) # معرف فريد لتتبع الخطأ في الـ Logs
 
     def to_dict(self) -> Dict[str, Any]:
-        """For structured logging."""
+        """توليد مخرجات JSON جاهزة لأنظمة المراقبة مثل ELK أو Datadog."""
         return {
+            "trace_id": self.trace_id,
+            "timestamp": self.timestamp,
             "error_type": self.__class__.__name__,
+            "severity": self.severity.value,
+            "recovery_strategy": self.recovery.value,
             "message": self.message,
             "episode_number": self.episode_number,
             "stage": self.stage,
             "context": self.context,
-            "cause": str(self.cause) if self.cause else None,
+            "cause": {
+                "type": type(self.cause).__name__,
+                "message": str(self.cause)
+            } if self.cause else None,
         }
 
 
-# ─── Transient errors (retry-able) ────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+# 1. Transient Errors (Retryable - الطبقة المرنة)
+# ════════════════════════════════════════════════════════════════
 class TransientError(QeemaError):
-    """Errors that may resolve themselves; safe to retry."""
+    """أخطاء مؤقتة ناتجة عن الشبكة أو ضغط الـ APIs."""
     pass
 
 
 class RateLimitError(TransientError):
-    """API rate limit hit; retry with backoff."""
+    """تجاوز الكوتة: يتم استخدامه بواسطة الـ TokenBucket في resilience.py."""
     def __init__(self, message: str, retry_after: Optional[float] = None, **kwargs):
-        super().__init__(message, **kwargs)
+        super().__init__(message, recovery=RecoveryStrategy.RETRY_WITH_BACKOFF, **kwargs)
         self.retry_after = retry_after
 
 
-class NetworkError(TransientError):
-    """Network connectivity issue."""
-    pass
-
-
-class TimeoutError(TransientError):
-    """Operation timed out."""
-    pass
-
-
 class ProviderUnavailableError(TransientError):
-    """External service is down; switch to fallback."""
+    """تعطل أحد المزودين: يرسل إشارة للـ Orchestrator لتغيير الـ Adapter."""
     def __init__(self, provider: str, message: str = "", **kwargs):
-        full_msg = f"Provider '{provider}' unavailable: {message}"
-        super().__init__(full_msg, **kwargs)
+        full_msg = f"Provider '{provider}' is DOWN. {message}"
+        super().__init__(
+            full_msg, 
+            recovery=RecoveryStrategy.SWITCH_PROVIDER, 
+            severity=ErrorSeverity.WARNING,
+            **kwargs
+        )
         self.provider = provider
 
 
-# ─── Permanent errors (don't retry) ───────────────────────────────
+# ════════════════════════════════════════════════════════════════
+# 2. Permanent Errors (Fatal - الأخطاء القاتلة)
+# ════════════════════════════════════════════════════════════════
 class PermanentError(QeemaError):
-    """Errors that won't resolve by retrying."""
-    pass
+    """أخطاء تتطلب تدخل يدوي أو تصحيح كود ولا ينفع معها الـ Retry."""
+    def __init__(self, message: str, **kwargs):
+        super().__init__(message, recovery=RecoveryStrategy.ABORT_EPISODE, **kwargs)
 
 
 class AuthenticationError(PermanentError):
-    """Invalid credentials; manual intervention needed."""
-    pass
+    """خطأ في الـ API Keys: يرفع درجة الخطورة لـ CRITICAL."""
+    def __init__(self, message: str, **kwargs):
+        super().__init__(message, severity=ErrorSeverity.CRITICAL, **kwargs)
 
 
-class ValidationError(PermanentError):
-    """Data validation failed."""
-    def __init__(self, message: str, field: Optional[str] = None, **kwargs):
-        super().__init__(message, **kwargs)
-        self.field = field
+class DependencyError(PermanentError):
+    """فشل في المتطلبات البرمجية (مثل عدم وجود FFmpeg أو Playwright)."""
+    def __init__(self, tool: str, **kwargs):
+        super().__init__(f"System dependency missing: {tool}", severity=ErrorSeverity.CRITICAL, **kwargs)
 
 
-class ConfigurationError(PermanentError):
-    """System misconfiguration."""
-    pass
-
-
-class QuotaExceededError(PermanentError):
-    """Account quota exhausted."""
-    pass
-
-
-# ─── Pipeline-specific errors ─────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+# 3. Pipeline & Logic Errors (المراحل الإنتاجية)
+# ════════════════════════════════════════════════════════════════
 class PipelineError(QeemaError):
-    """Errors specific to pipeline stages."""
+    """أخطاء منطقية داخل مراحل الـ Pipeline."""
     pass
 
 
 class ScriptGenerationError(PipelineError):
-    """LLM failed to produce valid script."""
+    """فشل الـ LLM في إنتاج سكريبت صالح (JSON Error مثلاً)."""
     pass
-
-
-class AudioGenerationError(PipelineError):
-    """TTS or Quran fetch failed."""
-    pass
-
-
-class QuranFetchError(AudioGenerationError):
-    """Could not fetch Quranic recitation from any CDN."""
-    def __init__(self, surah: int, ayah: int, sources_tried: list, **kwargs):
-        msg = f"Failed to fetch Quran {surah}:{ayah} from {len(sources_tried)} sources"
-        super().__init__(msg, **kwargs)
-        self.surah = surah
-        self.ayah = ayah
-        self.sources_tried = sources_tried
 
 
 class VisualRenderError(PipelineError):
-    """Procedural rendering failed."""
+    """فشل محرك الرندرة (Playwright/Three.js)."""
     pass
 
 
-class VideoAssemblyError(PipelineError):
-    """FFmpeg assembly failed."""
-    pass
+class QualityGateError(PipelineError):
+    """فشل بوابة الجودة: يحمل تفاصيل الانتقادات لإرسالها للـ LLM للتصحيح."""
+    def __init__(self, message: str, score: float, critiques: List[str], **kwargs):
+        super().__init__(message, recovery=RecoveryStrategy.RETRY_IMMEDIATE, **kwargs)
+        self.score = score
+        self.critiques = critiques
 
 
 class UploadError(PipelineError):
-    """YouTube upload failed."""
-    def __init__(self, message: str, *, video_path: Optional[str] = None, **kwargs):
+    """فشل الرفع ليوتيوب (قد يكون توكن منتهي أو فيديو مخالف)."""
+    def __init__(self, message: str, video_path: Optional[str] = None, **kwargs):
         super().__init__(message, **kwargs)
         self.video_path = video_path
-
-
-# ─── Quality gate errors ──────────────────────────────────────────
-class QualityGateError(PipelineError):
-    """Output failed quality validation."""
-    def __init__(self, message: str, *, score: float = 0.0, critiques: list = None, **kwargs):
-        super().__init__(message, **kwargs)
-        self.score = score
-        self.critiques = critiques or []
