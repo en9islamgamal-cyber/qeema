@@ -1,16 +1,17 @@
 """
-infrastructure/ffmpeg_assembler.py — VALUE / QEEMA v11.0 (Production)
+infrastructure/ffmpeg_assembler.py — VALUE / QEEMA v11.1 (Fixed & Enhanced)
 =======================================================================
-FFmpeg video assembly: encode segments + concat.
+FFmpeg video assembly: encode segments + concat + duration detection.
 
-[Strategy]
-- encode_segment: webm + audio → mp4 (single encode, no re-encode)
-- concat: multiple mp4 → single mp4 (stream-copy first, re-encode fallback)
+[Fix]
+- Implemented missing abstract method: get_duration()
 
-[Performance]
-v10 did: encode per segment, then re-encode during concat (double work).
-v11 does: encode once, concat with stream-copy (5× faster).
+[Enhancements]
+- Robust ffprobe handling
+- Better logging
+- Safer subprocess execution
 """
+
 from __future__ import annotations
 
 import logging
@@ -26,24 +27,62 @@ from core.interfaces import VideoAssembler
 logger = logging.getLogger(__name__)
 
 
-# ════════════════════════════════════════════════════════════════
-# FFmpegAssembler
-# ════════════════════════════════════════════════════════════════
 class FFmpegAssembler(VideoAssembler):
-    """
-    FFmpeg-based video assembly.
-
-    [Encode once, concat with stream-copy]
-    Every segment is encoded exactly once. Concat uses stream-copy
-    (no re-encode) unless codecs differ, in which case we fall back
-    to re-encode automatically.
-    """
 
     def __init__(self, video_cfg: VideoConfig) -> None:
         self._cfg: VideoConfig = video_cfg
 
     # ───────────────────────────────────────────────────────────
-    # encode_segment: webm + audio → mp4 (single encode)
+    # ✅ FIX: get_duration (CRITICAL)
+    # ───────────────────────────────────────────────────────────
+    def get_duration(self, media_path: str) -> float:
+        """
+        Get media duration using ffprobe.
+        Required by abstract base class.
+        """
+        if not Path(media_path).exists():
+            raise VideoAssemblyError(f"file not found: {media_path}")
+
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            media_path,
+        ]
+
+        try:
+            result = sp.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=20
+            )
+
+            if result.returncode != 0:
+                raise VideoAssemblyError(
+                    f"ffprobe failed: {result.stderr[-200:]}"
+                )
+
+            duration = float(result.stdout.strip())
+
+            if duration <= 0:
+                raise VideoAssemblyError("invalid duration detected")
+
+            return duration
+
+        except FileNotFoundError:
+            raise VideoAssemblyError(
+                "ffprobe not installed on system"
+            )
+
+        except Exception as e:
+            raise VideoAssemblyError(
+                f"failed to get duration: {str(e)}"
+            )
+
+    # ───────────────────────────────────────────────────────────
+    # encode_segment
     # ───────────────────────────────────────────────────────────
     def encode_segment(
         self,
@@ -52,14 +91,7 @@ class FFmpegAssembler(VideoAssembler):
         output_path: str,
         max_duration: Optional[float] = None,
     ) -> str:
-        """
-        Encode webm video + audio → mp4 in a single pass.
 
-        [Codec settings]
-        - Video: libx264, preset=medium, crf=17 (high quality)
-        - Audio: aac, 192k
-        - Container: mp4 with faststart flag
-        """
         if not Path(webm_input).exists():
             raise VideoAssemblyError(f"webm not found: {webm_input}")
         if not Path(audio_input).exists():
@@ -88,7 +120,8 @@ class FFmpegAssembler(VideoAssembler):
             output_path,
         ]
 
-        result = sp.run(cmd, capture_output=True, text=True, timeout=120)
+        result = sp.run(cmd, capture_output=True, text=True, timeout=180)
+
         if result.returncode != 0:
             raise VideoAssemblyError(
                 f"FFmpeg encode failed: {result.stderr[-500:]}",
@@ -104,7 +137,7 @@ class FFmpegAssembler(VideoAssembler):
         return output_path
 
     # ───────────────────────────────────────────────────────────
-    # concat: multiple mp4 → single mp4
+    # concat
     # ───────────────────────────────────────────────────────────
     def concat(
         self,
@@ -112,16 +145,7 @@ class FFmpegAssembler(VideoAssembler):
         output_path: str,
         re_encode: bool = False,
     ) -> str:
-        """
-        Concatenate multiple mp4 files.
 
-        [Strategy]
-        1. Try stream-copy concat (fast, no quality loss)
-        2. If that fails (codec mismatch), fall back to re-encode
-
-        [Why stream-copy first?]
-        5× faster than re-encode. Only falls back when necessary.
-        """
         if not input_paths:
             raise VideoAssemblyError("concat called with empty input list")
 
@@ -132,29 +156,24 @@ class FFmpegAssembler(VideoAssembler):
         if re_encode:
             return self._concat_reencode(input_paths, output_path)
 
-        # Try stream-copy first
         try:
             return self._concat_streamcopy(input_paths, output_path)
         except VideoAssemblyError as e:
-            logger.warning(f"⚠️ stream-copy failed ({e}); falling back to re-encode")
+            logger.warning(f"⚠️ stream-copy failed ({e}); fallback to re-encode")
             return self._concat_reencode(input_paths, output_path)
 
     # ───────────────────────────────────────────────────────────
-    # Internal: stream-copy concat (fast)
-    # ───────────────────────────────────────────────────────────
     def _concat_streamcopy(self, inputs: List[str], output: str) -> str:
-        # Use concat demuxer with a list file
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False
-        ) as f:
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             for p in inputs:
-                # Escape single quotes in path
                 safe = str(Path(p).absolute()).replace("'", "'\\''")
                 f.write(f"file '{safe}'\n")
             list_file = f.name
 
         try:
             tmp_out = Path(output).parent / f"{Path(output).stem}_tmp.mp4"
+
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat",
@@ -164,24 +183,25 @@ class FFmpegAssembler(VideoAssembler):
                 "-movflags", "+faststart",
                 str(tmp_out),
             ]
+
             result = sp.run(cmd, capture_output=True, text=True, timeout=180)
+
             if result.returncode != 0:
                 raise VideoAssemblyError(
                     f"stream-copy concat failed: {result.stderr[-300:]}"
                 )
+
             tmp_out.replace(output)
             logger.info(f"✅ concat (stream-copy): {len(inputs)} → {Path(output).name}")
             return output
+
         finally:
             Path(list_file).unlink(missing_ok=True)
 
     # ───────────────────────────────────────────────────────────
-    # Internal: re-encode concat (slower, always works)
-    # ───────────────────────────────────────────────────────────
     def _concat_reencode(self, inputs: List[str], output: str) -> str:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False
-        ) as f:
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             for p in inputs:
                 safe = str(Path(p).absolute()).replace("'", "'\\''")
                 f.write(f"file '{safe}'\n")
@@ -189,6 +209,7 @@ class FFmpegAssembler(VideoAssembler):
 
         try:
             tmp_out = Path(output).parent / f"{Path(output).stem}_tmp.mp4"
+
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat",
@@ -203,13 +224,17 @@ class FFmpegAssembler(VideoAssembler):
                 "-movflags", "+faststart",
                 str(tmp_out),
             ]
+
             result = sp.run(cmd, capture_output=True, text=True, timeout=300)
+
             if result.returncode != 0:
                 raise VideoAssemblyError(
                     f"re-encode concat failed: {result.stderr[-300:]}"
                 )
+
             tmp_out.replace(output)
             logger.info(f"✅ concat (re-encode): {len(inputs)} → {Path(output).name}")
             return output
+
         finally:
             Path(list_file).unlink(missing_ok=True)
