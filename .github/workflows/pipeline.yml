@@ -139,3 +139,5 @@ jobs:
           path: logs/
           retention-days: 7
           if-no-files-found: ignore
+          - name: Clear cache
+  run: rm -rf __pycache__
