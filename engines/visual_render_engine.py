@@ -235,7 +235,7 @@ class ProceduralRenderer(VisualRenderer):
 
         # 3) Encode webm + audio → mp4 (atomic rename)
         try:
-            tmp_mp4 = Path(request.output_path).with_suffix(".mp4.tmp")
+            tmp_mp4 = Path(request.output_path).parent / f"{Path(request.output_path).stem}_tmp.mp4"
             self._assembler.encode_segment(
                 webm_input=str(webm_path),
                 audio_input=audio_path,
