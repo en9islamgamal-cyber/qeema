@@ -45,9 +45,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             ffmpeg \
-            fonts-noto-core \
-            fonts-amiri \
-            fonts-dejavu
+            fonts-noto-arabic \
+            fonts-dejavu-core
 
       # ── Python deps
       - name: Install Python packages
