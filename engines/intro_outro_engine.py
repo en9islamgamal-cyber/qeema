@@ -402,7 +402,7 @@ class IntroOutroEngine(IntroOutroBuilder):
 
             # Use a synthesized silent audio track
             silent_audio = self._make_silence(duration)
-            tmp_mp4 = output.with_suffix(".mp4.tmp")
+            tmp_mp4 = output.parent / f"{output.stem}_tmp.mp4"
 
             self._assembler.encode_segment(
                 webm_input=str(webm_path),
