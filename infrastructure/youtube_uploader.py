@@ -1,16 +1,18 @@
 """
-infrastructure/youtube_uploader.py — VALUE / QEEMA v11.0 (Production)
+infrastructure/youtube_uploader.py — VALUE / QEEMA v12.0 (Production)
 =========================================================================
 YouTube Data API v3 uploader with:
   - Robust OAuth token refresh (no stale-token failures)
   - Resumable chunked upload with retry
   - Thumbnail upload
   - Proper error classification
+  - Early credential validation (fail-fast)
 
 [Why a self-contained module?]
 - The orchestrator should not know about Google libraries
 - Token caching is per-process; 60-min validity is enforced here
 - Upload failures must be classifiable (network vs auth vs quota)
+- Credentials are validated at construction time, not at upload time
 """
 from __future__ import annotations
 
@@ -51,8 +53,11 @@ class _YouTubeTokenManager:
     ) -> None:
         if not all([client_id, client_secret, refresh_token]):
             raise ConfigurationError(
-                "YouTube credentials incomplete (need CLIENT_ID, "
-                "CLIENT_SECRET, REFRESH_TOKEN)"
+                "YouTube credentials incomplete. Required secrets:\n"
+                "  • YOUTUBE_CLIENT_ID\n"
+                "  • YOUTUBE_CLIENT_SECRET\n"
+                "  • YOUTUBE_REFRESH_TOKEN\n"
+                "\nGet these from: https://console.cloud.google.com/apis/credentials"
             )
         self._client_id: str = client_id
         self._client_secret: str = client_secret
@@ -81,9 +86,12 @@ class _YouTubeTokenManager:
             raise NetworkError(f"YouTube token refresh failed: {e}", cause=e) from e
 
         if resp.status_code == 401 or resp.status_code == 400:
+            error_detail = resp.text[:500]
             raise AuthenticationError(
-                f"YouTube token refresh denied "
-                f"(HTTP {resp.status_code}): {resp.text[:200]}"
+                f"YouTube token refresh denied (HTTP {resp.status_code}). "
+                f"Check that YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, and "
+                f"YOUTUBE_REFRESH_TOKEN are valid.\n\n"
+                f"Error: {error_detail}"
             )
         if resp.status_code != 200:
             raise NetworkError(
@@ -105,6 +113,8 @@ class YouTubeUploader(VideoUploader):
     """
     Production YouTube uploader.
     Uses google-api-python-client for resumable uploads.
+    
+    Validates credentials at construction time (fail-fast pattern).
     """
 
     def __init__(
@@ -117,12 +127,14 @@ class YouTubeUploader(VideoUploader):
         max_retries: int = 5,
         default_language: str = "ar",
     ) -> None:
+        # Fail-fast: validate credentials before any upload attempt
         self._token_manager = _YouTubeTokenManager(
             client_id, client_secret, refresh_token
         )
         self._chunk_size: int = chunk_size_mb * 1024 * 1024
         self._max_retries: int = max_retries
         self._default_language: str = default_language
+        logger.info("✅ YouTube uploader initialized with valid credentials")
 
     def upload(self, request: UploadRequest) -> UploadResult:
         if not Path(request.video_path).exists():
