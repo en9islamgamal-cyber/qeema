@@ -107,6 +107,26 @@ class FFmpegAssembler(VideoAssembler):
         Bitrate(video_cfg.audio_bitrate)
 
     # ───────────────────────────────────────────────────────────
+    # get_duration: required by VideoAssembler interface
+    # ───────────────────────────────────────────────────────────
+    def get_duration(self, path: str) -> float:
+        """
+        Return duration of an audio/video file in seconds.
+
+        Delegates to probe_duration (ffprobe-based). Raises
+        VideoAssemblyError if the file does not exist or ffprobe fails.
+        """
+        p = Path(path)
+        if not p.exists():
+            raise VideoAssemblyError(f"get_duration: file not found: {path}")
+        duration = probe_duration(p)
+        if duration is None:
+            raise VideoAssemblyError(
+                f"get_duration: ffprobe could not read duration for: {path}"
+            )
+        return duration
+
+    # ───────────────────────────────────────────────────────────
     # encode_segment: webm + audio → mp4 (single pass)
     # ───────────────────────────────────────────────────────────
     def encode_segment(
