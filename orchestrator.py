@@ -1,5 +1,5 @@
 """
-orchestrator.py — VALUE / QEEMA v11.0 (Production)
+orchestrator.py — VALUE / QEEMA v12.0 (Production)
 ========================================================
 The Orchestrator coordinates all engines through the episode lifecycle.
 
@@ -13,10 +13,12 @@ The Orchestrator coordinates all engines through the episode lifecycle.
   7. upload        → VideoUploader.upload
   8. cleanup       → ONLY after upload + DB confirmation
 
-[Key Improvements vs v10]
+[Key Improvements vs v11]
+- Idempotency: per-episode key prevents duplicate YouTube uploads
+- Observability: structured spans for every stage, written to spans.jsonl
+- Stage-level metrics: latency histograms + success/failure counters
 - Transactional cleanup: only delete after BOTH upload and DB commit succeed
 - Dependency injection: orchestrator knows nothing about provider details
-- Stage-level metrics: every step is timed and logged
 - Signal-driven shutdown: SIGTERM triggers graceful stop
 - EpisodeRunReport: structured outcome for monitoring
 
@@ -43,6 +45,10 @@ from core.exceptions import (
     QeemaError,
     TransientError,
 )
+from core.idempotency import (
+    CheckpointStore,
+    IdempotencyKey,
+)
 from core.interfaces import (
     EpisodeRepository,
     IntroOutroBuilder,
@@ -56,10 +62,17 @@ from core.interfaces import (
 )
 from core.logging_setup import with_context
 from core.models import EpisodeScript, EpisodeStatus
+from core.observability import SpanEmitter, get_emitter, get_registry
 from engines.script_engine import ScriptEngine
 from engines.voice_engine import VoiceEngine
 
 logger = logging.getLogger(__name__)
+
+
+# Bump this when stages or their inputs change in a way that should
+# invalidate prior checkpoints. The idempotency key incorporates this,
+# so a version change forces a clean replay.
+PIPELINE_VERSION: str = "12.0.0"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -135,6 +148,16 @@ class Orchestrator:
         self.dry_run = dry_run
         self._shutdown_requested: bool = False
 
+        # Checkpoint store: enables idempotent stage replay across crashes.
+        # Checkpoints live under paths.root/state/checkpoints, sharded by
+        # idempotency key prefix.
+        checkpoints_root = paths.root / "state" / "checkpoints"
+        self._checkpoints: CheckpointStore = CheckpointStore(checkpoints_root)
+
+        # Span emitter: structured tracing for forensic debugging.
+        # Picks up the globally configured emitter (set up in main.py).
+        self._emitter: SpanEmitter = get_emitter()
+
     # ───────────────────────────────────────────────────────────
     # Lifecycle
     # ───────────────────────────────────────────────────────────
@@ -180,6 +203,52 @@ class Orchestrator:
         log = with_context(
             logger, episode_number=episode_number, stage="orchestrator"
         )
+
+        # ── Compute an idempotency key BEFORE any side effects.
+        # Same episode + same version + same key inputs → same key,
+        # which lets us skip already-completed stages on replay and
+        # prevents duplicate YouTube uploads after partial failures.
+        idem_key = IdempotencyKey.derive(
+            episode_number=episode_number,
+            pipeline_version=PIPELINE_VERSION,
+            inputs={
+                "voice_id": self.voice_engine._primary_voice_id(),
+                "video_resolution": f"{self.video_cfg.width}x{self.video_cfg.height}",
+                "audio_bitrate": self.video_cfg.audio_bitrate,
+                "fps": self.video_cfg.fps,
+                "dry_run": self.dry_run,
+            },
+        )
+        self._checkpoints.initialize(idem_key, episode_number=episode_number)
+        log.info(f"🔑 idempotency key: {idem_key.value[:8]}... (full in checkpoints)")
+
+        # Wrap the entire run in a top-level span. Every stage span is a
+        # child of this one, so the trace tree mirrors the pipeline.
+        with self._emitter.span(
+            "episode.run",
+            episode_number=episode_number,
+            idempotency_key=idem_key.value,
+            pipeline_version=PIPELINE_VERSION,
+            dry_run=self.dry_run,
+        ):
+            return self._run_pipeline(
+                episode_number=episode_number,
+                report=report,
+                start=start,
+                log=log,
+                idem_key=idem_key,
+            )
+
+    def _run_pipeline(
+        self,
+        *,
+        episode_number: int,
+        report: EpisodeRunReport,
+        start: float,
+        log,
+        idem_key: IdempotencyKey,
+    ) -> EpisodeRunReport:
+        """Pipeline body, extracted so the top-level span context stays clean."""
 
         # ── Phase 0: register with repo
         try:
@@ -257,6 +326,10 @@ class Orchestrator:
             )
 
             # ── Stage 7: Upload
+            # Idempotency-protected: if a previous run completed this stage
+            # but crashed before marking COMPLETED in the DB, the next run
+            # will skip the upload and reuse the recorded video_id.
+            # This prevents duplicate uploads on YouTube.
             if self.dry_run:
                 log.info("🧪 DRY RUN: skipping upload")
                 report.video_url = "dry-run-no-upload"
@@ -264,9 +337,8 @@ class Orchestrator:
             elif self.uploader is None:
                 raise RuntimeError("No uploader configured (and not dry-run)")
             else:
-                result = self._run_stage(
-                    "upload",
-                    lambda: self.uploader.upload(
+                def _do_upload() -> dict:
+                    result = self.uploader.upload(
                         UploadRequest(
                             video_path=str(branded),
                             title=script.youtube_title,
@@ -274,10 +346,20 @@ class Orchestrator:
                             tags=list(script.youtube_tags),
                             thumbnail_path=thumb,
                         )
-                    ),
+                    )
+                    return {
+                        "video_id": result.video_id,
+                        "video_url": result.video_url,
+                        "thumbnail_uploaded": result.thumbnail_uploaded,
+                    }
+
+                upload_result = self._run_stage(
+                    "upload",
+                    _do_upload,
                     report,
+                    idem_key=idem_key,
                 )
-                report.video_url = result.video_url
+                report.video_url = upload_result["video_url"]
                 upload_ok = True
 
             # ── Stage 8: Mark complete in DB
@@ -321,22 +403,88 @@ class Orchestrator:
     # ───────────────────────────────────────────────────────────
     # Internals
     # ───────────────────────────────────────────────────────────
-    def _run_stage(self, name: str, fn, report: EpisodeRunReport) -> Any:
-        start = time.monotonic()
-        try:
-            result = fn()
-            duration = time.monotonic() - start
+    def _run_stage(
+        self,
+        name: str,
+        fn,
+        report: EpisodeRunReport,
+        *,
+        idem_key: Optional[IdempotencyKey] = None,
+    ) -> Any:
+        """
+        Run a pipeline stage with structured tracing and metrics.
+
+        If `idem_key` is supplied AND the stage was already recorded as
+        completed, the function is NOT re-run — the recorded output is
+        returned. This is the crash-recovery path that prevents
+        duplicate YouTube uploads.
+
+        Note: not every stage is checkpoint-replayable in practice. Stages
+        that produce files (render_scenes, concat) can't be replayed if
+        cleanup ran. The caller decides whether to pass idem_key.
+        """
+        registry = get_registry()
+
+        # If we have a key and this stage was already completed, skip work.
+        if idem_key is not None and self._checkpoints.is_completed(idem_key, name):
+            cached = self._checkpoints.get_output(idem_key, name)
+            logger.info(
+                f"⏭️  stage '{name}' already completed; skipping (replay)"
+            )
             report.stages.append(StageResult(
-                name=name, success=True, duration_sec=duration,
+                name=name, success=True, duration_sec=0.0,
+                detail="skipped (idempotent replay)",
             ))
-            return result
-        except Exception as e:
-            duration = time.monotonic() - start
-            report.stages.append(StageResult(
-                name=name, success=False, duration_sec=duration,
-                detail=f"{type(e).__name__}",
-            ))
-            raise
+            registry.counter("pipeline.stage.skipped").inc(
+                labels={"stage": name},
+            )
+            return cached
+
+        with self._emitter.span(f"stage.{name}", stage=name) as span:
+            start = time.monotonic()
+            try:
+                result = fn()
+                duration = time.monotonic() - start
+
+                report.stages.append(StageResult(
+                    name=name, success=True, duration_sec=duration,
+                ))
+                registry.histogram("pipeline.stage.duration_ms").record(
+                    duration * 1000.0,
+                    labels={"stage": name, "outcome": "success"},
+                )
+                registry.counter("pipeline.stage.success").inc(
+                    labels={"stage": name},
+                )
+
+                # Best-effort checkpoint write. Only records dict outputs;
+                # non-dict results aren't checkpoint-replayable but the
+                # stage still ran successfully so we don't fail.
+                if idem_key is not None and isinstance(result, dict):
+                    self._checkpoints.record(
+                        idem_key,
+                        stage=name,
+                        duration_ms=int(duration * 1000),
+                        output=result,
+                    )
+
+                span.set("duration_ms", int(duration * 1000))
+                return result
+            except Exception as e:
+                duration = time.monotonic() - start
+                report.stages.append(StageResult(
+                    name=name, success=False, duration_sec=duration,
+                    detail=f"{type(e).__name__}",
+                ))
+                registry.histogram("pipeline.stage.duration_ms").record(
+                    duration * 1000.0,
+                    labels={"stage": name, "outcome": "failure"},
+                )
+                registry.counter("pipeline.stage.failure").inc(
+                    labels={"stage": name, "error_type": type(e).__name__},
+                )
+                # Span automatically captures the exception via context exit
+                raise
 
     def _render_all_scenes(
         self,
