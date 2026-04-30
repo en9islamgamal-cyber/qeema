@@ -86,9 +86,15 @@ class QeemaError(Exception):
             ctx_parts = []
             for k, v in self.context.items():
                 v_str = repr(v) if not isinstance(v, str) else v
-                # Truncate long values (like stderr_tail) to keep one log line readable
-                if len(v_str) > 1500:
-                    v_str = v_str[:1500] + "...(truncated)"
+                # IMPORTANT: keep the TAIL of long values, not the head.
+                # ffmpeg stderr starts with a long banner of build flags;
+                # the actual error message is at the end. Cutting the
+                # head off destroys diagnostic value.
+                # We allow up to 4000 chars per field — enough to capture
+                # the tail of an ffmpeg stderr including the failing line.
+                MAX_FIELD = 4000
+                if len(v_str) > MAX_FIELD:
+                    v_str = "...(truncated head)..." + v_str[-MAX_FIELD:]
                 ctx_parts.append(f"{k}={v_str}")
             parts.append("context={" + ", ".join(ctx_parts) + "}")
         if self.cause is not None:
@@ -249,4 +255,3 @@ class QualityGateError(PipelineError):
         super().__init__(message, **kwargs)
         self.score: float = score
         self.critiques: List[str] = critiques or []
-
