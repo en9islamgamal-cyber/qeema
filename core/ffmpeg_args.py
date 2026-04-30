@@ -199,6 +199,7 @@ class EncodeSegmentArgs:
             argv += ["-movflags", "+faststart"]
         argv += ["-r", str(self.framerate.fps)]
         argv += ["-s", self.resolution.as_ffmpeg()]
+        argv += ["-f", "mp4"]  # ← CRITICAL FIX: explicit format for .partial files
         argv += [str(self.output)]
         return argv
 
@@ -227,6 +228,7 @@ class ConcatStreamCopyArgs:
         ]
         if self.faststart:
             argv += ["-movflags", "+faststart"]
+        argv += ["-f", "mp4"]  # ← CRITICAL FIX: explicit format for .partial files
         argv += [str(self.output)]
         return argv
 
@@ -254,6 +256,7 @@ class ConcatReencodeArgs:
         argv += self.audio.to_args()
         if self.faststart:
             argv += ["-movflags", "+faststart"]
+        argv += ["-f", "mp4"]  # ← CRITICAL FIX: explicit format for .partial files
         argv += [str(self.output)]
         return argv
 
