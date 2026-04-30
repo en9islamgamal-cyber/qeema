@@ -40,7 +40,7 @@ from core.interfaces import (
     TTSRequest,
     TTSResult,
 )
-from core.models import EpisodeScript
+from core.models import AyahScene, EpisodeScript
 from core.resilience import (
     CircuitBreakerConfig,
     ProviderPool,
@@ -51,6 +51,7 @@ from infrastructure.audio_utils import (
     stable_cache_key,
     validate_audio_file,
 )
+from infrastructure.parallel_quran import ParallelQuranFetcher
 from infrastructure.quran_sources import default_sources
 from infrastructure.tts_providers import (
     ElevenLabsProvider,
@@ -204,6 +205,17 @@ class VoiceEngine:
 
         # Quran fetcher
         self._reciter: _QuranFetcher = _QuranFetcher(paths.quran_cache)
+
+        # Parallel wrapper around the Quran fetcher.
+        # Sequential fetch was a 3-minute bottleneck on long surahs (e.g.
+        # Al-Baqarah, 286 ayahs). With 6 workers this drops to ~30 seconds.
+        # We bound concurrency to be polite to free CDNs.
+        self._parallel_quran: ParallelQuranFetcher = ParallelQuranFetcher(
+            fetch_fn=self._reciter.fetch,
+            max_workers=getattr(engine_cfg, "quran_parallel_workers", 6),
+            per_request_timeout_sec=60.0,
+            fail_fast=False,
+        )
 
         paths.tts_cache.mkdir(parents=True, exist_ok=True)
 
@@ -460,13 +472,56 @@ class VoiceEngine:
             audio_map["outro"] = str(ep_dir / "outro_narrator.mp3")
             script.outro_scene.audio_path = audio_map["outro"]
 
-        # ── Quran fetches (sequential — they're already CDN-fast & cached)
-        for scene in script.ayah_scenes:
-            sid = f"ayah_{scene.scene_id}"
-            p = str(ep_dir / f"{sid}_recitation.mp3")
-            self.fetch_quran(scene.ayah.surah, scene.ayah.number, p)
-            audio_map[f"{sid}_ayah"] = p
-            scene.ayah_audio = p
+        # ── Quran fetches: parallel via ParallelQuranFetcher.
+        # The previous implementation fetched sequentially, which on long
+        # surahs (e.g. Al-Baqarah, 286 ayahs) blocked for ~3 minutes.
+        # Parallel fetch with 6 workers brings this down to ~30 seconds.
+        if script.ayah_scenes:
+            quran_requests: List[QuranAudioRequest] = []
+            request_to_scene: Dict[str, Tuple[str, AyahScene]] = {}
+
+            for scene in script.ayah_scenes:
+                sid = f"ayah_{scene.scene_id}"
+                output_path = str(ep_dir / f"{sid}_recitation.mp3")
+                req = QuranAudioRequest(
+                    surah=scene.ayah.surah,
+                    ayah=scene.ayah.number,
+                    output_path=output_path,
+                    reciter="alafasy",
+                )
+                quran_requests.append(req)
+                request_to_scene[output_path] = (sid, scene)
+
+            logger.info(
+                f"📥 Fetching {len(quran_requests)} Quran ayahs in parallel"
+            )
+            batch = self._parallel_quran.fetch_batch(quran_requests)
+
+            # Wire successful fetches back into the audio_map and scene refs.
+            for path in batch.successes:
+                sid, scene = request_to_scene[path]
+                audio_map[f"{sid}_ayah"] = path
+                scene.ayah_audio = path
+
+            # Any failure during Quran fetch is fatal — we cannot ship an
+            # episode without complete recitation. Surface a clear error
+            # listing which ayahs failed so the operator can act.
+            if batch.failures:
+                first_failure_path = next(iter(batch.failures))
+                first_failure_exc = batch.failures[first_failure_path]
+                _, failed_scene = request_to_scene[first_failure_path]
+                failure_summary = "; ".join(
+                    f"{Path(p).name}: {type(e).__name__}"
+                    for p, e in list(batch.failures.items())[:5]
+                )
+                raise QuranFetchError(
+                    surah=failed_scene.ayah.surah,
+                    ayah=failed_scene.ayah.number,
+                    sources_tried=[],
+                    cause=Exception(
+                        f"{len(batch.failures)} ayah(s) failed: {failure_summary}"
+                    ),
+                ) from first_failure_exc
 
         logger.info(f"✅ Episode audio: {len(audio_map)} files generated")
         return audio_map
