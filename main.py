@@ -1,12 +1,12 @@
 """
-main.py — VALUE / QEEMA v11.0 (Production)
+main.py — VALUE / QEEMA v12.0 (Production)
 ==================================================
 Composition root — wires everything together.
 
 [Responsibilities]
   1. Parse CLI arguments
   2. Load + validate config
-  3. Setup logging
+  3. Setup logging + observability
   4. Build infrastructure (DB, browser pool, ffmpeg)
   5. Build engines (script, voice, visual, intro/outro, thumbnail)
   6. Build orchestrator with all dependencies
@@ -34,6 +34,7 @@ from typing import Optional
 from core.config import AppConfig
 from core.exceptions import ConfigurationError
 from core.logging_setup import setup_logging
+from core.observability import SpanEmitter, configure_emitter, get_registry
 from data.curriculum import total_episodes
 from engines.intro_outro_engine import IntroOutroEngine
 from engines.quality_validator import ScriptQualityValidator
@@ -47,7 +48,7 @@ from infrastructure.repository_supabase import SupabaseRepository
 from infrastructure.youtube_uploader import YouTubeUploader
 from orchestrator import Orchestrator
 
-VERSION: str = "11.0.0"
+VERSION: str = "12.0.0"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -248,6 +249,14 @@ def main() -> int:
     log = logging.getLogger("main")
     log.info(f"🟢 QEEMA v{VERSION} starting (root={project_root})")
 
+    # ── 2b. Setup observability (structured tracing).
+    # Spans go to logs/spans.jsonl as one JSON object per line. CI can
+    # upload this as an artifact for post-mortem analysis. The file is
+    # append-only; clean logs/ between runs if rotation matters.
+    spans_path = config.paths.logs / "spans.jsonl"
+    configure_emitter(SpanEmitter(jsonl_path=spans_path, also_log=False))
+    log.info(f"📊 Observability: spans → {spans_path}")
+
     # ── 3. Read-only ops (no orchestrator needed)
     if args.status:
         return _print_status(config)
@@ -299,6 +308,16 @@ def main() -> int:
             orchestrator.shutdown()
         except Exception as e:
             log.warning(f"⚠️ shutdown error: {e}")
+
+        # Persist metrics snapshot for post-run analysis. Atomic write —
+        # if the process is killed mid-write, the previous snapshot
+        # stays intact.
+        try:
+            metrics_path = config.paths.logs / "metrics.json"
+            get_registry().write_snapshot(metrics_path)
+            log.info(f"📊 Metrics snapshot → {metrics_path}")
+        except Exception as e:
+            log.warning(f"⚠️ Failed to write metrics snapshot: {e}")
 
 
 if __name__ == "__main__":
