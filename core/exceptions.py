@@ -249,3 +249,4 @@ class QualityGateError(PipelineError):
         super().__init__(message, **kwargs)
         self.score: float = score
         self.critiques: List[str] = critiques or []
+
