@@ -79,6 +79,20 @@ class QeemaError(Exception):
             parts.append(f"stage={self.stage}")
         if self.episode_number is not None:
             parts.append(f"episode={self.episode_number}")
+        if self.context:
+            # Render context inline so e.g. f"{e}" shows the diagnostic detail.
+            # Without this, log.error(f"❌ Fatal error: {e}") drops the context
+            # and operators see only the headline message.
+            ctx_parts = []
+            for k, v in self.context.items():
+                v_str = repr(v) if not isinstance(v, str) else v
+                # Truncate long values (like stderr_tail) to keep one log line readable
+                if len(v_str) > 1500:
+                    v_str = v_str[:1500] + "...(truncated)"
+                ctx_parts.append(f"{k}={v_str}")
+            parts.append("context={" + ", ".join(ctx_parts) + "}")
+        if self.cause is not None:
+            parts.append(f"cause={type(self.cause).__name__}: {self.cause}")
         return " | ".join(parts)
 
 
