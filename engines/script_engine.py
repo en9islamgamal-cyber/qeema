@@ -1,22 +1,9 @@
 """
-engines/script_engine.py — VALUE / QEEMA v11.0 (Production)
-=================================================================
-LLM-driven script generation.
-
-[Pipeline]
-1. Validate episode_number against curriculum
-2. Check on-disk cache (atomic resume)
-3. Fetch verified ayah text from Quran API
-4. Generate intro / per-ayah / outro via LLM pool
-5. Run quality gate
-6. Persist atomically
-
-[Key Improvements vs v10]
-- ProviderPool replaces shared-state self.ptr (thread-safe, circuit-breaker)
-- Iterative retry per ayah (no recursion)
-- Quality gate IS wired in (was dead code before)
-- Atomic file persistence (no half-written caches)
-- Stable typing via core.models (Pydantic validation at every step)
+engines/script_engine.py — VALUE / QEEMA v13.0 (Full Human‑like Speech + Smart Crafting)
+============================================================================================
+- Smart batch prompt crafting (one template per surah)
+- Diacritic removal + natural pauses
+- Optional SSML wrapping for ElevenLabs professional TTS
 """
 from __future__ import annotations
 
@@ -24,6 +11,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -102,6 +90,8 @@ _ARABIC_STOPWORDS: frozenset[str] = frozenset({
 })
 
 _PUNCT_RE = re.compile(r'[،.؟!:؛"\'()\[\]{}]')
+_TASHKEEL_RE = re.compile(r'[\u064B-\u0652]')  # Arabic diacritics
+_PUNCTUATION_SET = {'.', '،', '؛', '؟', '!', ':'}
 
 
 def pick_visual_scene(text: str) -> str:
@@ -133,6 +123,60 @@ def extract_keywords(text: str, *, max_words: int = 5) -> List[str]:
 
 
 # ════════════════════════════════════════════════════════════════
+# Humanization for TTS
+# ════════════════════════════════════════════════════════════════
+def humanize_arabic(text: str) -> str:
+    """
+    Remove all diacritics, ensure final punctuation,
+    and add a natural mid-sentence pause for long sentences.
+    """
+    if not text:
+        return text
+
+    # Remove tashkeel
+    cleaned = _TASHKEEL_RE.sub('', text)
+    # Normalize combining marks
+    cleaned = unicodedata.normalize('NFKD', cleaned)
+    cleaned = ''.join(c for c in cleaned if not unicodedata.combining(c))
+
+    # Ensure a sentence-ending pause mark
+    if cleaned and cleaned[-1] not in _PUNCTUATION_SET:
+        cleaned += '.'
+
+    # Insert a breath comma if the sentence is long and lacks internal punctuation
+    if len(cleaned) > 40 and '،' not in cleaned and '.' not in cleaned[:-1]:
+        words = cleaned.split()
+        if len(words) > 5:
+            insert_pos = len(' '.join(words[:3]))
+            cleaned = cleaned[:insert_pos] + '، ' + cleaned[insert_pos:]
+
+    return cleaned.strip()
+
+
+def to_elevenlabs_ssml(text: str, voice_style: str = "conversational") -> str:
+    """
+    Wrap humanized Arabic text in SSML suitable for ElevenLabs.
+    - Replaces commas and periods with break tags for realistic breathing.
+    - Wraps in <prosody> with default conversational settings.
+    """
+    # Insert breaks at natural punctuation
+    ssml_text = text.replace("،", "،<break time='400ms'/>")
+    ssml_text = ssml_text.replace(".", ".<break time='600ms'/>")
+    ssml_text = ssml_text.replace("؟", "؟<break time='500ms'/>")
+    ssml_text = ssml_text.replace("!", "!<break time='500ms'/>")
+
+    # Wrap with speak and prosody
+    ssml = (
+        f'<speak>'
+        f'<prosody rate="medium" pitch="+0%" volume="+0dB">'
+        f'{ssml_text}'
+        f'</prosody>'
+        f'</speak>'
+    )
+    return ssml
+
+
+# ════════════════════════════════════════════════════════════════
 # Mood → Palette mapping
 # ════════════════════════════════════════════════════════════════
 def mood_to_palette(scene_type: str) -> str:
@@ -148,10 +192,42 @@ def mood_to_palette(scene_type: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════════
+# Meta‑prompts for intelligent prompt crafting
+# ════════════════════════════════════════════════════════════════
+META_SYSTEM_PROMPT = (
+    "أنت مهندس أوامر (Prompt Engineer) خبير في كتابة تعليمات لمحرك ذكاء اصطناعي "
+    "يعمل كحكواتي مصري للأطفال (5-8 سنوات). مهمتك هي صياغة برومبت تفصيلي بالعامية المصرية "
+    "يُستخدم كمدخل للحكواتي ليولّد سكريبت قصة قرآنية عالي الجودة. اكتب البرومبت فقط بلا أي شرح."
+)
+
+META_INTRO_TEMPLATE = (
+    "اكتب برومبت للحكواتي عشان يقدم مقدمة حلقة عن سورة {surah_name} للأطفال. "
+    "البرومبت لازم يطلب: عنوان حلو وجذاب، وصف يوتيوب مشوق (~150 كلمة)، 5 وسوم عربية، "
+    "مقدمة دافئة بالعامية المصرية (max 30 كلمة)، ومشهد بصري بديع (visual_prompt) بالإنجليزي. "
+    "أضف تعليمات عن النبرة الدافئة وربط اسم السورة بحياة الطفل. التنسيق المطلوب JSON "
+    "(title, youtube_title, youtube_description, youtube_tags, intro_text, visual_prompt)."
+)
+
+META_AYAH_TEMPLATE_BATCH = (
+    "اكتب برومبت واحداً (template) بالعامية المصرية يُستخدم كتعليمات للحكواتي لشرح أي آية "
+    "من سورة {surah_name} للأطفال. البرومبت لازم يحتوي على المتغير `{{ayah_text}}` "
+    "اللي هيتم استبداله بنص الآية الحقيقية وقت التشغيل. اطلب من الحكواتي يشرح بأسلوب قصة "
+    "من حياة الطفل، يستخدم ألفاظ مصرية، ويتجنب الترهيب. ويكون التنسيق JSON بحقول "
+    "(intro_text, explain_text, visual_prompt)."
+)
+
+META_OUTRO_TEMPLATE = (
+    "اكتب برومبت للحكواتي عشان يعمل خاتمة حلقة قرآنية للأطفال. البرومبت لازم يطلب: "
+    "دعاء قصير قبل النوم بالعامية المصرية (max 30 كلمة)، ومشهد ليلي جميل (visual_prompt بالإنجليزي). "
+    "التنسيق JSON (narrator_text, visual_prompt)."
+)
+
+
+# ════════════════════════════════════════════════════════════════
 # ScriptEngine
 # ════════════════════════════════════════════════════════════════
 class ScriptEngine:
-    """Production script generation engine."""
+    """Production script generation engine with full TTS optimizations."""
 
     def __init__(
         self,
@@ -164,6 +240,15 @@ class ScriptEngine:
         self._paths: PathsConfig = paths
         self._engine_cfg: EngineConfig = engine_cfg
         self._quality_validator: Optional[QualityValidator] = quality_validator
+
+        # Smart crafting flags
+        self._enable_crafting: bool = getattr(engine_cfg, "enable_prompt_crafting", False)
+        self._crafting_model: str = getattr(engine_cfg, "prompt_crafting_model", "gemini-2.5-flash")
+        self._crafting_adapter = None
+
+        # ElevenLabs SSML flag
+        self._add_ssml: bool = getattr(engine_cfg, "add_ssml", False)
+
         self._adapters: Dict[str, LLMProvider] = {}
         self._pool: ProviderPool = ProviderPool(
             "script_llm", strategy="round_robin"
@@ -211,11 +296,66 @@ class ScriptEngine:
             f"{list(self._adapters.keys())}"
         )
 
+        if self._enable_crafting:
+            if api_keys.gemini_keys:
+                try:
+                    self._crafting_adapter = GeminiJsonAdapter(
+                        api_keys.gemini_keys[0],
+                        model=self._crafting_model,
+                        instance_name="crafting-gemini",
+                    )
+                    logger.info(
+                        f"🧠 Prompt crafting ENABLED using model '{self._crafting_model}'"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to create crafting adapter: {e}. Crafting disabled.")
+                    self._enable_crafting = False
+            else:
+                logger.warning("No Gemini key available for crafting. Crafting disabled.")
+                self._enable_crafting = False
+
+    # ───────────────────────────────────────────────────────────
+    # Prompt crafting
+    # ───────────────────────────────────────────────────────────
+    def _craft_prompt(
+        self,
+        context_type: str,
+        info: Optional[SurahInfo] = None,
+    ) -> str:
+        if not self._enable_crafting or self._crafting_adapter is None:
+            return ""
+
+        if context_type == "intro":
+            meta_prompt = META_INTRO_TEMPLATE.format(surah_name=info["name"])
+        elif context_type == "ayah_template":
+            meta_prompt = META_AYAH_TEMPLATE_BATCH.format(surah_name=info["name"])
+        elif context_type == "outro":
+            meta_prompt = META_OUTRO_TEMPLATE
+        else:
+            logger.error(f"Unknown crafting context: {context_type}")
+            return ""
+
+        try:
+            adapter = self._crafting_adapter
+            if hasattr(adapter, "generate_text"):
+                crafted = adapter.generate_text(meta_prompt, system=META_SYSTEM_PROMPT)
+                if crafted:
+                    logger.info(f"✨ Crafted {context_type} prompt (first 80 chars): {crafted[:80]}...")
+                    return crafted.strip()
+                else:
+                    logger.warning(f"Crafted prompt for {context_type} is empty.")
+                    return ""
+            else:
+                logger.error("Crafting adapter lacks generate_text(); skipping")
+                return ""
+        except Exception as e:
+            logger.warning(f"Crafting failed for {context_type}: {e}")
+            return ""
+
     # ───────────────────────────────────────────────────────────
     # Public API
     # ───────────────────────────────────────────────────────────
     def load_from_disk(self, episode_number: int) -> Optional[EpisodeScript]:
-        """Load + validate cached script. Returns None if missing or invalid."""
         path = self._script_path(episode_number)
         if not path.exists():
             return None
@@ -224,26 +364,14 @@ class ScriptEngine:
                 path.read_text(encoding="utf-8")
             )
         except Exception as e:
-            logger.warning(
-                f"⚠️ Cached script {episode_number} invalid; regenerating: {e}"
-            )
+            logger.warning(f"⚠️ Cached script {episode_number} invalid; regenerating: {e}")
             return None
 
     def generate(self, episode_number: int) -> EpisodeScript:
-        """
-        Generate (or load) a complete EpisodeScript.
-
-        Raises:
-            ValidationError, ScriptGenerationError, QualityGateError
-        """
         try:
             info: SurahInfo = get_episode_info(episode_number)
         except KeyError as e:
-            raise ValidationError(
-                str(e),
-                episode_number=episode_number,
-                stage="script.lookup",
-            ) from e
+            raise ValidationError(str(e), episode_number=episode_number, stage="script.lookup") from e
 
         cached = self.load_from_disk(episode_number)
         if cached:
@@ -256,36 +384,25 @@ class ScriptEngine:
         )
 
         try:
-            ayahs = fetch_verified_ayahs(
-                info["surah"], info["start"], info["end"],
-            )
+            ayahs = fetch_verified_ayahs(info["surah"], info["start"], info["end"])
             intro_data = self._generate_intro(info)
-            ayah_scenes_data = self._generate_ayah_scenes(
-                ayahs, episode_number,
-            )
+            ayah_scenes_data = self._generate_ayah_scenes(ayahs, episode_number, info)
             outro_data = self._generate_outro()
-            script_dict = self._assemble(
-                episode_number, info, intro_data, ayah_scenes_data, outro_data,
-            )
+            script_dict = self._assemble(episode_number, info, intro_data, ayah_scenes_data, outro_data)
 
-            # Pydantic validation (catches LLM schema issues)
             script = EpisodeScript.model_validate(script_dict)
 
-            # Quality gate
             if self._quality_validator is not None:
                 report = self._quality_validator.validate(script_dict)
                 if not report.passed:
                     raise QualityGateError(
-                        f"Quality below threshold "
-                        f"(score={report.overall_score:.1f}/100)",
+                        f"Quality below threshold (score={report.overall_score:.1f}/100)",
                         score=report.overall_score,
                         critiques=report.critiques,
                         episode_number=episode_number,
                         stage="script.quality",
                     )
-                logger.info(
-                    f"✅ Quality: {report.overall_score:.1f}/100"
-                )
+                logger.info(f"✅ Quality: {report.overall_score:.1f}/100")
 
             self._save_atomic(episode_number, script)
             return script
@@ -306,21 +423,16 @@ class ScriptEngine:
     # ───────────────────────────────────────────────────────────
     # LLM invocation
     # ───────────────────────────────────────────────────────────
-    def _call_llm(
-        self,
-        prompt: str,
-        system: str = EGYPTIAN_SYSTEM_PROMPT,
-    ) -> Dict[str, Any]:
-        """Call LLM via pool. Failover handled inside ProviderPool."""
+    def _call_llm(self, prompt: str, system: str = EGYPTIAN_SYSTEM_PROMPT) -> Dict[str, Any]:
         def _invoke(provider_name: str) -> Dict[str, Any]:
             return self._adapters[provider_name].generate_json(prompt, system)
         return self._pool.execute(_invoke)
 
     # ───────────────────────────────────────────────────────────
-    # Stage prompts
+    # Stage prompts (crafting + fallback)
     # ───────────────────────────────────────────────────────────
     def _generate_intro(self, info: SurahInfo) -> Dict[str, Any]:
-        prompt = (
+        default_prompt = (
             f"اكتب مقدمة بالعامية المصرية لحلقة عن سورة {info['name']} للأطفال.\n"
             "أجب بـ JSON صالح بالحقول:\n"
             "- title (string)\n"
@@ -330,29 +442,35 @@ class ScriptEngine:
             "- intro_text (string, max 30 words)\n"
             "- visual_prompt (English short, 2D flat illustration)\n"
         )
-        return self._call_llm(prompt)
+        crafted = self._craft_prompt("intro", info=info)
+        return self._call_llm(crafted if crafted else default_prompt)
 
     def _generate_outro(self) -> Dict[str, Any]:
-        prompt = (
+        default_prompt = (
             "اكتب خاتمة بالعامية المصرية تتضمن دعاء قبل النوم لطفل.\n"
             "أجب بـ JSON بالحقول:\n"
             "- narrator_text (string, max 30 words)\n"
             "- visual_prompt (English short)\n"
         )
-        return self._call_llm(prompt)
+        crafted = self._craft_prompt("outro")
+        return self._call_llm(crafted if crafted else default_prompt)
 
     def _generate_ayah_scenes(
         self,
         ayahs: List[Dict[str, Any]],
         episode_number: int,
+        info: SurahInfo,
     ) -> List[Dict[str, Any]]:
+        crafted_template = self._craft_prompt("ayah_template", info=info)
+
         scenes: List[Dict[str, Any]] = []
         for i, ayah in enumerate(ayahs):
-            logger.info(
-                f"📖 [ep{episode_number}] generating ayah {ayah['number']}"
-            )
-            data = self._generate_one_ayah(
-                ayah, episode_number, attempts=self._engine_cfg.script_max_ayah_attempts,
+            logger.info(f"📖 [ep{episode_number}] generating ayah {ayah['number']}")
+            data = self._generate_one_ayah_with_template(
+                ayah,
+                episode_number,
+                attempts=self._engine_cfg.script_max_ayah_attempts,
+                crafted_template=crafted_template,
             )
             combined = f"{ayah['text']} {data.get('explain_text', '')}"
             scene_type = pick_visual_scene(combined)
@@ -368,36 +486,40 @@ class ScriptEngine:
             })
         return scenes
 
-    def _generate_one_ayah(
+    def _generate_one_ayah_with_template(
         self,
         ayah: Dict[str, Any],
         episode_number: int,
         *,
         attempts: int,
+        crafted_template: str,
     ) -> Dict[str, Any]:
-        prompt = (
-            f"الآية: {ayah['text']}\n\n"
-            "اشرحها بالعامية المصرية لطفل صغير. اربطها بموقف من حياته اليومية.\n"
-            "أجب بـ JSON بالحقول:\n"
-            "- intro_text (string, max 25 words)\n"
-            "- explain_text (string, max 35 words)\n"
-            "- visual_prompt (English short, 2D illustration)\n"
-        )
+        if crafted_template:
+            if "{ayah_text}" not in crafted_template:
+                logger.warning("Crafted template missing {ayah_text}, using it as-is with appended ayah.")
+                final_prompt = crafted_template + f"\n\nالآية: {ayah['text']}"
+            else:
+                final_prompt = crafted_template.replace("{ayah_text}", ayah["text"])
+        else:
+            final_prompt = (
+                f"الآية: {ayah['text']}\n\n"
+                "اشرحها بالعامية المصرية لطفل صغير. اربطها بموقف من حياته اليومية.\n"
+                "أجب بـ JSON بالحقول:\n"
+                "- intro_text (string, max 25 words)\n"
+                "- explain_text (string, max 35 words)\n"
+                "- visual_prompt (English short, 2D illustration)\n"
+            )
+
         last_err: Optional[Exception] = None
         for attempt in range(1, attempts + 1):
             try:
-                data = self._call_llm(prompt)
-                # Verify schema
+                data = self._call_llm(final_prompt)
                 if not data.get("intro_text") or not data.get("explain_text"):
-                    raise ValidationError(
-                        f"Missing intro_text/explain_text in ayah {ayah['number']}"
-                    )
+                    raise ValidationError(f"Missing fields in ayah {ayah['number']}")
                 return data
             except Exception as e:
                 last_err = e
-                logger.warning(
-                    f"⚠️ Ayah {ayah['number']} attempt {attempt}/{attempts}: {e}"
-                )
+                logger.warning(f"⚠️ Ayah {ayah['number']} attempt {attempt}/{attempts}: {e}")
                 if attempt < attempts:
                     time.sleep(2.0 * attempt)
 
@@ -410,7 +532,7 @@ class ScriptEngine:
         )
 
     # ───────────────────────────────────────────────────────────
-    # Assembly
+    # Assembly (with humanization & optional SSML)
     # ───────────────────────────────────────────────────────────
     def _assemble(
         self,
@@ -420,27 +542,28 @@ class ScriptEngine:
         ayah_scenes: List[Dict[str, Any]],
         outro: Dict[str, Any],
     ) -> Dict[str, Any]:
-        intro_text: str = intro.get("intro_text", "")
-        outro_text: str = outro.get("narrator_text", "")
-        intro_scene_type = pick_visual_scene(intro_text + " " + info["name"])
+        intro_text = humanize_arabic(intro.get("intro_text", ""))
+        outro_text = humanize_arabic(outro.get("narrator_text", ""))
 
-        return {
+        # Process ayah scenes: humanize narration texts
+        for scene in ayah_scenes:
+            scene["intro_text"] = humanize_arabic(scene.get("intro_text", ""))
+            scene["explain_text"] = humanize_arabic(scene.get("explain_text", ""))
+
+        # --- Optional SSML variants for ElevenLabs ---
+        result = {
             "episode_number": episode_number,
             "surah_name": info["name"],
             "title": intro.get("title", f"سورة {info['name']}"),
-            "youtube_title": intro.get(
-                "youtube_title", f"سورة {info['name']} للأطفال"
-            ),
+            "youtube_title": intro.get("youtube_title", f"سورة {info['name']} للأطفال"),
             "youtube_description": intro.get("youtube_description", ""),
-            "youtube_tags": intro.get(
-                "youtube_tags", [info["name"], "قرآن", "أطفال"]
-            ),
+            "youtube_tags": intro.get("youtube_tags", [info["name"], "قرآن", "أطفال"]),
             "intro_scene": {
                 "scene_id": 1,
                 "scene_type": "intro",
                 "narrator_text": intro_text,
                 "visual_prompt": intro.get("visual_prompt", ""),
-                "visual_scene": intro_scene_type,
+                "visual_scene": pick_visual_scene(intro_text + " " + info["name"]),
                 "palette": "golden_hour",
                 "keywords": extract_keywords(intro_text),
                 "mood": "intro",
@@ -459,6 +582,16 @@ class ScriptEngine:
             },
         }
 
+        if self._add_ssml:
+            # Add SSML representations for all narrator texts
+            result["intro_scene"]["narrator_text_ssml"] = to_elevenlabs_ssml(intro_text)
+            result["outro_scene"]["narrator_text_ssml"] = to_elevenlabs_ssml(outro_text)
+            for scene in result["ayah_scenes"]:
+                scene["intro_text_ssml"] = to_elevenlabs_ssml(scene["intro_text"])
+                scene["explain_text_ssml"] = to_elevenlabs_ssml(scene["explain_text"])
+
+        return result
+
     # ───────────────────────────────────────────────────────────
     # Persistence
     # ───────────────────────────────────────────────────────────
@@ -469,9 +602,6 @@ class ScriptEngine:
         path = self._script_path(episode_number)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(
-            script.model_dump_json(indent=2),
-            encoding="utf-8",
-        )
+        tmp.write_text(script.model_dump_json(indent=2), encoding="utf-8")
         tmp.replace(path)
         logger.info(f"✅ Script saved: {path}")
