@@ -1,14 +1,14 @@
 """
-core/config.py — VALUE / QEEMA v11.0 (Production)
+core/config.py — VALUE / QEEMA v13.0 (Production)
 =====================================================
 Centralized configuration with explicit validation.
 
-[Design Goals]
-1. Fail fast: invalid config caught at startup, not deep in pipeline
-2. Single source of truth: all knobs live here
-3. Environment-aware: prod vs test settings via env vars
-4. Type-safe: dataclasses with explicit types
-5. No hidden state: dataclasses are frozen where possible
+[New in v13.0]
+- EngineConfig now includes:
+  - enable_prompt_crafting (bool)
+  - prompt_crafting_model (str)
+  - add_ssml (bool)
+  (These power the intelligent two‑stage generation and ElevenLabs SSML output.)
 """
 from __future__ import annotations
 
@@ -231,20 +231,24 @@ class ProceduralConfig:
 
 
 # ════════════════════════════════════════════════════════════════
-# 7. Engine tuning (concurrency, retries)
+# 7. Engine tuning (concurrency, retries) – now with smart crafting & SSML
 # ════════════════════════════════════════════════════════════════
 @dataclass(frozen=True)
 class EngineConfig:
-    # ScriptEngine
+    # Original settings
     script_max_ayah_attempts: int = 3
-    # VoiceEngine
     voice_parallel_workers: int = 4
     voice_enable_cache: bool = True
-    # VisualRenderer
     render_scene_timeout_sec: int = 120
-    # Uploader
     upload_chunk_size_mb: int = 5
     upload_max_retries: int = 5
+
+    # 🧠 Intelligent prompt crafting
+    enable_prompt_crafting: bool = False
+    prompt_crafting_model: str = "gemini-2.5-flash"  # can use "gemini-2.5-pro" for deeper reasoning
+
+    # 🎙️ ElevenLabs SSML output
+    add_ssml: bool = False  # When True, every narration field gets an _ssml variant
 
 
 # ════════════════════════════════════════════════════════════════
