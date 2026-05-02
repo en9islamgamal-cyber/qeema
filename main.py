@@ -1,5 +1,5 @@
 """
-main.py — VALUE / QEEMA v12.0 (Production)
+main.py — VALUE / QEEMA v13.0 (Production)
 ==================================================
 Composition root — wires everything together.
 
@@ -13,12 +13,9 @@ Composition root — wires everything together.
   7. Install signal handlers for graceful shutdown
   8. Run requested operation
 
-[Operations]
-  --episode N        : run episode #N
-  --next            : run next pending from queue (default)
-  --status          : print episode dashboard
-  --dry-run         : skip YouTube upload
-  --list-voices     : print available TTS providers
+[New in v13.0]
+  - Environment‑driven intelligent prompt crafting (QEEMA_CRAFTING)
+  - Optional ElevenLabs SSML output (QEEMA_SSML)
 """
 from __future__ import annotations
 
@@ -31,7 +28,7 @@ import traceback
 from pathlib import Path
 from typing import Optional
 
-from core.config import AppConfig
+from core.config import AppConfig, EngineConfig
 from core.exceptions import ConfigurationError
 from core.logging_setup import setup_logging
 from core.observability import SpanEmitter, configure_emitter, get_registry
@@ -48,7 +45,7 @@ from infrastructure.repository_supabase import SupabaseRepository
 from infrastructure.youtube_uploader import YouTubeUploader
 from orchestrator import Orchestrator
 
-VERSION: str = "12.0.0"
+VERSION: str = "13.0.0"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -158,16 +155,14 @@ def _build_orchestrator(
         assembler=assembler,
     )
 
-    # IntroOutro shares the visual renderer's browser pool to avoid
-    # launching two Chromium instances. We expose it via the renderer's
-    # internal attribute (clean coupling: same pool object).
+    # IntroOutro shares the visual renderer's browser pool
     intro_outro = IntroOutroEngine(
         paths=config.paths,
         video_cfg=config.video,
         proc_cfg=config.procedural,
         branding=config.branding,
         assembler=assembler,
-        browser_pool=visual_renderer._pool,  # noqa: SLF001  (intentional sharing)
+        browser_pool=visual_renderer._pool,  # noqa: SLF001
     )
 
     thumbnail_builder = ThumbnailEngine(
@@ -237,6 +232,25 @@ def main() -> int:
     project_root = Path(__file__).parent.resolve()
     config = AppConfig.load(project_root)
 
+    # 🧠 Override engine config with new features from environment
+    crafting_enabled = os.getenv("QEEMA_CRAFTING", "false").lower() in ("1", "true", "yes")
+    ssml_enabled = os.getenv("QEEMA_SSML", "false").lower() in ("1", "true", "yes")
+    if crafting_enabled or ssml_enabled:
+        # Since AppConfig is frozen, we replace the engine field
+        new_engine = EngineConfig(
+            script_max_ayah_attempts=config.engine.script_max_ayah_attempts,
+            voice_parallel_workers=config.engine.voice_parallel_workers,
+            voice_enable_cache=config.engine.voice_enable_cache,
+            render_scene_timeout_sec=config.engine.render_scene_timeout_sec,
+            upload_chunk_size_mb=config.engine.upload_chunk_size_mb,
+            upload_max_retries=config.engine.upload_max_retries,
+            enable_prompt_crafting=crafting_enabled,
+            prompt_crafting_model=config.engine.prompt_crafting_model,  # keep default model
+            add_ssml=ssml_enabled,
+        )
+        # Use object.__setattr__ to bypass frozen dataclass (safe: we own it)
+        object.__setattr__(config, 'engine', new_engine)
+
     try:
         config.validate()
     except ConfigurationError as e:
@@ -249,10 +263,7 @@ def main() -> int:
     log = logging.getLogger("main")
     log.info(f"🟢 QEEMA v{VERSION} starting (root={project_root})")
 
-    # ── 2b. Setup observability (structured tracing).
-    # Spans go to logs/spans.jsonl as one JSON object per line. CI can
-    # upload this as an artifact for post-mortem analysis. The file is
-    # append-only; clean logs/ between runs if rotation matters.
+    # ── 2b. Setup observability
     spans_path = config.paths.logs / "spans.jsonl"
     configure_emitter(SpanEmitter(jsonl_path=spans_path, also_log=False))
     log.info(f"📊 Observability: spans → {spans_path}")
@@ -282,7 +293,6 @@ def main() -> int:
         try:
             signal.signal(sig, _shutdown)
         except (ValueError, OSError):
-            # Some platforms (Windows, certain containers) don't support all signals
             pass
 
     # ── 6. Execute
@@ -309,9 +319,6 @@ def main() -> int:
         except Exception as e:
             log.warning(f"⚠️ shutdown error: {e}")
 
-        # Persist metrics snapshot for post-run analysis. Atomic write —
-        # if the process is killed mid-write, the previous snapshot
-        # stays intact.
         try:
             metrics_path = config.paths.logs / "metrics.json"
             get_registry().write_snapshot(metrics_path)
