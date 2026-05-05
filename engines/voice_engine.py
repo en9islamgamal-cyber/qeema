@@ -347,6 +347,65 @@ class VoiceEngine:
             )
         return results
 
+    # ════════════════════════════════════════════════════════════════
+    # v20: Per-scene combined synthesis (cost optimization)
+    # ════════════════════════════════════════════════════════════════
+    def synthesize_combined(
+        self,
+        segments: List[Tuple[str, str]],
+        output_path: str,
+        *,
+        emotion: str = "warm",
+        join_pause_ms: int = 600,
+    ) -> TTSResult:
+        """
+        v20: Synthesize multiple text segments as ONE TTS call.
+
+        Joins segments with SSML <break> tags, calls API once, returns
+        combined audio. Eliminates per-segment overhead.
+
+        Args:
+            segments: List of (text, label) — label is for logging only
+            output_path: Where to save combined audio
+            emotion: Voice emotion override
+            join_pause_ms: Pause between segments (default 600ms)
+
+        Returns:
+            Single TTSResult for the combined audio.
+
+        [Cost saving]
+            Old: 5 segments × ~80 char overhead per request = 400 wasted chars
+            New: 1 request with 5 segments + 4 breaks = minimal overhead
+
+        [Use case]
+            Per-ayah scene has hook + intro + analogy + explain + moral.
+            Instead of 5 separate calls, synthesize as one and use
+            silence detection / segment markers to split for video.
+        """
+        if not segments:
+            raise AudioGenerationError("No segments provided")
+
+        # Filter empty segments
+        valid_segments = [(t, lbl) for t, lbl in segments if t and t.strip()]
+        if not valid_segments:
+            raise AudioGenerationError("All segments empty")
+
+        # Build combined text with SSML breaks
+        # eleven_multilingual_v2 supports <break time="Xms"/>
+        joiner = f'<break time="{join_pause_ms}ms"/>'
+        combined_text = joiner.join(t for t, _ in valid_segments)
+
+        labels = [lbl for _, lbl in valid_segments]
+        char_total = sum(len(t) for t, _ in valid_segments)
+        logger.info(
+            f"🎙️ Combined TTS: {len(valid_segments)} segments → {char_total} chars "
+            f"({', '.join(labels)})"
+        )
+
+        # Call standard synthesize with the combined text
+        # (synthesize handles emotion via TTSRequest.emotion if supported)
+        return self.synthesize(combined_text, output_path)
+
     def fetch_quran(
         self,
         surah: int,

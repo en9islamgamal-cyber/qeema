@@ -195,11 +195,11 @@ class Orchestrator:
 
     # ─── Lifecycle ───────────────────────────────────────────────
     def warmup(self) -> None:
-        logger.info("🔥 Warming up v19 orchestrator")
+        logger.info("🔥 Warming up v20 orchestrator")
         self.visual_renderer.warmup()
         self.intro_outro.build_intro()
         self.intro_outro.build_outro()
-        logger.info("✅ Orchestrator v19 warm")
+        logger.info("✅ Orchestrator v20 warm")
 
     def shutdown(self) -> None:
         logger.info("🧹 Shutting down orchestrator")

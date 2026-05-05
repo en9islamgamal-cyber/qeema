@@ -83,10 +83,13 @@ class APIKeysConfig:
 
     def validate(self) -> List[str]:
         missing: List[str] = []
-        if not self.supabase_url:
-            missing.append("SUPABASE_URL")
-        if not self.supabase_key:
-            missing.append("SUPABASE_KEY")
+        # v20.1: Supabase is optional when SKIP_SUPABASE=true
+        skip_supabase = os.getenv("SKIP_SUPABASE", "false").lower() == "true"
+        if not skip_supabase:
+            if not self.supabase_url:
+                missing.append("SUPABASE_URL")
+            if not self.supabase_key:
+                missing.append("SUPABASE_KEY")
         if not self.gemini_keys and not self.groq:
             missing.append("GEMINI_API_KEY or GROQ_API_KEY")
         if not self.elevenlabs and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):

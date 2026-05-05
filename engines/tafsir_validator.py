@@ -485,3 +485,191 @@ class TafsirValidator:
                 )
         
         return all_passed, all_concerns
+
+    # ════════════════════════════════════════════════════════════════
+    # v20: Batched validation — 1 Claude call for entire episode
+    # ════════════════════════════════════════════════════════════════
+    def validate_episode_batched_v20(
+        self,
+        episode_data: Dict,
+        surah: int,
+        surah_name: str,
+    ) -> Tuple[bool, List[str]]:
+        """
+        v20 OPTIMIZATION: Validate all ayahs in ONE Claude call instead of N.
+
+        Cost reduction:
+            Old (validate_episode): 5 ayahs × $0.03 = $0.15/episode
+            New (this method):     1 call × $0.05 = $0.05/episode
+            → 67% cheaper, 5x fewer API calls
+
+        Strategy:
+            - Fetch authentic tafsir for all ayahs in parallel (HTTP batched)
+            - Build single multi-part validation prompt
+            - Send to Claude with structured JSON response schema
+            - Parse per-ayah verdicts from single response
+
+        Falls back to per-ayah validation if Claude unavailable.
+        """
+        ayah_scenes = episode_data.get("ayah_scenes", [])
+        if not ayah_scenes:
+            return True, []
+
+        # No anthropic key? Fall back to per-ayah heuristic.
+        if not self._anthropic_key:
+            logger.info("📋 No Anthropic key — falling back to per-ayah heuristic")
+            return self.validate_episode(episode_data, surah, surah_name)
+
+        try:
+            import concurrent.futures
+            # Step 1: Fetch all authentic tafsir in parallel
+            authentic_map: Dict[int, str] = {}
+
+            def _fetch(ayah_num: int) -> Tuple[int, str]:
+                authentic = self._fetch_authentic_tafsir(surah, ayah_num)
+                if authentic:
+                    return ayah_num, authentic.get("saadi", "") or authentic.get("muyassar", "")
+                return ayah_num, ""
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+                futures = [
+                    ex.submit(_fetch, scene.get("ayah", {}).get("number", 0))
+                    for scene in ayah_scenes
+                ]
+                for fut in concurrent.futures.as_completed(futures):
+                    num, text = fut.result()
+                    if text:
+                        authentic_map[num] = text
+
+            # Step 2: Build single batched prompt
+            prompt = self._build_batched_prompt(
+                ayah_scenes, surah_name, authentic_map
+            )
+
+            # Step 3: One Claude call
+            verdicts = self._call_claude_batched(prompt)
+
+            # Step 4: Parse per-ayah verdicts
+            all_passed = True
+            all_concerns: List[str] = []
+            for verdict in verdicts:
+                ayah_num = verdict.get("ayah_number", 0)
+                passed = verdict.get("passed", False)
+                concerns = verdict.get("concerns", [])
+                ayah_label = f"{surah_name} {ayah_num}"
+                if not passed:
+                    all_passed = False
+                    all_concerns.extend([f"[{ayah_label}] {c}" for c in concerns])
+                    logger.warning(
+                        f"⚠️ Religious FAIL: {ayah_label} — {len(concerns)} concerns"
+                    )
+                else:
+                    logger.info(f"✅ Religious OK: {ayah_label} (batched)")
+
+            return all_passed, all_concerns
+
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Batched validation failed: {e} — falling back to per-ayah"
+            )
+            return self.validate_episode(episode_data, surah, surah_name)
+
+    def _build_batched_prompt(
+        self,
+        ayah_scenes: List[Dict],
+        surah_name: str,
+        authentic_map: Dict[int, str],
+    ) -> str:
+        """Build prompt that asks Claude to validate all ayahs at once."""
+        ayah_blocks: List[str] = []
+        for i, scene in enumerate(ayah_scenes, 1):
+            ayah_data = scene.get("ayah", {})
+            num = ayah_data.get("number", i)
+            text = ayah_data.get("text", "")
+            authentic = authentic_map.get(num, "")[:1200]
+            explanation = scene.get("explain_text", "")
+            analogy = scene.get("story_text", "")
+            takeaway = scene.get("moral_text", "")
+
+            ayah_blocks.append(f"""
+═══ آية رقم {num} ═══
+[النص]: {text}
+
+[التفسير المعتمد - السعدي/الميسر]:
+{authentic if authentic else '(غير متاح — اعتمد على معرفتك التفسيرية)'}
+
+[الشرح المُنتج آلياً]:
+الشرح: {explanation}
+المثال: {analogy}
+الخلاصة: {takeaway}
+""")
+
+        ayahs_section = "\n".join(ayah_blocks)
+
+        return f"""أنت مدقق ديني صارم. تراجع شرحاً قرآنياً للأطفال أُنتج بنظام آلي.
+سورة {surah_name}، عدد الآيات: {len(ayah_scenes)}.
+
+{ayahs_section}
+
+═══════════════════════════════════════
+[المطلوب]:
+قيّم كل آية على الـ 5 محاور:
+1. التوافق العقدي مع التفاسير المعتمدة
+2. الدقة التفسيرية
+3. التبسيط الآمن (لم يخل بمفهوم عقدي)
+4. سلامة التشبيهات (لا تشبه الله بمخلوقاته)
+5. اللهجة الموقّرة
+
+أجب بـ JSON فقط، بدون أي نص خارجه:
+
+{{
+  "verdicts": [
+    {{
+      "ayah_number": 1,
+      "passed": true/false,
+      "confidence": 0.0-1.0,
+      "concerns": ["..."],
+      "key_finding": "summary"
+    }}
+    // ... كرر لكل آية
+  ]
+}}
+
+passed=false إذا فيه أي خطأ عقدي أو معلومة غلط.
+passed=true فقط إذا كل المحاور سليمة.
+"""
+
+    def _call_claude_batched(self, prompt: str) -> List[Dict]:
+        """Call Claude with batched prompt, return list of per-ayah verdicts."""
+        try:
+            import anthropic
+        except ImportError:
+            raise RuntimeError("anthropic SDK not installed")
+
+        client = anthropic.Anthropic(
+            api_key=self._anthropic_key,
+            timeout=self._timeout_sec,
+        )
+
+        # Use larger max_tokens since we're returning multiple verdicts
+        response = client.messages.create(
+            model=self._review_model,
+            max_tokens=2000,  # ~5 verdicts × 400 tokens each
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        text = response.content[0].text.strip()
+        # Strip markdown if present
+        import re
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+
+        try:
+            data = json.loads(text)
+            verdicts = data.get("verdicts", [])
+            if not isinstance(verdicts, list):
+                raise ValueError("verdicts is not a list")
+            return verdicts
+        except json.JSONDecodeError as e:
+            logger.error(f"Could not parse batched verdicts: {e}\nText: {text[:500]}")
+            raise

@@ -47,6 +47,14 @@ from infrastructure.bgm_mixer import BGMMixer
 from infrastructure.browser_pool import BrowserPool
 from infrastructure.ffmpeg_assembler import FFmpegAssembler
 from infrastructure.repository_supabase import SupabaseRepository
+
+# v20.1: Local file-backed repository (no Supabase needed for testing)
+try:
+    from infrastructure.repository_local import LocalRepository
+    _HAS_LOCAL_REPO = True
+except ImportError:
+    _HAS_LOCAL_REPO = False
+    LocalRepository = None
 from infrastructure.youtube_uploader import YouTubeUploader
 from orchestrator import Orchestrator
 
@@ -67,6 +75,21 @@ except ImportError:
     _HAS_QUOTA_MANAGER = False
     QuotaManager = None
     QuotaConfig = None
+
+# v20: degradation modes + cost dashboard
+try:
+    from core.degradation_modes import QualityMode, auto_select_mode, parse_mode, get_budget
+    _HAS_DEGRADATION = True
+except ImportError:
+    _HAS_DEGRADATION = False
+    QualityMode = None
+
+try:
+    from core.cost_dashboard import CostDashboard
+    _HAS_DASHBOARD = True
+except ImportError:
+    _HAS_DASHBOARD = False
+    CostDashboard = None
 
 # v18: cost tracking (optional)
 try:
@@ -122,7 +145,7 @@ try:
 except ImportError:
     _HAS_LEGACY_QUALITY = False
 
-VERSION: str = "19.0.0"
+VERSION: str = "20.1.0"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -176,6 +199,21 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="v18: episodes ≤ this number need manual review (default: 10)",
     )
     p.add_argument(
+        "--mode", choices=["high", "balanced", "economy", "auto"],
+        default="auto",
+        help="v20: quality mode (default: auto-select based on quota)",
+    )
+    p.add_argument(
+        "--skip-supabase", action="store_true",
+        help="v20.1: use local JSON-file repository instead of Supabase "
+             "(for testing/dev — no remote DB needed)",
+    )
+    p.add_argument(
+        "--reset-local-state", action="store_true",
+        help="v20.1: wipe local repository state before run (dev only). "
+             "Has no effect when using Supabase.",
+    )
+    p.add_argument(
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity (default: INFO)",
@@ -223,16 +261,47 @@ def _apply_env_overrides(config: AppConfig) -> AppConfig:
 def _build_orchestrator(
     config: AppConfig, *,
     dry_run: bool,
-    approval_explicit: bool = False,  # v18
-    review_threshold: int = 10,       # v18
+    approval_explicit: bool = False,
+    review_threshold: int = 10,
+    skip_supabase: bool = False,        # v20.1
+    reset_local_state: bool = False,    # v20.1
 ) -> Orchestrator:
     """Wire all dependencies. This is the only place that knows the full graph."""
 
     # ── Infrastructure
     assembler = FFmpegAssembler(config.video)
-    repository = SupabaseRepository(
-        config.api_keys.supabase_url, config.api_keys.supabase_key,
-    )
+
+    # v20.1: Choose repository — local JSON or Supabase
+    repository: Any
+    if skip_supabase:
+        if not _HAS_LOCAL_REPO:
+            raise RuntimeError(
+                "--skip-supabase requested but LocalRepository module unavailable"
+            )
+        local_state_dir = config.paths.root / "state"
+        repository = LocalRepository(state_dir=local_state_dir)
+        if reset_local_state:
+            repository.reset()
+        logging.getLogger("main").info(
+            f"📁 Using LOCAL repository (Supabase skipped): "
+            f"{local_state_dir / 'local_episodes.json'}"
+        )
+        # Print stats so user sees current state
+        stats = repository.stats()
+        if stats:
+            stats_str = ", ".join(f"{s}: {n}" for s, n in stats.items())
+            logging.getLogger("main").info(f"   Current state: {stats_str}")
+    else:
+        if not config.api_keys.supabase_url or not config.api_keys.supabase_key:
+            raise RuntimeError(
+                "SUPABASE_URL and SUPABASE_KEY required, OR pass --skip-supabase "
+                "to use the local file-backed repository instead."
+            )
+        repository = SupabaseRepository(
+            config.api_keys.supabase_url,
+            config.api_keys.supabase_key,
+        )
+        logging.getLogger("main").info("☁️  Using SUPABASE repository (production mode)")
 
     uploader: Optional[YouTubeUploader] = None
     if not dry_run:
@@ -463,12 +532,21 @@ def _build_orchestrator(
 # ════════════════════════════════════════════════════════════════
 # Operations
 # ════════════════════════════════════════════════════════════════
-def _print_status(config: AppConfig) -> int:
-    repo = SupabaseRepository(
-        config.api_keys.supabase_url, config.api_keys.supabase_key,
-    )
+def _print_status(config: AppConfig, skip_supabase: bool = False) -> int:
+    """List episodes from repository (Supabase or local)."""
+    if skip_supabase and _HAS_LOCAL_REPO:
+        repo = LocalRepository(state_dir=config.paths.root / "state")
+        print(f"\n📁 LOCAL repository: {config.paths.root / 'state' / 'local_episodes.json'}\n")
+    else:
+        if not config.api_keys.supabase_url or not config.api_keys.supabase_key:
+            print("⚠️ Supabase not configured. Pass --skip-supabase to use local repo.")
+            return 1
+        repo = SupabaseRepository(
+            config.api_keys.supabase_url, config.api_keys.supabase_key,
+        )
+        print("\n☁️  SUPABASE repository\n")
     episodes = repo.list_episodes()
-    print(f"\n{'EP':<5}{'Status':<22}{'YouTube URL'}")
+    print(f"{'EP':<5}{'Status':<22}{'YouTube URL'}")
     print("-" * 70)
     for ep in episodes:
         n = ep.get("episode_number", "?")
@@ -505,6 +583,11 @@ def main() -> int:
     args = _build_argparser().parse_args()
     print(_banner())
 
+    # v20.1: Propagate --skip-supabase to env BEFORE config validation
+    # (so AppConfig.validate() doesn't complain about missing SUPABASE_URL/KEY)
+    if args.skip_supabase:
+        os.environ["SKIP_SUPABASE"] = "true"
+
     # ── 1. Load config
     project_root = Path(__file__).parent.resolve()
     config = AppConfig.load(project_root)
@@ -531,7 +614,7 @@ def main() -> int:
 
     # ── 3. Read-only ops (no orchestrator needed)
     if args.status:
-        return _print_status(config)
+        return _print_status(config, skip_supabase=args.skip_supabase)
     if args.list_voices:
         return _print_voices(config)
 
@@ -542,6 +625,8 @@ def main() -> int:
             dry_run=args.dry_run,
             approval_explicit=args.approve,
             review_threshold=args.review_threshold,
+            skip_supabase=args.skip_supabase,           # v20.1
+            reset_local_state=args.reset_local_state,   # v20.1
         )
     except ConfigurationError as e:
         log.error(f"❌ Configuration error: {e}")
