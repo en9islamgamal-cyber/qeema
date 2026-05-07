@@ -328,7 +328,11 @@ class GeminiReviewer:
         llm_analogy: str,
         authentic_tafsir: str,
     ) -> TafsirValidationResult:
-        """Review one ayah explanation. Same signature as ClaudeReviewer.review()."""
+        """Review one ayah explanation. Same signature as ClaudeReviewer.review().
+
+        v22.5: Retries up to 3 times with exponential backoff on transient
+        errors (503, 429). Hard failures (auth, invalid request) fail fast.
+        """
         if not self._available:
             return TafsirValidationResult(
                 passed=False, confidence=0.0,
@@ -345,50 +349,109 @@ class GeminiReviewer:
             authentic_tafsir=authentic_tafsir,
         )
 
+        # v22.5: Retry logic for transient Gemini failures (503/429)
+        import time as _time
+        max_attempts = 3
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self._do_review_call(
+                    prompt, authentic_tafsir, ayah_number,
+                )
+            except Exception as e:
+                err_msg = str(e).lower()
+                last_error = e
+                # Distinguish transient vs permanent errors
+                is_transient = (
+                    "503" in err_msg
+                    or "unavailable" in err_msg
+                    or "429" in err_msg
+                    or "resource_exhausted" in err_msg
+                    or "rate limit" in err_msg
+                    or "timeout" in err_msg
+                )
+                if not is_transient or attempt == max_attempts:
+                    # Permanent error or final attempt — give up
+                    logger.error(f"❌ Gemini review error: {e}")
+                    return TafsirValidationResult(
+                        passed=False, confidence=0.0,
+                        concerns=[f"Reviewer error: {e}"],
+                        reviewer="gemini-2.5-flash",
+                    )
+                # Transient: backoff and retry
+                backoff = 2 ** attempt + (attempt * 0.5)  # 2.5s, 4.5s, 8.5s
+                logger.warning(
+                    f"⚠️ Gemini review transient failure "
+                    f"(attempt {attempt}/{max_attempts}): retrying in {backoff:.1f}s"
+                )
+                _time.sleep(backoff)
+
+        # Should not reach here, but defensively:
+        return TafsirValidationResult(
+            passed=False, confidence=0.0,
+            concerns=[f"Reviewer error after retries: {last_error}"],
+            reviewer="gemini-2.5-flash",
+        )
+
+    def _do_review_call(
+        self,
+        prompt: str,
+        authentic_tafsir: str,
+        ayah_number: int,
+    ) -> TafsirValidationResult:
+        """Single Gemini review call. Raises on transient errors so the
+        retry wrapper in review() can catch them.
+        """
+        from google.genai import types
+        response = self._client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.1,  # low for consistency on religious validation
+                response_mime_type="application/json",
+                max_output_tokens=800,
+            ),
+        )
+        text = response.text.strip() if response.text else ""
+
+        # Strip markdown fences if present
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+
+        # v22.5 FIX: Gemini returns smart quotes in Arabic text
+        # which break JSON parsing. Normalize them to standard quotes.
+        text = (text
+            .replace("\u201c", '"').replace("\u201d", '"')  # smart double quotes
+            .replace("\u2018", "'").replace("\u2019", "'")  # smart single quotes
+            .replace("\u00ab", '"').replace("\u00bb", '"')  # guillemets
+        )
+
         try:
-            from google.genai import types
-            response = self._client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,  # low for consistency on religious validation
-                    response_mime_type="application/json",
-                    max_output_tokens=800,
-                ),
-            )
-            text = response.text.strip() if response.text else ""
-
-            # Strip markdown fences if present
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-
             data = json.loads(text.strip())
+        except json.JSONDecodeError as parse_err:
+            # Try to salvage: find first { ... last }
+            import re as _re
+            match = _re.search(r'\{.*\}', text, flags=_re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    raise parse_err
+            else:
+                raise parse_err
 
-            return TafsirValidationResult(
-                passed=bool(data.get("passed", False)),
-                confidence=float(data.get("confidence", 0.0)),
-                concerns=list(data.get("concerns", [])),
-                authentic_excerpt=authentic_tafsir[:300],
-                reviewer="gemini-2.5-flash",
-            )
-        except json.JSONDecodeError as e:
-            logger.error(f"❌ Gemini returned invalid JSON: {e}")
-            return TafsirValidationResult(
-                passed=False, confidence=0.0,
-                concerns=[f"Reviewer JSON parse error: {e}"],
-                reviewer="gemini-2.5-flash",
-            )
-        except Exception as e:
-            logger.error(f"❌ Gemini review error: {e}")
-            return TafsirValidationResult(
-                passed=False, confidence=0.0,
-                concerns=[f"Reviewer error: {e}"],
-                reviewer="gemini-2.5-flash",
-            )
+        return TafsirValidationResult(
+            passed=bool(data.get("passed", False)),
+            confidence=float(data.get("confidence", 0.0)),
+            concerns=list(data.get("concerns", [])),
+            authentic_excerpt=authentic_tafsir[:300],
+            reviewer="gemini-2.5-flash",
+        )
 
     def _build_review_prompt(
         self,
@@ -659,7 +722,28 @@ class TafsirValidator:
                 llm_analogy=llm_analogy or "",
                 authentic_tafsir=authentic,
             )
-            if result.confidence < self._confidence_threshold:
+            # v22.5 FIX: Distinguish infra errors from genuine religious rejection.
+            # If concerns contain "Reviewer error" / "JSON parse" / "unavailable",
+            # the reviewer COULDN'T review — fall through to heuristic instead of
+            # treating this as a doctrinal failure.
+            concern_text = " ".join(result.concerns).lower()
+            is_infra_error = (
+                "reviewer error" in concern_text
+                or "json parse" in concern_text
+                or "unavailable" in concern_text
+                or "timeout" in concern_text
+                or "503" in concern_text
+                or "429" in concern_text
+                or "rate limit" in concern_text
+                or "quota" in concern_text
+            )
+            if is_infra_error:
+                logger.warning(
+                    f"⚠️ Gemini reviewer infrastructure error "
+                    f"(not a religious rejection) — falling through to heuristic"
+                )
+                # Fall through to Layer 3 below
+            elif result.confidence < self._confidence_threshold:
                 return TafsirValidationResult(
                     passed=False,
                     confidence=result.confidence,
@@ -669,7 +753,8 @@ class TafsirValidator:
                     authentic_excerpt=result.authentic_excerpt,
                     reviewer=result.reviewer,
                 )
-            return result
+            else:
+                return result
         
         # Layer 3: Heuristic fallback
         return self._heuristic_reviewer.review(
@@ -766,10 +851,16 @@ class TafsirValidator:
             authentic_map: Dict[int, str] = {}
 
             def _fetch(ayah_num: int) -> Tuple[int, str]:
-                authentic = self._fetch_authentic_tafsir(surah, ayah_num)
-                if authentic:
-                    return ayah_num, authentic.get("saadi", "") or authentic.get("muyassar", "")
-                return ayah_num, ""
+                # v22.5 FIX: was calling self._fetch_authentic_tafsir (doesn't exist)
+                # Actual API: self._fetcher.fetch_combined(surah, ayah) → str
+                try:
+                    text = self._fetcher.fetch_combined(surah, ayah_num)
+                    return ayah_num, text or ""
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ Tafsir fetch failed for {surah}:{ayah_num}: {e}"
+                    )
+                    return ayah_num, ""
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
                 futures = [
