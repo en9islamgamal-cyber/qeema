@@ -1183,6 +1183,19 @@ class TafsirValidator:
                     f"⚠️ Religious validation FAILED for {ayah_label} "
                     f"(reviewer={result.reviewer}, confidence={result.confidence:.2f})"
                 )
+                # v22.5.4: log the actual concerns so we can debug failures
+                # without having to inspect artifacts. Gemini's concerns explain
+                # WHY the script was rejected — without these logs, we just see
+                # "FAILED" with no clue about the root cause.
+                if result.concerns:
+                    for i, concern in enumerate(result.concerns, 1):
+                        logger.warning(f"   └─ concern #{i}: {concern}")
+                else:
+                    logger.warning(
+                        f"   └─ Gemini said passed=True but confidence "
+                        f"{result.confidence:.2f} < threshold "
+                        f"{self._confidence_threshold:.2f}"
+                    )
             else:
                 logger.info(
                     f"✅ Religious OK: {ayah_label} "
