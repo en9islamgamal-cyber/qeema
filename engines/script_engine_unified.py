@@ -299,11 +299,35 @@ class UnifiedScriptEngine:
         )
 
         # 7. Save to disk cache (legacy engine handles this)
-        if hasattr(self._legacy, "save_to_disk"):
-            try:
-                self._legacy.save_to_disk(script, episode_number)
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to cache script: {e}")
+        # v22.5.4: ScriptEngine has `_save_atomic`, not `save_to_disk` — try
+        # both names so the multi-task script gets persisted to disk for
+        # debugging artifacts (otherwise temp/episodes/episode_001.json never
+        # gets created when the multi-task path is taken).
+        saved = False
+        for save_method in ("save_to_disk", "_save_atomic"):
+            if hasattr(self._legacy, save_method):
+                try:
+                    method = getattr(self._legacy, save_method)
+                    # _save_atomic signature is (episode_number, script)
+                    # save_to_disk signature is (script, episode_number)
+                    if save_method == "_save_atomic":
+                        method(episode_number, script)
+                    else:
+                        method(script, episode_number)
+                    saved = True
+                    logger.info(
+                        f"💾 Multi-task script cached to disk via {save_method}"
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ {save_method} failed: {e}"
+                    )
+        if not saved:
+            logger.warning(
+                "⚠️ Multi-task script NOT cached — neither save_to_disk "
+                "nor _save_atomic available on legacy engine"
+            )
 
         # 8. Validate quality (reuse legacy engine's validator if present)
         validator = getattr(self._legacy, "_quality_validator", None)
@@ -327,14 +351,34 @@ class UnifiedScriptEngine:
 
     # ─── LLM call (delegates to legacy engine's failover machinery) ──
     def _call_llm(self, prompt: str) -> str:
-        """Call LLM through legacy engine's provider pool (uses circuit breakers).
+        """Call LLM for multi-task script generation.
 
-        v22.5.1 NOTE: ScriptEngine._call_llm returns a dict (JSON-parsed).
-        Multi-task path needs the raw string to apply its own parser.
-        We convert dict → JSON string when needed.
+        v22.5.4: prefer Gemini direct over the pool. Groq has produced
+        scripts that fail Gemini's tafsir review with confidence 0.70-0.80
+        (probable doctrinal drift). Gemini directly produces text Gemini
+        agrees with — same model, fewer review failures.
+
+        Order:
+          1. Try gemini-1 adapter directly (best quality for Arabic religious)
+          2. Fall back to the pool's failover (will pick groq if gemini down)
         """
-        # The legacy engine has a method like _call_llm_with_failover or similar.
-        # Try common names; raise if none found.
+        # Try Gemini first if available
+        adapters = getattr(self._legacy, "_adapters", {})
+        if "gemini-1" in adapters:
+            try:
+                from engines.script_engine import SYSTEM_PROMPT
+                result = adapters["gemini-1"].generate_json(prompt, SYSTEM_PROMPT)
+                if isinstance(result, dict):
+                    logger.info("🎯 Multi-task: used Gemini direct (better Arabic)")
+                    return json.dumps(result, ensure_ascii=False)
+                return result
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ Multi-task Gemini direct failed ({e}) — "
+                    f"falling back to pool"
+                )
+
+        # Fall back to legacy pool with failover
         for method_name in [
             "_call_llm_with_failover",
             "_call_llm",
@@ -342,7 +386,6 @@ class UnifiedScriptEngine:
         ]:
             if hasattr(self._legacy, method_name):
                 method = getattr(self._legacy, method_name)
-                # Most signatures are (prompt: str, ...) → str OR dict
                 try:
                     result = method(prompt)
                 except TypeError:
@@ -353,7 +396,6 @@ class UnifiedScriptEngine:
                 except Exception:
                     raise
 
-                # Normalize: ScriptEngine._call_llm returns dict, we need str
                 if isinstance(result, dict):
                     return json.dumps(result, ensure_ascii=False)
                 return result
