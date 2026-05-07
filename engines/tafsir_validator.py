@@ -164,7 +164,13 @@ class AuthenticTafsirFetcher:
 # GeminiReviewer — Layer 2 (the ONLY active reviewer in v22.5)
 # ════════════════════════════════════════════════════════════════
 class GeminiReviewer:
-    """Religious validator using Gemini 2.5 Flash.
+    """Religious validator using Gemini 2.5 Flash with multi-key rotation.
+
+    [Multi-key rotation — v22.5]
+    Accepts one OR multiple Gemini API keys (typically GEMINI_API_KEY,
+    GEMINI_API_KEY_2, GEMINI_API_KEY_3 from 3 separate Google projects).
+    On 429 RESOURCE_EXHAUSTED (daily quota), rotates to the next key.
+    Each key has its own 20/day free-tier limit — 3 keys = 60/day total.
 
     [Conservative bias]
     The prompt instructs Gemini to default to "needs review" when uncertain,
@@ -172,49 +178,125 @@ class GeminiReviewer:
     children's religious content.
 
     [Retry policy]
-    4 attempts with 15s, 30s, 60s backoffs. Total worst-case = 105s per
-    ayah. The script-engine throttle (4 RPM) keeps us under Gemini's free
-    tier 5-RPM ceiling in normal operation, but transient 503s from Google's
-    load balancer still happen and these waits give it time to recover.
+    Per-key: 4 attempts with 15s/30s/60s backoffs (transient 503s).
+    Across keys: rotate immediately on 429 daily quota (no backoff).
 
     [JSON parsing]
     Uses response_mime_type=application/json. Defensively normalizes smart
-    quotes (Gemini sometimes wraps Arabic text in “ ” instead of " "),
-    strips markdown fences, and falls back to regex { ... } extraction
-    if direct parse fails.
+    quotes, strips markdown fences, handles truncated responses gracefully.
     """
 
-    def __init__(self, gemini_api_key: str) -> None:
-        self._key = gemini_api_key
-        self._available = False
-        self._rate_limiter = None  # set below if key is non-empty
+    def __init__(
+        self,
+        gemini_api_key: Optional[str] = None,
+        gemini_api_keys: Optional[List[str]] = None,
+    ) -> None:
+        """Build reviewer with one OR multiple keys.
 
-        if not gemini_api_key:
+        Args:
+            gemini_api_key: Single key (legacy compat — prefer gemini_api_keys)
+            gemini_api_keys: List of keys for rotation across daily-quota-isolated
+                             projects. If both args given, key is appended first.
+        """
+        # Normalize to a list of unique non-empty keys
+        keys: List[str] = []
+        if gemini_api_key:
+            keys.append(gemini_api_key)
+        if gemini_api_keys:
+            for k in gemini_api_keys:
+                if k and k not in keys:
+                    keys.append(k)
+
+        self._keys: List[str] = keys
+        self._current_key_idx: int = 0
+        self._clients: Dict[str, Any] = {}
+        self._rate_limiters: Dict[str, Any] = {}
+        self._key_exhausted: Dict[str, bool] = {}
+        self._available = bool(keys)
+
+        if not keys:
             logger.warning(
-                "⚠️ GeminiReviewer constructed with empty api_key — disabled"
+                "⚠️ GeminiReviewer constructed with no keys — disabled"
             )
             return
 
-        # v22.5: shared rate limiter — if ScriptEngine uses the same key,
-        # both go through the same sliding window. This prevents the
-        # 5 RPM ceiling from being exceeded by combined script+tafsir
-        # traffic in Phase 1.
-        from core.gemini_rate_limiter import limiter_for_key
-        self._rate_limiter = limiter_for_key(
-            gemini_api_key, label_hint="tafsir-reviewer",
-        )
-
+        # Pre-build clients + rate limiters for each key
         try:
             from google import genai
-            self._client = genai.Client(api_key=gemini_api_key)
-            self._available = True
-            logger.info("✅ Gemini religious reviewer ready (model=gemini-2.5-flash)")
+            from core.gemini_rate_limiter import limiter_for_key
+            for k in keys:
+                self._clients[k] = genai.Client(api_key=k)
+                self._rate_limiters[k] = limiter_for_key(
+                    k, label_hint="tafsir-reviewer",
+                )
+                self._key_exhausted[k] = False
+            logger.info(
+                f"✅ Gemini religious reviewer ready "
+                f"(model=gemini-2.5-flash, keys={len(keys)})"
+            )
         except ImportError:
             logger.warning(
                 "⚠️ google-genai package not installed — Gemini reviewer disabled"
             )
+            self._available = False
+            return
         except Exception as e:
             logger.warning(f"⚠️ Gemini reviewer init failed: {e}")
+            self._available = False
+            return
+
+    @property
+    def _current_key(self) -> Optional[str]:
+        """Currently active key (None if all exhausted)."""
+        if not self._keys or self._current_key_idx >= len(self._keys):
+            return None
+        return self._keys[self._current_key_idx]
+
+    @property
+    def _client(self) -> Any:
+        """Active client for the current key (legacy property)."""
+        k = self._current_key
+        return self._clients.get(k) if k else None
+
+    @property
+    def _key(self) -> str:
+        """Current active key (legacy property — back-compat)."""
+        return self._current_key or ""
+
+    @property
+    def _rate_limiter(self) -> Any:
+        """Rate limiter for current key (legacy property)."""
+        k = self._current_key
+        return self._rate_limiters.get(k) if k else None
+
+    def _rotate_to_next_key(self) -> bool:
+        """Mark current key exhausted, advance to next available.
+
+        Returns True if a fresh key is now active, False if all exhausted.
+        """
+        cur = self._current_key
+        if cur:
+            self._key_exhausted[cur] = True
+            logger.warning(
+                f"⚠️ GeminiReviewer: key #{self._current_key_idx + 1} "
+                f"daily-quota exhausted, rotating"
+            )
+
+        # Advance to next non-exhausted key
+        for idx in range(self._current_key_idx + 1, len(self._keys)):
+            if not self._key_exhausted.get(self._keys[idx]):
+                self._current_key_idx = idx
+                logger.info(
+                    f"✅ GeminiReviewer: switched to key #{idx + 1}/{len(self._keys)}"
+                )
+                return True
+
+        # All keys exhausted
+        self._current_key_idx = len(self._keys)
+        logger.error(
+            f"❌ GeminiReviewer: ALL {len(self._keys)} keys exhausted today"
+        )
+        return False
 
     def review(
         self,
@@ -257,14 +339,43 @@ class GeminiReviewer:
             except Exception as e:
                 err_msg = str(e).lower()
                 last_error = e
-                is_transient = (
+
+                # v22.5: distinguish daily quota (RESOURCE_EXHAUSTED) from
+                # transient rate limits. Daily quota = key is dead for the day,
+                # rotate immediately to next key. Transient = backoff and retry.
+                is_daily_quota = (
+                    "resource_exhausted" in err_msg
+                    or "exceeded your current quota" in err_msg
+                    or "generaterequestsperdayperprojectpermodel" in err_msg
+                )
+                is_transient = is_daily_quota or (
                     "503" in err_msg
                     or "unavailable" in err_msg
                     or "429" in err_msg
-                    or "resource_exhausted" in err_msg
                     or "rate limit" in err_msg
                     or "timeout" in err_msg
                 )
+
+                # Daily quota → try next key without backoff
+                if is_daily_quota and len(self._keys) > 1:
+                    if self._rotate_to_next_key():
+                        logger.info(
+                            f"🔄 Daily quota hit — rotated to fresh key, "
+                            f"retrying ayah {ayah_number} immediately"
+                        )
+                        # Don't count this as a retry attempt — fresh key gets full budget
+                        continue
+                    else:
+                        # All keys exhausted today
+                        logger.error(
+                            f"❌ All {len(self._keys)} Gemini keys exhausted today"
+                        )
+                        return TafsirValidationResult(
+                            passed=False, confidence=0.0,
+                            concerns=[f"All Gemini keys daily-exhausted: {e}"],
+                            reviewer="gemini-2.5-flash",
+                        )
+
                 if not is_transient or attempt == max_attempts:
                     logger.error(f"❌ Gemini review error: {e}")
                     return TafsirValidationResult(
@@ -337,14 +448,35 @@ class GeminiReviewer:
         try:
             data = json.loads(text.strip())
         except json.JSONDecodeError as parse_err:
-            # Salvage: find first { ... last }
+            # Salvage 1: find first { ... last }
             import re as _re
             match = _re.search(r'\{.*\}', text, flags=_re.DOTALL)
             if match:
                 try:
                     data = json.loads(match.group(0))
                 except json.JSONDecodeError:
-                    raise parse_err
+                    # Salvage 2: response was truncated. Extract just the
+                    # numeric/boolean fields with regex — concerns may be lost
+                    # but passed/confidence are what gates the validation.
+                    logger.warning(
+                        f"⚠️ Gemini response truncated for ayah {ayah_number}, "
+                        f"salvaging fields via regex"
+                    )
+                    passed_match = _re.search(
+                        r'"passed"\s*:\s*(true|false)', text, _re.IGNORECASE,
+                    )
+                    conf_match = _re.search(
+                        r'"confidence"\s*:\s*([0-9.]+)', text,
+                    )
+                    if passed_match and conf_match:
+                        data = {
+                            "passed": passed_match.group(1).lower() == "true",
+                            "confidence": float(conf_match.group(1)),
+                            "concerns": ["[response truncated — regex-salvaged]"],
+                        }
+                    else:
+                        # Truly unparseable — re-raise to trigger the retry chain
+                        raise parse_err
             else:
                 raise parse_err
 
@@ -411,6 +543,281 @@ class GeminiReviewer:
   "concerns": ["قلق 1", "قلق 2"]
 }}"""
 
+    # ════════════════════════════════════════════════════════════════
+    # BATCH review (v22.5.1) — review all ayahs in one Gemini call
+    # ════════════════════════════════════════════════════════════════
+    def review_batch(
+        self,
+        ayahs_payload: List[Dict[str, Any]],
+        surah_name: str,
+    ) -> List[TafsirValidationResult]:
+        """Review ALL ayahs of an episode in ONE Gemini call.
+
+        [Why this exists]
+        Free-tier Gemini = 20 requests/day per project. Reviewing 7 ayahs
+        with 7 separate calls eats 35% of the daily quota for one episode.
+        Batching all 7 into a single call costs 1 quota token regardless of
+        ayah count — leaving 19 calls/day available for script + visuals.
+
+        Args:
+            ayahs_payload: list of dicts, each with keys:
+                - ayah_number (int)
+                - ayah_text (str)
+                - llm_explanation (str)
+                - llm_analogy (str)
+                - authentic_tafsir (str)
+            surah_name: e.g. "الفاتحة"
+
+        Returns:
+            One TafsirValidationResult per input ayah, in input order. If the
+            batch fails partially, missing ayahs get a result with
+            passed=False/confidence=0 so the caller's quality gate catches it.
+        """
+        if not self._available:
+            return [
+                TafsirValidationResult(
+                    passed=False, confidence=0.0,
+                    concerns=["Gemini reviewer unavailable"],
+                    reviewer="none",
+                )
+                for _ in ayahs_payload
+            ]
+
+        if not ayahs_payload:
+            return []
+
+        # Build batch prompt
+        prompt = self._build_batch_prompt(ayahs_payload, surah_name)
+
+        # Retry + key rotation logic — same as single review() but batch-aware
+        max_attempts = 4
+        backoffs = [15, 30, 60]
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self._do_batch_review_call(prompt, ayahs_payload)
+            except Exception as e:
+                err_msg = str(e).lower()
+                last_error = e
+
+                is_daily_quota = (
+                    "resource_exhausted" in err_msg
+                    or "exceeded your current quota" in err_msg
+                    or "generaterequestsperdayperprojectpermodel" in err_msg
+                )
+                is_transient = is_daily_quota or (
+                    "503" in err_msg
+                    or "unavailable" in err_msg
+                    or "429" in err_msg
+                    or "rate limit" in err_msg
+                    or "timeout" in err_msg
+                )
+
+                # Daily quota → rotate keys without backoff
+                if is_daily_quota and len(self._keys) > 1:
+                    if self._rotate_to_next_key():
+                        logger.info(
+                            f"🔄 Batch review: daily quota hit, rotated to "
+                            f"fresh key, retrying immediately"
+                        )
+                        continue
+                    else:
+                        logger.error(
+                            f"❌ Batch review: all {len(self._keys)} keys exhausted"
+                        )
+                        return [
+                            TafsirValidationResult(
+                                passed=False, confidence=0.0,
+                                concerns=[f"All Gemini keys exhausted: {e}"],
+                                reviewer="gemini-2.5-flash",
+                            )
+                            for _ in ayahs_payload
+                        ]
+
+                if not is_transient or attempt == max_attempts:
+                    logger.error(f"❌ Batch review error: {e}")
+                    return [
+                        TafsirValidationResult(
+                            passed=False, confidence=0.0,
+                            concerns=[f"Batch reviewer error: {e}"],
+                            reviewer="gemini-2.5-flash",
+                        )
+                        for _ in ayahs_payload
+                    ]
+                wait = backoffs[attempt - 1]
+                logger.warning(
+                    f"⚠️ Batch review transient failure "
+                    f"(attempt {attempt}/{max_attempts}): retrying in {wait}s"
+                )
+                time.sleep(wait)
+
+        # Defensive
+        return [
+            TafsirValidationResult(
+                passed=False, confidence=0.0,
+                concerns=[f"Batch reviewer failed: {last_error}"],
+                reviewer="gemini-2.5-flash",
+            )
+            for _ in ayahs_payload
+        ]
+
+    def _build_batch_prompt(
+        self,
+        ayahs_payload: List[Dict[str, Any]],
+        surah_name: str,
+    ) -> str:
+        """Build a single prompt for reviewing all ayahs at once."""
+        ayah_blocks = []
+        for i, p in enumerate(ayahs_payload, start=1):
+            block = f"""━━━━━━━━━━━ الآية #{i} ━━━━━━━━━━━
+سورة {surah_name}، الآية {p['ayah_number']}:
+"{p['ayah_text']}"
+
+[التفسير الأصيل المعتمد]
+{p['authentic_tafsir']}
+
+[الشرح المقترح للأطفال]
+الشرح: {p['llm_explanation']}
+المثال/التشبيه: {p['llm_analogy']}
+"""
+            ayah_blocks.append(block)
+
+        ayahs_text = "\n".join(ayah_blocks)
+        n = len(ayahs_payload)
+
+        return f"""أنت عالم دين أزهري متخصص في التفسير. مهمتك مراجعة شرح موجَّه للأطفال (٦-١٢ سنة) لـ {n} آيات من سورة {surah_name}.
+
+{ayahs_text}
+
+━━━━━━━━━━━ نهاية الآيات ━━━━━━━━━━━
+
+[مهمتك]
+راجع كل آية على حدة ضد التفسير الأصيل. لكل آية حدد:
+
+1. **passed (boolean):**
+   - true: الشرح صحيح ومتوافق مع التفسير الأصيل
+   - false: فيه خطأ أو انحراف عن المعنى
+
+2. **confidence (0.0-1.0):** ثقتك في حكمك على هذه الآية تحديداً
+
+3. **concerns (list of strings):** المشاكل الفعلية المحددة لو وُجدت
+
+[قواعد صارمة]
+- ✋ راجع كل آية بشكل مستقل (لا تتأثر بحكمك على الآيات الأخرى)
+- ✋ لو في أي شك، اخفض الـ confidence
+- ✋ لا تقبل شرحاً يضيف معاني مش في التفسير الأصيل
+- ✋ التشبيهات ممكنة لو ما خالفتش المعنى
+- ✋ مفيش مجال للتساهل — الخطأ يبقى خطأ
+
+[الإجابة]
+ارجع JSON فقط (بدون markdown، بدون نص قبله أو بعده):
+{{
+  "reviews": [
+    {{"ayah_number": <number>, "passed": true/false, "confidence": 0.0-1.0, "concerns": ["..."]}},
+    ... (واحد لكل آية بنفس الترتيب)
+  ]
+}}
+
+⚠️ مهم: ارجع بالظبط {n} reviews بنفس ترتيب الآيات في المدخلات."""
+
+    def _do_batch_review_call(
+        self,
+        prompt: str,
+        ayahs_payload: List[Dict[str, Any]],
+    ) -> List[TafsirValidationResult]:
+        """Make ONE Gemini call and parse the array response.
+
+        Raises on transient errors (caught by review_batch retry loop).
+        Returns one result per input ayah on success.
+        """
+        if self._rate_limiter is not None:
+            self._rate_limiter.acquire()
+
+        # Defensive: client may be None if all keys exhausted
+        if self._client is None:
+            raise RuntimeError("No active Gemini client (all keys exhausted)")
+
+        from google.genai import types as genai_types
+        # Output: ~150 tokens × N ayahs. For 7 ayahs ≈ 1050 tokens. Cap at 4096
+        # to give some headroom but stay well under the 8192 model limit.
+        config = genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.1,
+            max_output_tokens=4096,
+        )
+
+        response = self._client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=config,
+        )
+
+        text = response.text or ""
+        # Strip markdown fences if Gemini added them
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = (text
+            .replace("\u201c", '"').replace("\u201d", '"')
+            .replace("\u2018", "'").replace("\u2019", "'")
+            .replace("\u00ab", '"').replace("\u00bb", '"')
+        )
+
+        # Parse the JSON array
+        try:
+            data = json.loads(text.strip())
+        except json.JSONDecodeError:
+            # Salvage: find { ... }
+            import re as _re
+            match = _re.search(r'\{.*\}', text, flags=_re.DOTALL)
+            if not match:
+                raise
+            data = json.loads(match.group(0))
+
+        reviews = data.get("reviews", [])
+        if not isinstance(reviews, list):
+            raise ValueError(f"Expected 'reviews' array, got {type(reviews)}")
+
+        # Build result list — one per input ayah, in input order
+        results: List[TafsirValidationResult] = []
+        for input_ayah in ayahs_payload:
+            ayah_num = input_ayah['ayah_number']
+            authentic = input_ayah.get('authentic_tafsir', '')
+            # Find matching review by ayah_number
+            matching = next(
+                (r for r in reviews
+                 if r.get('ayah_number') == ayah_num),
+                None,
+            )
+            if matching is None:
+                logger.warning(
+                    f"⚠️ Batch review missing ayah {ayah_num} — flagging as failed"
+                )
+                results.append(TafsirValidationResult(
+                    passed=False, confidence=0.0,
+                    concerns=[f"Missing in batch review response"],
+                    authentic_excerpt=authentic[:300],
+                    reviewer="gemini-2.5-flash-batch",
+                ))
+            else:
+                results.append(TafsirValidationResult(
+                    passed=bool(matching.get("passed", False)),
+                    confidence=float(matching.get("confidence", 0.0)),
+                    concerns=list(matching.get("concerns", [])),
+                    authentic_excerpt=authentic[:300],
+                    reviewer="gemini-2.5-flash-batch",
+                ))
+
+        logger.info(
+            f"✅ Batch review: {sum(r.passed for r in results)}/{len(results)} ayahs passed "
+            f"(1 Gemini call instead of {len(results)})"
+        )
+        return results
+
 
 # ════════════════════════════════════════════════════════════════
 # TafsirValidator — main coordinator
@@ -435,23 +842,29 @@ class TafsirValidator:
     def __init__(
         self,
         gemini_review_key: Optional[str] = None,
+        gemini_review_keys: Optional[List[str]] = None,
         confidence_threshold: float = 0.65,
         cache_path: Optional[Path] = None,
     ) -> None:
         """Build a v22.5 validator.
 
         Args:
-            gemini_review_key: REQUIRED. The Gemini API key for review calls.
-                              In Phase 1 architecture, this is the same key as
-                              script generation (key #1).
+            gemini_review_key: REQUIRED if gemini_review_keys not given. The
+                              Gemini API key for review calls. Legacy single-key
+                              path (back-compat).
+            gemini_review_keys: NEW v22.5 — list of multiple keys for daily-quota
+                              rotation. When the active key hits 429
+                              RESOURCE_EXHAUSTED, the reviewer rotates to the
+                              next available key. Each key counts as a separate
+                              free-tier 20/day quota (use 3 separate Google
+                              projects). If both `key` and `keys` given, they
+                              are merged with `key` first.
             confidence_threshold: Minimum confidence to mark validation as
                                  passed (default: 0.65).
             cache_path: Optional path to a persistent JSON tafsir cache.
                         When provided, AuthenticTafsirFetcher is wrapped in a
                         CachedTafsirFetcher so quran.com is only hit once per
-                        (surah, ayah, tafsir_id) across all runs. Without this,
-                        only the in-memory cache (per-process) is used and every
-                        new run refetches all ayahs.
+                        (surah, ayah, tafsir_id) across all runs.
         """
         # Build the tafsir fetcher chain: optionally wrap with disk cache
         upstream_fetcher: Any = AuthenticTafsirFetcher()
@@ -466,23 +879,27 @@ class TafsirValidator:
                     f"📚 TafsirValidator: persistent cache wired at {cache_path}"
                 )
             except Exception as e:
-                # Cache is best-effort — fall back to in-memory only
                 logger.warning(
                     f"⚠️ Tafsir disk cache init failed ({e}) — using "
                     f"in-memory cache only"
                 )
                 self._fetcher = upstream_fetcher
         else:
-            # No persistent cache → in-memory only (each process refetches)
             self._fetcher = upstream_fetcher
 
         self._gemini_reviewer: Optional[GeminiReviewer] = None
         self._confidence_threshold = confidence_threshold
 
-        if gemini_review_key:
-            self._gemini_reviewer = GeminiReviewer(gemini_review_key)
+        # Has at least one key?
+        has_key = bool(gemini_review_key) or bool(gemini_review_keys)
+        if has_key:
+            self._gemini_reviewer = GeminiReviewer(
+                gemini_api_key=gemini_review_key,
+                gemini_api_keys=gemini_review_keys,
+            )
+            n_keys = len(self._gemini_reviewer._keys)
             logger.info(
-                "✅ TafsirValidator wired (Gemini-only — v22.5)"
+                f"✅ TafsirValidator wired (Gemini-only, {n_keys} key(s) — v22.5)"
             )
         else:
             logger.error(
@@ -596,42 +1013,107 @@ class TafsirValidator:
         surah: int,
         surah_name: str,
     ) -> Tuple[bool, List[str]]:
-        """Validate ALL ayahs in an episode.
+        """Validate ALL ayahs in an episode using a SINGLE Gemini call.
 
-        Returns (all_passed, combined_concerns). Logs progress per-ayah.
+        v22.5.1: switched from per-ayah loop (7 calls) to batched review
+        (1 call). Saves 6/7 of daily quota per episode. Falls back to the
+        per-ayah path automatically if reviewer is unavailable or batching
+        is somehow disabled.
+
+        Returns (all_passed, combined_concerns).
         """
+        scenes = episode_data.get("ayah_scenes", [])
+        if not scenes:
+            logger.warning("⚠️ validate_episode called with no ayah_scenes")
+            return True, []
+
+        # Build batch payload — fetch authentic tafsir for each ayah first.
+        # Tafsir fetch is cheap (HTTP cached), Gemini is the expensive resource.
+        batch_payload: List[Dict[str, Any]] = []
+        skipped: List[Tuple[int, str]] = []  # (ayah_num, reason)
+
+        for scene in scenes:
+            ayah = scene.get("ayah", {})
+            ayah_num = ayah.get("number", 0)
+            ayah_text = ayah.get("text", "")
+            llm_explanation = scene.get("explain_text", "")
+            llm_analogy = scene.get("story_text", "")
+
+            if not (ayah_text and llm_explanation):
+                skipped.append((ayah_num, "missing ayah text or explanation"))
+                continue
+
+            try:
+                authentic = self._fetcher.fetch_combined(
+                    surah=surah, ayah=ayah_num,
+                )
+            except Exception as e:
+                skipped.append((ayah_num, f"tafsir fetch failed: {e}"))
+                continue
+
+            if not authentic:
+                skipped.append((ayah_num, "no authentic tafsir available"))
+                continue
+
+            batch_payload.append({
+                "ayah_number": ayah_num,
+                "ayah_text": ayah_text,
+                "llm_explanation": llm_explanation,
+                "llm_analogy": llm_analogy,
+                "authentic_tafsir": authentic,
+            })
+
+        # If reviewer can't do batch (no keys), fail loudly
+        if self._gemini_reviewer is None or not self._gemini_reviewer._available:
+            logger.error("❌ TafsirValidator: reviewer unavailable")
+            return False, ["Reviewer unavailable for batch review"]
+
+        # Single Gemini call for ALL ayahs
+        results = self._gemini_reviewer.review_batch(
+            ayahs_payload=batch_payload,
+            surah_name=surah_name,
+        )
+
+        # Pair results back with ayah numbers and check threshold
         all_passed = True
         all_concerns: List[str] = []
 
-        for scene in episode_data.get("ayah_scenes", []):
-            ayah = scene.get("ayah", {})
-            result = self.validate_explanation(
-                ayah_text=ayah.get("text", ""),
-                surah=surah,
-                surah_name=surah_name,
-                ayah_number=ayah.get("number", 0),
-                llm_explanation=scene.get("explain_text", ""),
-                llm_analogy=scene.get("story_text", ""),
+        for payload, result in zip(batch_payload, results):
+            ayah_num = payload["ayah_number"]
+            ayah_label = f"{surah_name} {ayah_num}"
+
+            # Apply confidence threshold (same logic as single review path)
+            effectively_passed = (
+                result.passed
+                and result.confidence >= self._confidence_threshold
             )
 
-            if not result.passed:
+            if not effectively_passed:
                 all_passed = False
-                ayah_label = f"{surah_name} {ayah.get('number')}"
-                all_concerns.extend([f"[{ayah_label}] {c}" for c in result.concerns])
+                if result.concerns:
+                    all_concerns.extend([f"[{ayah_label}] {c}" for c in result.concerns])
+                else:
+                    all_concerns.append(
+                        f"[{ayah_label}] confidence {result.confidence:.2f} "
+                        f"below threshold {self._confidence_threshold}"
+                    )
                 logger.warning(
                     f"⚠️ Religious validation FAILED for {ayah_label} "
                     f"(reviewer={result.reviewer}, confidence={result.confidence:.2f})"
                 )
             else:
                 logger.info(
-                    f"✅ Religious OK: {surah_name} {ayah.get('number')} "
+                    f"✅ Religious OK: {ayah_label} "
                     f"(reviewer={result.reviewer}, confidence={result.confidence:.2f})"
                 )
 
-        # v22.5: Flush the disk cache after each episode. Without this, if the
-        # process crashes mid-pipeline (e.g., voice_engine OOM, FFmpeg failure),
-        # the newly-fetched tafsir from quran.com is lost — next run hits the
-        # API again. Best-effort: cache failure must NOT block validation.
+        # Skipped ayahs are also failures
+        for ayah_num, reason in skipped:
+            all_passed = False
+            all_concerns.append(f"[{surah_name} {ayah_num}] skipped: {reason}")
+            logger.warning(f"⚠️ Skipped ayah {ayah_num}: {reason}")
+
+        # Flush disk cache (best-effort)
         try:
             cache_obj = getattr(self._fetcher, "_cache", None)
             if cache_obj is not None and hasattr(cache_obj, "flush"):

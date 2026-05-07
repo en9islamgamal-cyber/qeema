@@ -127,11 +127,15 @@ class UnifiedScriptEngine:
         Falls back to legacy 6-call path on any error.
         """
         # Fast path eligibility check
+        # v22.5.1: was checking for `_call_llm_with_failover` which doesn't
+        # exist on ScriptEngine — that's why multi-task NEVER fired in the
+        # production logs (always fell back to legacy 6-call path).
+        # The actual method is `_call_llm` which uses the pool's failover.
         try_multi = (
             strategy is not None
             and getattr(strategy, "use_multi_task_script", False)
             and _HAS_MULTI_TASK_HELPERS
-            and hasattr(self._legacy, "_call_llm_with_failover")
+            and hasattr(self._legacy, "_call_llm")
         )
 
         if not try_multi:
@@ -318,7 +322,12 @@ class UnifiedScriptEngine:
 
     # ─── LLM call (delegates to legacy engine's failover machinery) ──
     def _call_llm(self, prompt: str) -> str:
-        """Call LLM through legacy engine's provider pool (uses circuit breakers)."""
+        """Call LLM through legacy engine's provider pool (uses circuit breakers).
+
+        v22.5.1 NOTE: ScriptEngine._call_llm returns a dict (JSON-parsed).
+        Multi-task path needs the raw string to apply its own parser.
+        We convert dict → JSON string when needed.
+        """
         # The legacy engine has a method like _call_llm_with_failover or similar.
         # Try common names; raise if none found.
         for method_name in [
@@ -328,17 +337,21 @@ class UnifiedScriptEngine:
         ]:
             if hasattr(self._legacy, method_name):
                 method = getattr(self._legacy, method_name)
-                # Most signatures are (prompt: str, ...) → str
+                # Most signatures are (prompt: str, ...) → str OR dict
                 try:
-                    return method(prompt)
+                    result = method(prompt)
                 except TypeError:
-                    # Try with operation_name kwarg
                     try:
-                        return method(prompt, operation_name="multi_task_script")
+                        result = method(prompt, operation_name="multi_task_script")
                     except Exception:
                         continue
                 except Exception:
                     raise
+
+                # Normalize: ScriptEngine._call_llm returns dict, we need str
+                if isinstance(result, dict):
+                    return json.dumps(result, ensure_ascii=False)
+                return result
 
         # Last resort: use the provider pool directly
         pool = getattr(self._legacy, "_provider_pool", None)

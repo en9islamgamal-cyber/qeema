@@ -289,22 +289,23 @@ def _apply_env_overrides(config: AppConfig) -> AppConfig:
 # ════════════════════════════════════════════════════════════════
 def _build_tafsir_validator(
     gemini_review_key: Optional[str] = None,
+    gemini_review_keys: Optional[List[str]] = None,
     cache_path: Optional[Path] = None,
 ) -> Any:
-    """Build a v22.5 TafsirValidator (Gemini-only architecture).
+    """Build a v22.5 TafsirValidator (Gemini-only architecture, multi-key).
 
-    Returns None if no Gemini key was configured. The validator has only
-    one signature now: TafsirValidator(gemini_review_key=..., cache_path=...).
+    Returns None if no Gemini key was configured.
 
     Args:
-        gemini_review_key: Gemini API key for religious validation
-        cache_path: Path to persistent JSON cache for tafsir API responses.
-                    Strongly recommended — without it, every run hits quran.com
-                    fresh for all ayahs (14 HTTP calls per episode).
+        gemini_review_key: legacy single-key (back-compat)
+        gemini_review_keys: NEW v22.5 — list of all 3 Gemini keys for daily-quota
+                           rotation. Each key has its own free-tier 20/day limit
+                           (when keys come from separate Google projects).
+        cache_path: persistent disk cache for tafsir API responses.
     """
     if not _HAS_TAFSIR_VALIDATOR:
         return None
-    if not gemini_review_key:
+    if not gemini_review_key and not gemini_review_keys:
         logging.getLogger("main").warning(
             "⚠️ TafsirValidator NOT wired — no Gemini key for tafsir review"
         )
@@ -314,9 +315,11 @@ def _build_tafsir_validator(
     try:
         v = TafsirValidator(
             gemini_review_key=gemini_review_key,
+            gemini_review_keys=gemini_review_keys,
             cache_path=cache_path,
         )
-        log.info("✅ TafsirValidator wired (Gemini-only — v22.5)")
+        n_keys = len(gemini_review_keys or []) + (1 if gemini_review_key else 0)
+        log.info(f"✅ TafsirValidator wired ({n_keys} key(s) — v22.5)")
         return v
     except Exception as e:
         log.error(f"❌ TafsirValidator init failed: {e}")
@@ -518,13 +521,13 @@ def _build_orchestrator(
         )
 
     # ─── 8. TafsirValidator (CRITICAL — religious accuracy) ──────
-    # Persistent cache lives at state/tafsir_cache.json — same path the pipeline
-    # action restores via actions/cache. Without this, every episode hits
-    # quran.com fresh for all 7 ayahs × 2 tafsirs = 14 HTTP calls.
+    # v22.5: passes ALL 3 Gemini keys (not just one) to enable daily-quota
+    # rotation. Each key has its own free-tier 20/day limit when keys come
+    # from separate Google projects. Total = 60/day across 3 projects.
     tafsir_cache_path = config.paths.root / "state" / "tafsir_cache.json"
     tafsir_cache_path.parent.mkdir(parents=True, exist_ok=True)
     tafsir_validator = _build_tafsir_validator(
-        gemini_review_key=config.api_keys.tafsir_review_key,
+        gemini_review_keys=list(config.api_keys.gemini_keys),
         cache_path=tafsir_cache_path,
     )
     if not tafsir_validator:
