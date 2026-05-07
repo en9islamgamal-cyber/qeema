@@ -1168,23 +1168,79 @@ class Orchestrator:
     def _validate_tafsir(
         self, script: EpisodeScript, strategy: Any,
     ) -> List[Dict[str, Any]]:
-        """v22.5: Per-ayah Gemini validation. The legacy batched-Claude
-        approach is gone — Gemini's 5 RPM limit makes batching pointless
-        (we throttle per-ayah anyway).
+        """v22.5.1: BATCH Gemini validation — all ayahs in 1 Gemini call.
+
+        Saves 6/7 of the daily quota per episode. Falls back to per-ayah
+        loop if validate_episode is unavailable for any reason.
         """
         if self.tafsir_validator is None:
             return []
 
-        # Determine the surah for logging (use the first ayah's surah)
+        # Determine the surah info from the first ayah
         surah_name = "Unknown"
+        surah_num = 0
         if script.ayah_scenes:
             first = script.ayah_scenes[0]
             ayah_obj = getattr(first, 'ayah', None)
             if ayah_obj is not None:
+                surah_num = getattr(ayah_obj, 'surah', 0)
                 surah_name = getattr(ayah_obj, 'surah_name', '') or (
-                    f"سورة {getattr(ayah_obj, 'surah', 0)}"
+                    f"سورة {surah_num}"
                 )
 
+        # Try batch path first
+        if hasattr(self.tafsir_validator, "validate_episode"):
+            logger.info(
+                "🔍 Tafsir validation (BATCH — 1 Gemini call for all ayahs)"
+            )
+            try:
+                # Build episode_data dict in the shape validate_episode expects
+                episode_data = {
+                    "ayah_scenes": [
+                        {
+                            "ayah": {
+                                "text": getattr(getattr(s, 'ayah', None), 'text', ''),
+                                "number": getattr(getattr(s, 'ayah', None), 'number', 0),
+                                "surah": getattr(getattr(s, 'ayah', None), 'surah', 0),
+                            },
+                            "explain_text": getattr(s, 'explain_text', ''),
+                            "story_text": getattr(s, 'story_text', '') or '',
+                        }
+                        for s in script.ayah_scenes
+                    ]
+                }
+                all_passed, concerns = self.tafsir_validator.validate_episode(
+                    episode_data=episode_data,
+                    surah=surah_num,
+                    surah_name=surah_name,
+                )
+                # Convert to per-ayah report list (orchestrator expects this shape)
+                results: List[Dict[str, Any]] = []
+                for scene in script.ayah_scenes:
+                    ayah_obj = getattr(scene, 'ayah', None)
+                    ayah_num = getattr(ayah_obj, 'number', 0) if ayah_obj else 0
+                    # Filter concerns to this ayah's label
+                    label = f"{surah_name} {ayah_num}"
+                    ayah_concerns = [
+                        c.replace(f"[{label}] ", "") for c in concerns
+                        if f"[{label}]" in c
+                    ]
+                    results.append({
+                        "ayah": ayah_num,
+                        "surah": surah_num,
+                        "passed": all_passed or not ayah_concerns,
+                        "confidence": 0.85 if all_passed else 0.0,
+                        "concerns": ayah_concerns,
+                        "method": "gemini-2.5-flash-batch",
+                    })
+                return results
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ Batch tafsir validation failed ({type(e).__name__}: {e}) "
+                    f"— falling back to per-ayah loop"
+                )
+
+        # Fallback: per-ayah loop (legacy path)
         logger.info("🔍 Tafsir validation (Gemini per-ayah, throttled)")
         return self._validate_tafsir_per_ayah(script, surah_name)
 
