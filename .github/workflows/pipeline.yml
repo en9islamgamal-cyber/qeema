@@ -7,9 +7,14 @@ name: QEEMA Pipeline v22.5
 # ═══════════════════════════════════════════════════════════════
 on:
   schedule:
-    # Run daily at 02:00 UTC. The phase router auto-detects what work to
-    # do based on persistent state from previous days.
-    - cron: "0 2 * * *"
+    # v22.5: 3 runs per day to distribute load across 3 Gemini keys
+    # 08:00 / 09:00 / 10:00 UTC. Each run takes ~30-45 minutes worst-case.
+    # The phase router auto-detects which phase to run for each episode
+    # based on persistent state. Multi-key rotation in tafsir_validator
+    # ensures daily quota (20/key/day = 60/day total) is used efficiently.
+    - cron: "0 8 * * *"
+    - cron: "0 9 * * *"
+    - cron: "0 10 * * *"
   workflow_dispatch:
     inputs:
       episode:
@@ -328,11 +333,16 @@ jobs:
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
           # ── TTS
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           ELEVENLABS_VOICE_ID: ${{ vars.ELEVENLABS_VOICE_ID || 'UR972wNGq3zluze0LoIp' }}
+          # CAMB.AI fallback (Arabic via MARS8) — only used if ElevenLabs fails
+          CAMB_AI_KEY: ${{ secrets.CAMB_AI_KEY }}
+          CAMB_AI_VOICE_ID: ${{ vars.CAMB_AI_VOICE_ID || '' }}
+          CAMB_AI_SPEECH_MODEL: ${{ vars.CAMB_AI_SPEECH_MODEL || 'mars-pro' }}
+          # Optional: skip /source-languages auto-discovery by hard-coding the ID
+          CAMB_AI_LANGUAGE_ID: ${{ vars.CAMB_AI_LANGUAGE_ID || '' }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-sa.json
           # ── DB
           SUPABASE_URL: ${{ secrets.SUPABASE_URL || '' }}
