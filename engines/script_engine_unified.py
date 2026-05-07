@@ -193,12 +193,17 @@ class UnifiedScriptEngine:
         t0 = time.monotonic()
 
         # 1. Fetch verified ayahs (REQUIRED — never AI-generate Quran text)
+        # Returns List[Dict[str, Any]] with keys: surah, number, text
         ayahs = fetch_verified_ayahs(info["surah"], info["start"], info["end"])
         t_fetch = time.monotonic() - t0
 
         # 2. Build multi-task prompt
+        # v22.5.2: fetch returns dicts, not Pydantic objects — use [] not . access.
+        # The previous .number access caused "AttributeError: 'dict' object has no
+        # attribute 'number'" on every multi-task attempt → silent fallback to
+        # legacy 6-call path.
         ayah_dicts = [
-            {"number": a.number, "text": a.text}
+            {"number": a["number"], "text": a["text"]}
             for a in ayahs
         ]
         prompt = build_full_episode_prompt(
@@ -419,7 +424,7 @@ class UnifiedScriptEngine:
             visual_prompt=data.get("outro_visual", ""),
             visual_scene=VisualScene.STARRY_NIGHT,
             palette=PaletteName.NIGHT_STARS,
-            mood=AudioMood.PEACEFUL,
+            mood=AudioMood.REVERENT,  # v22.5.3: was PEACEFUL — not in enum
             keywords=[],
         )
 
@@ -430,6 +435,19 @@ class UnifiedScriptEngine:
         deep_visuals_list = data.get("_deep_visuals", []) or []
 
         for i, (ayah, scene_data) in enumerate(zip(ayahs, scene_data_list)):
+            # v22.5.2: ayah from fetch_verified_ayahs is a dict.
+            # AyahScene requires a VerifiedAyah Pydantic model.
+            from core.models import VerifiedAyah
+            if isinstance(ayah, dict):
+                ayah_obj = VerifiedAyah(
+                    surah=ayah.get("surah", info["surah"]),
+                    number=ayah["number"],
+                    text=ayah["text"],
+                    audio_url=ayah.get("audio_url"),
+                )
+            else:
+                ayah_obj = ayah  # already a VerifiedAyah (defensive)
+
             # Map LLM emotion string to enum
             emotion_str = scene_data.get("scene_emotion", "warm").lower()
             try:
@@ -454,7 +472,7 @@ class UnifiedScriptEngine:
 
             ayah_scene = AyahScene(
                 scene_id=i + 1,
-                ayah=ayah,
+                ayah=ayah_obj,
                 intro_text=scene_data.get("intro_text", ""),
                 hook_text=scene_data.get("hook_text", ""),
                 story_text=scene_data.get("analogy_text", ""),
@@ -502,7 +520,7 @@ class UnifiedScriptEngine:
             "starry_night": VisualScene.STARRY_NIGHT,
             "abstract": VisualScene.ABSTRACT_WARM,
             "abstract_warm": VisualScene.ABSTRACT_WARM,
-            "abstract_cool": VisualScene.ABSTRACT_COOL,
+            "abstract_cool": VisualScene.ABSTRACT_WARM,  # v22.5.3: COOL not in enum
         }
         return mapping.get(hint, VisualScene.ABSTRACT_WARM)
 
