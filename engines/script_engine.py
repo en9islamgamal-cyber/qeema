@@ -384,6 +384,10 @@ class ScriptEngine:
 
     def _setup_providers(self, api_keys: APIKeysConfig) -> None:
         # v22.5: use script_pool_keys (excludes the dedicated tafsir key)
+        # v22.5 RATE LIMIT FIX: Gemini free tier = 5 RPM = 1 call per 12 seconds
+        # OLD: rate_limit=(1.0, 5) → 1 RPS + burst 5 = ~12x faster than allowed
+        # NEW: rate_limit=(0.067, 1) → 1 token per 15s, no burst
+        #   0.067 tokens/sec × 60s = 4 tokens/min (safety margin under 5 RPM cap)
         for i, key in enumerate(api_keys.script_pool_keys, start=1):
             try:
                 name = f"gemini-{i}"
@@ -396,7 +400,7 @@ class ScriptEngine:
                     breaker_config=CircuitBreakerConfig(
                         failure_threshold=4, recovery_timeout_sec=45.0,
                     ),
-                    rate_limit=(1.0, 5),
+                    rate_limit=(0.067, 1),  # 4 RPM with no burst (safe under 5 RPM)
                 )
             except Exception as e:
                 logger.warning(f"⚠️ Gemini #{i} init failed: {e}")
@@ -532,10 +536,18 @@ class ScriptEngine:
     ) -> List[Dict[str, Any]]:
         total = len(ayahs)
         adapter_count = max(1, len(self._adapter_names))
-        max_workers = min(adapter_count, 4)
+        # v22.5 FINAL: Force serial execution when only 1 Gemini adapter is in
+        # the pool. Parallelism here would race the rate limiter and trigger
+        # 429s. With 1 adapter at 4 RPM, 7 ayahs take ~105s. That's still
+        # well under any reasonable Phase 1 budget.
+        gemini_count = sum(1 for n in self._adapter_names if n.startswith("gemini-"))
+        if gemini_count <= 1:
+            max_workers = 1
+        else:
+            max_workers = min(adapter_count, 4)
 
         logger.info(
-            f"🎬 Generating {total} ayahs in parallel (max_workers={max_workers}, "
+            f"🎬 Generating {total} ayahs (max_workers={max_workers}, "
             f"adapters={self._adapter_names})"
         )
 
