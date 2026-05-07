@@ -349,10 +349,15 @@ class GeminiReviewer:
             authentic_tafsir=authentic_tafsir,
         )
 
-        # v22.5: Retry logic for transient Gemini failures (503/429)
+        # v22.5 FINAL: Retry logic tuned for Gemini free-tier 5 RPM ceiling.
+        # Backoff sequence: 15s, 30s, 60s. Total worst case = ~105s per ayah.
+        # The script-engine throttle ensures we don't hit 5 RPM in the first
+        # place, but 503 (overload, not quota) can still happen → these waits
+        # give Google's load balancer time to recover.
         import time as _time
-        max_attempts = 3
+        max_attempts = 4
         last_error: Optional[Exception] = None
+        backoffs = [15, 30, 60]  # seconds before retries 2, 3, 4
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -379,13 +384,13 @@ class GeminiReviewer:
                         concerns=[f"Reviewer error: {e}"],
                         reviewer="gemini-2.5-flash",
                     )
-                # Transient: backoff and retry
-                backoff = 2 ** attempt + (attempt * 0.5)  # 2.5s, 4.5s, 8.5s
+                # Transient: long backoff and retry
+                wait = backoffs[attempt - 1]
                 logger.warning(
                     f"⚠️ Gemini review transient failure "
-                    f"(attempt {attempt}/{max_attempts}): retrying in {backoff:.1f}s"
+                    f"(attempt {attempt}/{max_attempts}): retrying in {wait}s"
                 )
-                _time.sleep(backoff)
+                _time.sleep(wait)
 
         # Should not reach here, but defensively:
         return TafsirValidationResult(
@@ -606,48 +611,54 @@ class TafsirValidator:
         confidence_threshold: float = 0.65,
     ) -> None:
         """
-        v22.5: Now accepts a dedicated Gemini key for religious validation.
+        v22.5 FINAL: Gemini-only validation architecture.
 
-        Chain priority:
-            1. Claude (if anthropic_key provided AND credit available)
-            2. Gemini (if gemini_review_key provided)
-            3. Heuristic (always available as last resort)
+        Background:
+          - User has confirmed Anthropic credit will NOT be funded (zero & staying zero)
+          - User has 3 Google accounts → 3 independent Gemini keys with full quotas
+          - Heuristic was structurally too weak to reliably pass valid content
+
+        Decision:
+          - Claude reviewer: DISABLED (anthropic_key ignored even if provided)
+          - Heuristic reviewer: DISABLED as fallback (kept on instance for legacy
+            tests but never invoked in the live chain)
+          - Gemini reviewer: PRIMARY and ONLY active reviewer
+
+        The retry logic inside GeminiReviewer (3 attempts with exponential backoff)
+        plus the rate limiter at the script-pool level should keep us under the
+        5 RPM Gemini free-tier ceiling per key. Phase 3 (the day this runs) has
+        an entire dedicated daily quota with no other consumers.
 
         Args:
-            anthropic_key: Anthropic API key for Claude reviewer (preferred)
-            gemini_review_key: Dedicated Gemini key for fallback reviewer
+            anthropic_key: IGNORED (kept for signature compatibility)
+            gemini_review_key: REQUIRED for validation to succeed
             confidence_threshold: minimum confidence to pass validation
         """
         self._fetcher = AuthenticTafsirFetcher()
-        self._claude_reviewer: Optional[ClaudeReviewer] = None
+        self._claude_reviewer: Optional[ClaudeReviewer] = None  # ALWAYS None now
         self._gemini_reviewer: Optional[GeminiReviewer] = None
-        self._heuristic_reviewer = HeuristicReviewer()
+        self._heuristic_reviewer = HeuristicReviewer()  # kept but NOT used in chain
         self._confidence_threshold = confidence_threshold
-        # v22.5: Track Claude credit failures within a run to avoid retry storms
-        self._claude_credit_exhausted = False
+        # Legacy flag — no longer meaningful since Claude is disabled, but kept
+        # so existing code paths that reference it don't crash.
+        self._claude_credit_exhausted = True
 
         if anthropic_key:
-            self._claude_reviewer = ClaudeReviewer(anthropic_key)
+            logger.info(
+                "ℹ️ Anthropic key provided but ignored — v22.5 uses Gemini-only "
+                "validation (Claude disabled by design)"
+            )
 
         if gemini_review_key:
             self._gemini_reviewer = GeminiReviewer(gemini_review_key)
-
-        if not self._claude_reviewer and not self._gemini_reviewer:
-            logger.warning(
-                "⚠️ TafsirValidator running without Claude OR Gemini — "
-                "using heuristic fallback only (not recommended for production)"
-            )
-        elif not self._claude_reviewer:
             logger.info(
-                "ℹ️ TafsirValidator: Claude unavailable, Gemini reviewer is primary"
-            )
-        elif not self._gemini_reviewer:
-            logger.info(
-                "ℹ️ TafsirValidator: Claude is primary, Gemini fallback unavailable"
+                "✅ TafsirValidator: Gemini-only architecture active "
+                "(reviewer=gemini-2.5-flash)"
             )
         else:
-            logger.info(
-                "✅ TafsirValidator: Claude (primary) + Gemini (fallback) wired"
+            logger.error(
+                "❌ TafsirValidator: NO Gemini key — validation will fail "
+                "every episode. Set GEMINI_API_KEY_3 to enable."
             )
     
     def validate_explanation(
@@ -660,109 +671,95 @@ class TafsirValidator:
         llm_analogy: str = "",
     ) -> TafsirValidationResult:
         """
-        Validates LLM-generated explanation for a single ayah.
-        Returns TafsirValidationResult — orchestrator should reject episode if passed=False.
+        v22.5 FINAL: Validates one ayah explanation against authentic tafsir.
+
+        Architecture: Gemini-only. No Claude. No heuristic fallback.
+        On Gemini infrastructure failure, returns failure with a clear concern
+        so the Phase 3 day-N+1 retry catches it with fresh quota.
         """
-        # Layer 1: Fetch authentic tafsir
+        # Layer 1: Fetch authentic tafsir (HTTP — no Gemini quota cost)
         authentic = self._fetcher.fetch_combined(surah, ayah_number)
         if not authentic:
             logger.warning(
                 f"⚠️ No authentic tafsir for {surah_name} {ayah_number} — "
-                f"falling back to heuristic-only check"
+                f"cannot validate (returning soft-pass with low confidence)"
             )
-            # Still try heuristic on whatever we have
             return TafsirValidationResult(
-                passed=True,  # Don't block if we can't validate
+                passed=True,  # Don't block if source unavailable
                 confidence=0.3,
                 concerns=["Authentic tafsir unavailable — manual review recommended"],
                 reviewer="none",
             )
-        
-        # Layer 2: Claude review (preferred — if available + credit)
-        if self._claude_reviewer and not self._claude_credit_exhausted:
-            result = self._claude_reviewer.review(
-                ayah_text=ayah_text,
-                surah_name=surah_name,
-                ayah_number=ayah_number,
-                llm_explanation=llm_explanation,
-                llm_analogy=llm_analogy or "",
-                authentic_tafsir=authentic,
-            )
-            # v22.5: Detect credit exhaustion to skip retries this run
-            if (
-                "credit balance is too low" in str(result.concerns).lower()
-                or "credit_balance" in str(result.concerns).lower()
-            ):
-                logger.error(
-                    "💸 Anthropic credit exhausted — switching to Gemini reviewer "
-                    "for the rest of this run"
-                )
-                self._claude_credit_exhausted = True
-                # Don't return — fall through to Gemini below
-            elif result.confidence < self._confidence_threshold:
-                return TafsirValidationResult(
-                    passed=False,
-                    confidence=result.confidence,
-                    concerns=result.concerns + [
-                        f"Confidence {result.confidence:.2f} below threshold {self._confidence_threshold}"
-                    ],
-                    authentic_excerpt=result.authentic_excerpt,
-                    reviewer=result.reviewer,
-                )
-            else:
-                return result
 
-        # Layer 2b (v22.5): Gemini fallback — if Claude unavailable/failed
-        if self._gemini_reviewer:
-            result = self._gemini_reviewer.review(
-                ayah_text=ayah_text,
-                surah_name=surah_name,
-                ayah_number=ayah_number,
-                llm_explanation=llm_explanation,
-                llm_analogy=llm_analogy or "",
-                authentic_tafsir=authentic,
+        # Layer 2 (v22.5): Gemini is the ONLY active reviewer
+        if not self._gemini_reviewer:
+            logger.error(
+                f"❌ TafsirValidator: Gemini unavailable for {surah_name} ayah {ayah_number} "
+                "— returning failure (Gemini-only architecture, no fallback)"
             )
-            # v22.5 FIX: Distinguish infra errors from genuine religious rejection.
-            # If concerns contain "Reviewer error" / "JSON parse" / "unavailable",
-            # the reviewer COULDN'T review — fall through to heuristic instead of
-            # treating this as a doctrinal failure.
-            concern_text = " ".join(result.concerns).lower()
-            is_infra_error = (
-                "reviewer error" in concern_text
-                or "json parse" in concern_text
-                or "unavailable" in concern_text
-                or "timeout" in concern_text
-                or "503" in concern_text
-                or "429" in concern_text
-                or "rate limit" in concern_text
-                or "quota" in concern_text
+            return TafsirValidationResult(
+                passed=False,
+                confidence=0.0,
+                concerns=[
+                    "Gemini reviewer not configured. "
+                    "Set GEMINI_API_KEY_3 (or last available key)."
+                ],
+                authentic_excerpt=authentic[:300],
+                reviewer="none",
             )
-            if is_infra_error:
-                logger.warning(
-                    f"⚠️ Gemini reviewer infrastructure error "
-                    f"(not a religious rejection) — falling through to heuristic"
-                )
-                # Fall through to Layer 3 below
-            elif result.confidence < self._confidence_threshold:
-                return TafsirValidationResult(
-                    passed=False,
-                    confidence=result.confidence,
-                    concerns=result.concerns + [
-                        f"Confidence {result.confidence:.2f} below threshold {self._confidence_threshold}"
-                    ],
-                    authentic_excerpt=result.authentic_excerpt,
-                    reviewer=result.reviewer,
-                )
-            else:
-                return result
-        
-        # Layer 3: Heuristic fallback
-        return self._heuristic_reviewer.review(
+
+        result = self._gemini_reviewer.review(
             ayah_text=ayah_text,
+            surah_name=surah_name,
+            ayah_number=ayah_number,
             llm_explanation=llm_explanation,
+            llm_analogy=llm_analogy or "",
             authentic_tafsir=authentic,
         )
-    
+
+        # Distinguish infra errors from genuine religious rejection. On infra
+        # errors, surface them clearly — the day-N+1 retry will pick up the
+        # episode with refreshed quota.
+        concern_text = " ".join(result.concerns).lower()
+        is_infra_error = (
+            "reviewer error" in concern_text
+            or "json parse" in concern_text
+            or "unavailable" in concern_text
+            or "timeout" in concern_text
+            or "503" in concern_text
+            or "429" in concern_text
+            or "rate limit" in concern_text
+            or "quota" in concern_text
+        )
+        if is_infra_error:
+            logger.error(
+                f"❌ Gemini infra error on {surah_name} ayah {ayah_number}: "
+                f"{result.concerns[0] if result.concerns else 'unknown'}"
+            )
+            return TafsirValidationResult(
+                passed=False,
+                confidence=0.0,
+                concerns=result.concerns + [
+                    "Phase quota likely exhausted — retry next day"
+                ],
+                authentic_excerpt=result.authentic_excerpt,
+                reviewer=result.reviewer,
+            )
+
+        if result.confidence < self._confidence_threshold:
+            return TafsirValidationResult(
+                passed=False,
+                confidence=result.confidence,
+                concerns=result.concerns + [
+                    f"Confidence {result.confidence:.2f} below threshold "
+                    f"{self._confidence_threshold}"
+                ],
+                authentic_excerpt=result.authentic_excerpt,
+                reviewer=result.reviewer,
+            )
+
+        return result
+
     def validate_episode(
         self,
         episode_data: Dict,
@@ -813,205 +810,15 @@ class TafsirValidator:
         surah_name: str,
     ) -> Tuple[bool, List[str]]:
         """
-        v20 OPTIMIZATION: Validate all ayahs in ONE Claude call instead of N.
+        v22.5 FINAL: Batched method retained for orchestrator compatibility,
+        but now delegates to per-ayah Gemini validation.
 
-        Cost reduction:
-            Old (validate_episode): 5 ayahs × $0.03 = $0.15/episode
-            New (this method):     1 call × $0.05 = $0.05/episode
-            → 67% cheaper, 5x fewer API calls
-
-        Strategy:
-            - Fetch authentic tafsir for all ayahs in parallel (HTTP batched)
-            - Build single multi-part validation prompt
-            - Send to Claude with structured JSON response schema
-            - Parse per-ayah verdicts from single response
-
-        Falls back to per-ayah validation if Claude unavailable.
+        Background:
+          The original v20 design did one Claude call for the whole episode
+          (cost optimization). With Claude disabled in v22.5 and Gemini's
+          5 RPM free-tier limit, batching no longer helps — we MUST throttle
+          per-ayah anyway. So this method is now a thin wrapper around
+          validate_episode().
         """
-        ayah_scenes = episode_data.get("ayah_scenes", [])
-        if not ayah_scenes:
-            return True, []
+        return self.validate_episode(episode_data, surah, surah_name)
 
-        # v22.5: Skip Claude batched call if credit exhausted in this run
-        if self._claude_credit_exhausted:
-            logger.info(
-                "💸 Claude credit exhausted earlier — going straight to per-ayah "
-                "(which uses Gemini fallback)"
-            )
-            return self.validate_episode(episode_data, surah, surah_name)
-
-        # No Claude reviewer? Fall back to per-ayah heuristic.
-        if not self._claude_reviewer or not self._claude_reviewer._available:
-            logger.info("📋 No Claude reviewer — falling back to per-ayah heuristic")
-            return self.validate_episode(episode_data, surah, surah_name)
-
-        try:
-            import concurrent.futures
-            # Step 1: Fetch all authentic tafsir in parallel
-            authentic_map: Dict[int, str] = {}
-
-            def _fetch(ayah_num: int) -> Tuple[int, str]:
-                # v22.5 FIX: was calling self._fetch_authentic_tafsir (doesn't exist)
-                # Actual API: self._fetcher.fetch_combined(surah, ayah) → str
-                try:
-                    text = self._fetcher.fetch_combined(surah, ayah_num)
-                    return ayah_num, text or ""
-                except Exception as e:
-                    logger.warning(
-                        f"⚠️ Tafsir fetch failed for {surah}:{ayah_num}: {e}"
-                    )
-                    return ayah_num, ""
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
-                futures = [
-                    ex.submit(_fetch, scene.get("ayah", {}).get("number", 0))
-                    for scene in ayah_scenes
-                ]
-                for fut in concurrent.futures.as_completed(futures):
-                    num, text = fut.result()
-                    if text:
-                        authentic_map[num] = text
-
-            # Step 2: Build single batched prompt
-            prompt = self._build_batched_prompt(
-                ayah_scenes, surah_name, authentic_map
-            )
-
-            # Step 3: One Claude call (with v22.5 credit-exhaustion detection)
-            try:
-                verdicts = self._call_claude_batched(prompt)
-            except Exception as e:
-                err_msg = str(e).lower()
-                if "credit balance is too low" in err_msg or "credit_balance" in err_msg:
-                    logger.error(
-                        "💸 Anthropic credit exhausted in batched call — "
-                        "switching to per-ayah Gemini for this episode"
-                    )
-                    self._claude_credit_exhausted = True
-                    return self.validate_episode(episode_data, surah, surah_name)
-                # Other errors: re-raise to outer try/except
-                raise
-
-            # Step 4: Parse per-ayah verdicts
-            all_passed = True
-            all_concerns: List[str] = []
-            for verdict in verdicts:
-                ayah_num = verdict.get("ayah_number", 0)
-                passed = verdict.get("passed", False)
-                concerns = verdict.get("concerns", [])
-                ayah_label = f"{surah_name} {ayah_num}"
-                if not passed:
-                    all_passed = False
-                    all_concerns.extend([f"[{ayah_label}] {c}" for c in concerns])
-                    logger.warning(
-                        f"⚠️ Religious FAIL: {ayah_label} — {len(concerns)} concerns"
-                    )
-                else:
-                    logger.info(f"✅ Religious OK: {ayah_label} (batched)")
-
-            return all_passed, all_concerns
-
-        except Exception as e:
-            logger.warning(
-                f"⚠️ Batched validation failed: {e} — falling back to per-ayah"
-            )
-            return self.validate_episode(episode_data, surah, surah_name)
-
-    def _build_batched_prompt(
-        self,
-        ayah_scenes: List[Dict],
-        surah_name: str,
-        authentic_map: Dict[int, str],
-    ) -> str:
-        """Build prompt that asks Claude to validate all ayahs at once."""
-        ayah_blocks: List[str] = []
-        for i, scene in enumerate(ayah_scenes, 1):
-            ayah_data = scene.get("ayah", {})
-            num = ayah_data.get("number", i)
-            text = ayah_data.get("text", "")
-            authentic = authentic_map.get(num, "")[:1200]
-            explanation = scene.get("explain_text", "")
-            analogy = scene.get("story_text", "")
-            takeaway = scene.get("moral_text", "")
-
-            ayah_blocks.append(f"""
-═══ آية رقم {num} ═══
-[النص]: {text}
-
-[التفسير المعتمد - السعدي/الميسر]:
-{authentic if authentic else '(غير متاح — اعتمد على معرفتك التفسيرية)'}
-
-[الشرح المُنتج آلياً]:
-الشرح: {explanation}
-المثال: {analogy}
-الخلاصة: {takeaway}
-""")
-
-        ayahs_section = "\n".join(ayah_blocks)
-
-        return f"""أنت مدقق ديني صارم. تراجع شرحاً قرآنياً للأطفال أُنتج بنظام آلي.
-سورة {surah_name}، عدد الآيات: {len(ayah_scenes)}.
-
-{ayahs_section}
-
-═══════════════════════════════════════
-[المطلوب]:
-قيّم كل آية على الـ 5 محاور:
-1. التوافق العقدي مع التفاسير المعتمدة
-2. الدقة التفسيرية
-3. التبسيط الآمن (لم يخل بمفهوم عقدي)
-4. سلامة التشبيهات (لا تشبه الله بمخلوقاته)
-5. اللهجة الموقّرة
-
-أجب بـ JSON فقط، بدون أي نص خارجه:
-
-{{
-  "verdicts": [
-    {{
-      "ayah_number": 1,
-      "passed": true/false,
-      "confidence": 0.0-1.0,
-      "concerns": ["..."],
-      "key_finding": "summary"
-    }}
-    // ... كرر لكل آية
-  ]
-}}
-
-passed=false إذا فيه أي خطأ عقدي أو معلومة غلط.
-passed=true فقط إذا كل المحاور سليمة.
-"""
-
-    def _call_claude_batched(self, prompt: str) -> List[Dict]:
-        """Call Claude with batched prompt, return list of per-ayah verdicts.
-
-        v22.5 FIX: Uses self._claude_reviewer._client directly (the bug was
-        accessing self._anthropic_key which doesn't exist on this class).
-        """
-        if not self._claude_reviewer or not self._claude_reviewer._available:
-            raise RuntimeError("Claude reviewer not available")
-
-        client = self._claude_reviewer._client
-
-        # Use larger max_tokens since we're returning multiple verdicts
-        response = client.messages.create(
-            model="claude-opus-4-7",
-            max_tokens=2000,  # ~5 verdicts × 400 tokens each
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        text = response.content[0].text.strip()
-        # Strip markdown if present
-        import re
-        text = re.sub(r'^```(?:json)?\s*', '', text)
-        text = re.sub(r'\s*```$', '', text)
-
-        try:
-            data = json.loads(text)
-            verdicts = data.get("verdicts", [])
-            if not isinstance(verdicts, list):
-                raise ValueError("verdicts is not a list")
-            return verdicts
-        except json.JSONDecodeError as e:
-            logger.error(f"Could not parse batched verdicts: {e}\nText: {text[:500]}")
-            raise
