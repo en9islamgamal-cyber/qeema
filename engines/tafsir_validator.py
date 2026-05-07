@@ -406,13 +406,11 @@ class GeminiReviewer:
         """Single Gemini review call. Raises on transient errors so the
         retry wrapper in review() can catch them.
 
-        v22.5: Acquires a rate-limit token before calling Gemini. This is
-        the same limiter ScriptEngine uses if they share a key, so combined
-        traffic on key #1 in Phase 1 stays under 4 RPM.
+        v22.5.2: bumped max_output_tokens to 2048 (was 800 — too tight for
+        Arabic prompts which use ~3 chars per token vs 1 for English).
+        Also added robust field-by-field JSON salvage for the case where
+        Gemini returns malformed JSON with broken Arabic escapes.
         """
-        # Block if we'd exceed 4 RPM on this key (shared with ScriptEngine).
-        # If no limiter (e.g. empty key in tests), skip — but we'd be
-        # unavailable anyway so this branch isn't reached in practice.
         if self._rate_limiter is not None:
             self._rate_limiter.acquire()
 
@@ -421,64 +419,31 @@ class GeminiReviewer:
             model="gemini-2.5-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
-                temperature=0.1,  # low for consistency on religious validation
+                temperature=0.1,
                 response_mime_type="application/json",
-                max_output_tokens=800,
+                max_output_tokens=2048,  # Arabic ~3 chars/token, gives headroom
             ),
         )
         text = response.text.strip() if response.text else ""
 
-        # Strip markdown fences if present (Gemini sometimes adds them despite
-        # response_mime_type=json)
+        # Strip markdown fences if present
         if text.startswith("```json"):
             text = text[7:]
         if text.startswith("```"):
             text = text[3:]
         if text.endswith("```"):
             text = text[:-3]
+        text = text.strip()
 
-        # Normalize smart quotes — Gemini occasionally wraps Arabic strings in
-        # “” instead of "" which breaks JSON parsing.
+        # Normalize smart quotes
         text = (text
-            .replace("\u201c", '"').replace("\u201d", '"')  # smart double
-            .replace("\u2018", "'").replace("\u2019", "'")  # smart single
-            .replace("\u00ab", '"').replace("\u00bb", '"')  # guillemets
+            .replace("\u201c", '"').replace("\u201d", '"')
+            .replace("\u2018", "'").replace("\u2019", "'")
+            .replace("\u00ab", '"').replace("\u00bb", '"')
         )
 
-        try:
-            data = json.loads(text.strip())
-        except json.JSONDecodeError as parse_err:
-            # Salvage 1: find first { ... last }
-            import re as _re
-            match = _re.search(r'\{.*\}', text, flags=_re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    # Salvage 2: response was truncated. Extract just the
-                    # numeric/boolean fields with regex — concerns may be lost
-                    # but passed/confidence are what gates the validation.
-                    logger.warning(
-                        f"⚠️ Gemini response truncated for ayah {ayah_number}, "
-                        f"salvaging fields via regex"
-                    )
-                    passed_match = _re.search(
-                        r'"passed"\s*:\s*(true|false)', text, _re.IGNORECASE,
-                    )
-                    conf_match = _re.search(
-                        r'"confidence"\s*:\s*([0-9.]+)', text,
-                    )
-                    if passed_match and conf_match:
-                        data = {
-                            "passed": passed_match.group(1).lower() == "true",
-                            "confidence": float(conf_match.group(1)),
-                            "concerns": ["[response truncated — regex-salvaged]"],
-                        }
-                    else:
-                        # Truly unparseable — re-raise to trigger the retry chain
-                        raise parse_err
-            else:
-                raise parse_err
+        # ─── Robust parsing chain ────────────────────────────────
+        data = self._robust_parse_json(text, ayah_number)
 
         return TafsirValidationResult(
             passed=bool(data.get("passed", False)),
@@ -487,6 +452,89 @@ class GeminiReviewer:
             authentic_excerpt=authentic_tafsir[:300],
             reviewer="gemini-2.5-flash",
         )
+
+    @staticmethod
+    def _robust_parse_json(text: str, ayah_number: int) -> Dict[str, Any]:
+        """Parse Gemini JSON output with multiple fallback strategies.
+
+        Real-world failures observed in production logs:
+          • "Unterminated string starting at: line 4 column 3"
+          • "Expecting property name enclosed in double quotes: line 3 col 21"
+
+        These happen when Gemini outputs malformed JSON with Arabic content
+        (broken escapes, mid-string newlines, trailing commas, etc).
+
+        Strategy:
+          1. json.loads — works for clean output
+          2. Find {...} substring and parse — handles preamble/markdown
+          3. Field-level regex extraction — works on truncated output
+          4. Last resort: return safe default that triggers a retry
+        """
+        import re as _re
+
+        # Layer 1: clean parse
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Layer 2: extract JSON object substring
+        match = _re.search(r'\{.*\}', text, flags=_re.DOTALL)
+        if match:
+            obj_text = match.group(0)
+            try:
+                return json.loads(obj_text)
+            except (json.JSONDecodeError, ValueError):
+                # Try fixing common issues: trailing commas, unquoted keys
+                fixed = _re.sub(r',\s*([\]}])', r'\1', obj_text)  # trailing commas
+                # Quote unquoted keys: `confidence:` → `"confidence":`
+                fixed = _re.sub(
+                    r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:',
+                    r'\1"\2":',
+                    fixed,
+                )
+                try:
+                    return json.loads(fixed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        # Layer 3: field-by-field regex extraction (handles truncation)
+        passed_match = _re.search(
+            r'"passed"\s*:\s*(true|false)', text, _re.IGNORECASE,
+        )
+        conf_match = _re.search(
+            r'"confidence"\s*:\s*([0-9.]+)', text,
+        )
+        if passed_match and conf_match:
+            logger.warning(
+                f"⚠️ Salvaged malformed JSON for ayah {ayah_number} via regex "
+                f"(passed={passed_match.group(1)}, conf={conf_match.group(1)})"
+            )
+            # Try to extract concerns array (best effort)
+            concerns_match = _re.search(
+                r'"concerns"\s*:\s*\[([^\]]*)\]', text, _re.DOTALL,
+            )
+            concerns: List[str] = []
+            if concerns_match:
+                # Pull quoted strings from inside the array
+                concerns = _re.findall(r'"([^"]*)"', concerns_match.group(1))
+            return {
+                "passed": passed_match.group(1).lower() == "true",
+                "confidence": float(conf_match.group(1)),
+                "concerns": concerns or ["[malformed JSON — fields salvaged via regex]"],
+            }
+
+        # Layer 4: complete failure — log raw text for debugging and fail closed
+        logger.error(
+            f"❌ Could not parse Gemini response for ayah {ayah_number}. "
+            f"Raw (first 500 chars): {text[:500]!r}"
+        )
+        # Return safe default that indicates failure (downstream gates this)
+        return {
+            "passed": False,
+            "confidence": 0.0,
+            "concerns": [f"JSON parse completely failed (raw len={len(text)})"],
+        }
 
     def _build_review_prompt(
         self,
@@ -767,20 +815,54 @@ class GeminiReviewer:
             .replace("\u00ab", '"').replace("\u00bb", '"')
         )
 
-        # Parse the JSON array
+        # Parse the JSON array — try clean parse, then progressive salvage
+        data: Dict[str, Any] = {}
         try:
             data = json.loads(text.strip())
-        except json.JSONDecodeError:
-            # Salvage: find { ... }
+        except (json.JSONDecodeError, ValueError):
+            # Salvage 1: find { ... }
             import re as _re
             match = _re.search(r'\{.*\}', text, flags=_re.DOTALL)
-            if not match:
-                raise
-            data = json.loads(match.group(0))
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                except (json.JSONDecodeError, ValueError):
+                    # Salvage 2: trailing-comma fix
+                    fixed = _re.sub(r',\s*([\]}])', r'\1', match.group(0))
+                    try:
+                        data = json.loads(fixed)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
 
-        reviews = data.get("reviews", [])
+        reviews = data.get("reviews", []) if data else []
         if not isinstance(reviews, list):
-            raise ValueError(f"Expected 'reviews' array, got {type(reviews)}")
+            reviews = []
+
+        # If batch parse failed completely, fall back to per-ayah field extraction
+        if not reviews:
+            logger.warning(
+                f"⚠️ Batch JSON unparseable, salvaging individual ayah fields. "
+                f"Raw (first 300 chars): {text[:300]!r}"
+            )
+            import re as _re
+            # Find every { passed: ..., confidence: ..., ayah_number: ... } block
+            # Pattern allows them in any order (Gemini doesn't always output consistently)
+            block_pattern = _re.compile(
+                r'\{[^{}]*?"ayah_number"\s*:\s*(\d+)[^{}]*?\}',
+                flags=_re.DOTALL,
+            )
+            for block_match in block_pattern.finditer(text):
+                block = block_match.group(0)
+                ayah_match = block_match.group(1)
+                passed_m = _re.search(r'"passed"\s*:\s*(true|false)', block, _re.I)
+                conf_m = _re.search(r'"confidence"\s*:\s*([0-9.]+)', block)
+                if passed_m and conf_m:
+                    reviews.append({
+                        "ayah_number": int(ayah_match),
+                        "passed": passed_m.group(1).lower() == "true",
+                        "confidence": float(conf_m.group(1)),
+                        "concerns": ["[salvaged from malformed batch JSON]"],
+                    })
 
         # Build result list — one per input ayah, in input order
         results: List[TafsirValidationResult] = []
