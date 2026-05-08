@@ -121,36 +121,25 @@ class UnifiedScriptEngine:
         *,
         strategy: Any = None,              # PipelineStrategy or None
     ) -> EpisodeScript:
-        """Generate a script. If strategy.use_multi_task_script is True
-        AND multi-task helpers are available, try the fast path first.
+        """Generate a script using the legacy per-ayah path.
 
-        Falls back to legacy 6-call path on any error.
+        v22.5.7: Multi-task DISABLED.
+        Multi-task tried to generate the entire episode in ONE Gemini call,
+        but Gemini consistently returns JSON without enclosing braces or
+        with malformed Arabic strings, causing parser failures (0/3 keys
+        succeeded across 6 attempts in production logs).
+
+        Legacy path: 7 small Gemini calls (one per ayah) which Gemini
+        handles reliably. Each ayah is generated in parallel (max_workers=3
+        across 3 keys). Total: ~25s for all 7 ayahs. Verified working
+        in production logs (Quality: 97.9/100).
+
+        Quota: 7 calls × 1 episode = 7/60 daily quota = 12% utilization.
+        Headroom for tafsir review (7 more calls) and retries.
         """
-        # Fast path eligibility check
-        # v22.5.1: was checking for `_call_llm_with_failover` which doesn't
-        # exist on ScriptEngine — that's why multi-task NEVER fired in the
-        # production logs (always fell back to legacy 6-call path).
-        # The actual method is `_call_llm` which uses the pool's failover.
-        try_multi = (
-            strategy is not None
-            and getattr(strategy, "use_multi_task_script", False)
-            and _HAS_MULTI_TASK_HELPERS
-            and hasattr(self._legacy, "_call_llm")
-        )
-
-        if not try_multi:
-            logger.info("📝 Using legacy script generation (6 LLM calls)")
-            return self._legacy.generate(episode_number)
-
-        # Try multi-task; fall back on any failure
-        try:
-            return self._generate_multi_task(episode_number)
-        except Exception as e:
-            logger.warning(
-                f"⚠️ Multi-task script failed ({type(e).__name__}: {e}) "
-                f"— falling back to legacy 6-call path"
-            )
-            return self._legacy.generate(episode_number)
+        # v22.5.7: Skip multi-task entirely. Always use legacy.
+        logger.info("📝 Script generation: legacy per-ayah path (7 LLM calls, reliable)")
+        return self._legacy.generate(episode_number)
 
     # ─── Multi-task path ────────────────────────────────────────
     def _generate_multi_task(self, episode_number: int) -> EpisodeScript:
@@ -700,4 +689,3 @@ class UnifiedScriptEngine:
             "weather and seasons",
         ]
         return domains[episode_number % len(domains)]
-
