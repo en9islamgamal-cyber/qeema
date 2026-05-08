@@ -773,3 +773,4 @@ class ScriptEngine:
 
     def health_report(self) -> dict:
         return self._pool.health_report()
+
