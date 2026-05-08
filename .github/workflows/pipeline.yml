@@ -328,11 +328,11 @@ jobs:
       # ─── Main pipeline run ───────────────────────────────────
       - name: Run QEEMA pipeline v22.5
         env:
-          # ── LLM providers
+          # ── LLM providers (Gemini-only since v22.5.6)
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # Groq removed in v22.5.6 — Llama-3.3 produced doctrinally weak Arabic
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
           # ── TTS
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
