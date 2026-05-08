@@ -453,3 +453,4 @@ class AppConfig:
             raise ConfigurationError(
                 f"Missing required configuration: {', '.join(missing)}"
             )
+
