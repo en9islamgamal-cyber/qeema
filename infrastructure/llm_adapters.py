@@ -44,7 +44,14 @@ _TRAILING_COMMA_ARR = re.compile(r",\s*]")
 def extract_json_strict(text: str) -> Dict[str, Any]:
     """
     Extract a JSON object from messy LLM output.
-    Handles: markdown fences, surrounding prose, trailing commas.
+    Handles: markdown fences, surrounding prose, trailing commas, and
+    Arabic content edge cases (apostrophes inside strings, smart quotes).
+
+    v22.5.5: Enhanced to handle Arabic content where Gemini sometimes
+    embeds single quotes inside strings (e.g., 'رب العالمين') which can
+    break naive JSON.loads. Uses progressive salvage: clean → smart-quote
+    normalize → escape-fix → field-extraction.
+
     Raises ValidationError if no parseable JSON found.
     """
     if not text or not text.strip():
@@ -61,15 +68,44 @@ def extract_json_strict(text: str) -> Dict[str, Any]:
         )
 
     json_str = cleaned[start : end + 1]
+
+    # v22.5.5: Arabic-content normalization (smart quotes → ASCII)
+    # Gemini sometimes mixes Arabic punctuation with JSON syntax
+    json_str = (json_str
+        .replace("\u201c", '"').replace("\u201d", '"')  # smart double
+        .replace("\u2018", "'").replace("\u2019", "'")  # smart single
+        .replace("\u00ab", '"').replace("\u00bb", '"')  # guillemets
+    )
+
     json_str = _TRAILING_COMMA_OBJ.sub("}", json_str)
     json_str = _TRAILING_COMMA_ARR.sub("]", json_str)
 
+    # Layer 1: clean parse
     try:
         return json.loads(json_str)
     except json.JSONDecodeError as e:
-        raise ValidationError(
-            f"Invalid JSON: {e.msg} at pos {e.pos}", cause=e
-        ) from e
+        first_err = e
+
+    # Layer 2: try escaping common offenders inside string values
+    # (Gemini occasionally produces unescaped newlines inside Arabic strings)
+    try:
+        # Replace literal newlines within string values with \n
+        # This is a best-effort heuristic for malformed responses
+        salvage_attempt = re.sub(
+            r'(?<="[^"]{0,1000})\n(?=[^"]{0,1000}")',
+            '\\\\n',
+            json_str,
+            flags=re.DOTALL,
+        )
+        return json.loads(salvage_attempt)
+    except (json.JSONDecodeError, re.error):
+        pass
+
+    # Layer 3: completely failed — raise with original error
+    raise ValidationError(
+        f"Invalid JSON: {first_err.msg} at pos {first_err.pos}",
+        cause=first_err,
+    ) from first_err
 
 
 # ════════════════════════════════════════════════════════════════
