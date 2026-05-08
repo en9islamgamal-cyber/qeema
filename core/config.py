@@ -58,25 +58,15 @@ class APIKeysConfig:
     def script_pool_keys(self) -> Tuple[str, ...]:
         """Gemini keys reserved for Phase 1 script generation.
 
-        v22.5 FINAL: Phase 1 uses ONLY key #1. The other keys are reserved
-        for other phases on different days:
-            key #1 → Phase 1 (Day 1): script + tafsir validation
-            key #2 → Phase 2 (Day 2): deep visuals + TTS director
-            key #3 → reserved (currently unused — could be Phase 3 fallback)
+        v22.5.6: Uses ALL Gemini keys (rotation across the pool).
+        Each key has its own 20/day free-tier quota when keys come from
+        separate Google accounts. Groq fallback removed entirely — it
+        produced doctrinally weak Arabic that failed religious review.
 
-        With each key on a separate Google account, this gives each phase a
-        full daily 5-RPM quota (= 7,200 calls/day) — far more than needed
-        (~14 in Phase 1, ~22 in Phase 2).
-
-        Fallback for fewer keys:
-            1 key  → all phases share the same key
-            2 keys → key 1 for Phase 1, key 2 for Phase 2+, no key 3
-            3+ keys → as documented above
+        With 3 keys × 20/day = 60 calls/day. Episode needs ~10 calls.
+        Plenty of headroom for retries and multi-task generation.
         """
-        if not self.gemini_keys:
-            return ()
-        # Phase 1 uses ONLY the first key
-        return (self.gemini_keys[0],)
+        return self.gemini_keys
 
     @property
     def phase2_gemini_key(self) -> str:
