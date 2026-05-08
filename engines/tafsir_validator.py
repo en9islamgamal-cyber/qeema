@@ -405,27 +405,48 @@ class GeminiReviewer:
         authentic_tafsir: str,
         ayah_number: int,
     ) -> TafsirValidationResult:
-        """Single Gemini review call. Raises on transient errors so the
-        retry wrapper in review() can catch them.
+        """Single Gemini review call.
 
-        v22.5.2: bumped max_output_tokens to 2048 (was 800 — too tight for
-        Arabic prompts which use ~3 chars per token vs 1 for English).
-        Also added robust field-by-field JSON salvage for the case where
-        Gemini returns malformed JSON with broken Arabic escapes.
+        v22.5.7: Uses Pydantic response_schema to FORCE valid JSON.
+        Previous parser failures ("Unterminated string", "Expecting ','
+        delimiter") are eliminated because the SDK validates against the
+        schema before returning. Falls back to manual JSON parsing only
+        if response.parsed is unavailable.
         """
         if self._rate_limiter is not None:
             self._rate_limiter.acquire()
 
-        from google.genai import types
+        from google.genai import types as genai_types
+
+        # v22.5.7: Pydantic schema for guaranteed valid JSON
+        class _SingleReview(BaseModel):
+            passed: bool = Field(description="True if explanation matches tafsir")
+            confidence: float = Field(description="0.0-1.0 confidence", ge=0.0, le=1.0)
+            concerns: List[str] = Field(default_factory=list, description="Specific issues")
+
         response = self._client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
-            config=types.GenerateContentConfig(
+            config=genai_types.GenerateContentConfig(
                 temperature=0.1,
                 response_mime_type="application/json",
-                max_output_tokens=2048,  # Arabic ~3 chars/token, gives headroom
+                response_schema=_SingleReview,
+                max_output_tokens=2048,
             ),
         )
+
+        # SDK auto-parses response_schema to typed object
+        parsed = getattr(response, "parsed", None)
+        if parsed is not None and hasattr(parsed, "passed"):
+            return TafsirValidationResult(
+                passed=bool(parsed.passed),
+                confidence=float(parsed.confidence),
+                concerns=list(parsed.concerns),
+                authentic_excerpt=authentic_tafsir[:300],
+                reviewer="gemini-2.5-flash",
+            )
+
+        # Fallback: manual parsing (should be rare with response_schema)
         text = response.text.strip() if response.text else ""
 
         # Strip markdown fences if present
@@ -444,7 +465,6 @@ class GeminiReviewer:
             .replace("\u00ab", '"').replace("\u00bb", '"')
         )
 
-        # ─── Robust parsing chain ────────────────────────────────
         data = self._robust_parse_json(text, ayah_number)
 
         return TafsirValidationResult(
