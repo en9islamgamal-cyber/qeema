@@ -91,21 +91,18 @@ class TestAPIKeySplits:
         )
 
     def test_three_keys_phase_1_uses_only_first(self):
-        """v22.5 FINAL: Phase 1 (script + tafsir) uses ONLY key #1.
-        Keys #2 and #3 are reserved for other phases on other days."""
+        """v22.5.6: script_pool_keys returns ALL keys (was: only key 1).
+        Reason: Groq removed, so we use ALL Gemini keys for redundancy.
+        Each key has its own daily quota."""
         k = self._build('k1', 'k2', 'k3')
-        # Phase 1 script pool = key 1 only (we don't load-balance — we throttle)
-        assert k.script_pool_keys == ('k1',)
-        # Tafsir validation co-locates on key 1 (same day, same phase)
+        assert k.script_pool_keys == ('k1', 'k2', 'k3')
         assert k.tafsir_review_key == 'k1'
-        # Key 2 is reserved for Phase 2 (visuals + TTS director on Day 2)
-        # — accessed via gemini_keys[1] when Phase 2 builds its adapter
         assert k.gemini_keys[1] == 'k2'
 
     def test_two_keys_phase_1_uses_first(self):
-        """With 2 keys: Phase 1 still uses only key 1; key 2 reserved for Phase 2."""
+        """v22.5.6: With 2 keys, both are in the script pool."""
         k = self._build('k1', 'k2')
-        assert k.script_pool_keys == ('k1',)
+        assert k.script_pool_keys == ('k1', 'k2')
         assert k.tafsir_review_key == 'k1'
         assert k.gemini_keys[1] == 'k2'
 
@@ -120,10 +117,9 @@ class TestAPIKeySplits:
         assert k.tafsir_review_key == ''
 
     def test_four_keys_phase_1_still_uses_only_first(self):
-        """Even with 4 keys, Phase 1 throttles on key 1.
-        Throttling > pooling for the 5-RPM-per-project free tier."""
+        """v22.5.6: With 4 keys, all 4 are in the script pool."""
         k = self._build('k1', 'k2', 'k3', 'k4')
-        assert k.script_pool_keys == ('k1',)
+        assert k.script_pool_keys == ('k1', 'k2', 'k3', 'k4')
         assert k.tafsir_review_key == 'k1'
 
 
