@@ -383,15 +383,17 @@ class ScriptEngine:
             logger.info("✅ Hook optimizer wired (data-driven selection)")
 
     def _setup_providers(self, api_keys: APIKeysConfig) -> None:
-        # v22.5: use script_pool_keys (excludes the dedicated tafsir key — but
-        # in our 1-key Phase 1 design, that key IS the script key too).
-        #
-        # Rate limiting moved to GeminiJsonAdapter level (shared per-key sliding
-        # window via core.gemini_rate_limiter). This means ScriptEngine and
-        # TafsirValidator using the same key automatically share the 4 RPM
-        # window. The ProviderPool no longer enforces a separate rate limit
-        # — it would double-throttle and is now used only for circuit-breaker
-        # failure handling.
+        """Set up Gemini-only provider pool.
+
+        v22.5.6: Removed Groq. With 3 Gemini keys × 20/day = 60 calls/day,
+        we have far more capacity than needed (~10 calls/episode). Groq's
+        Llama-3.3-70b produced Arabic religious content that consistently
+        failed tafsir review (confidence 0.70-0.80, marked passed=false).
+        Single-provider pool with 3 keys gives:
+          - Higher quality (Gemini better at Arabic religious nuance)
+          - No race condition (no Groq winning when Gemini delays)
+          - Consistent JSON format (same model = same edge cases)
+        """
         for i, key in enumerate(api_keys.script_pool_keys, start=1):
             try:
                 name = f"gemini-{i}"
@@ -404,34 +406,24 @@ class ScriptEngine:
                     breaker_config=CircuitBreakerConfig(
                         failure_threshold=4, recovery_timeout_sec=45.0,
                     ),
-                    # rate_limit removed — adapter handles via shared limiter
                 )
             except Exception as e:
                 logger.warning(f"⚠️ Gemini #{i} init failed: {e}")
 
-        if api_keys.groq:
-            try:
-                self._adapters["groq"] = GroqJsonAdapter(
-                    api_keys.groq, instance_name="groq",
-                )
-                self._adapter_names.append("groq")
-                self._pool.register(
-                    "groq",
-                    breaker_config=CircuitBreakerConfig(
-                        failure_threshold=4, recovery_timeout_sec=30.0,
-                    ),
-                    rate_limit=(2.0, 10),
-                )
-            except Exception as e:
-                logger.warning(f"⚠️ Groq init failed: {e}")
+        # v22.5.6: Groq removed. The previous fallback chain
+        # (Gemini → Groq) caused Groq to "win" the round-robin when
+        # Gemini was rate-limited, producing scripts with doctrinal
+        # drift that Gemini reviewer then rejected.
+        # If you really need a non-Gemini fallback, use a 4th Gemini
+        # key from a 4th Google account, not Groq.
 
         if not self._adapters:
             raise ConfigurationError(
-                "No LLM providers. Set GEMINI_API_KEY or GROQ_API_KEY."
+                "No Gemini providers. Set GEMINI_API_KEY (and optionally _2, _3)."
             )
         logger.info(
-            f"✅ ScriptEngine v16: {len(self._adapters)} providers: "
-            f"{list(self._adapters.keys())}"
+            f"✅ ScriptEngine v16: {len(self._adapters)} Gemini providers: "
+            f"{list(self._adapters.keys())} (Groq removed in v22.5.6)"
         )
 
     def _call_llm(self, prompt: str, system: str = SYSTEM_PROMPT) -> Dict[str, Any]:
