@@ -226,8 +226,8 @@ class TestPhaseKeyIsolation:
         try:
             from core.config import APIKeysConfig
             api = APIKeysConfig.from_env()
-            assert api.script_pool_keys == ('k1',), \
-                f"Phase 1 must use ONLY k1, got: {api.script_pool_keys}"
+            assert api.script_pool_keys == ('k1', 'k2', 'k3'), \
+                f"v22.5.6: Phase 1 uses ALL Gemini keys, got: {api.script_pool_keys}"
             assert api.tafsir_review_key == 'k1', \
                 f"Tafsir is in Phase 1 → must use k1, got: {api.tafsir_review_key}"
         finally:
