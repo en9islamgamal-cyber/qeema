@@ -351,34 +351,58 @@ class UnifiedScriptEngine:
 
     # ─── LLM call (delegates to legacy engine's failover machinery) ──
     def _call_llm(self, prompt: str) -> str:
-        """Call LLM for multi-task script generation.
+        """Call Gemini for multi-task script generation.
 
-        v22.5.4: prefer Gemini direct over the pool. Groq has produced
-        scripts that fail Gemini's tafsir review with confidence 0.70-0.80
-        (probable doctrinal drift). Gemini directly produces text Gemini
-        agrees with — same model, fewer review failures.
+        v22.5.6: Gemini-only with multi-key rotation. Groq removed.
 
         Order:
-          1. Try gemini-1 adapter directly (best quality for Arabic religious)
-          2. Fall back to the pool's failover (will pick groq if gemini down)
+          1. Try gemini-1, gemini-2, gemini-3 in sequence
+          2. Each key has its own quota — if one is rate-limited, try next
+          3. If all 3 fail, raise — the daily cron will retry tomorrow
         """
-        # Try Gemini first if available
+        from engines.script_engine import SYSTEM_PROMPT
         adapters = getattr(self._legacy, "_adapters", {})
-        if "gemini-1" in adapters:
+
+        last_error: Optional[Exception] = None
+        for key_name in ("gemini-1", "gemini-2", "gemini-3"):
+            if key_name not in adapters:
+                continue
             try:
-                from engines.script_engine import SYSTEM_PROMPT
-                result = adapters["gemini-1"].generate_json(prompt, SYSTEM_PROMPT)
+                result = adapters[key_name].generate_json(prompt, SYSTEM_PROMPT)
                 if isinstance(result, dict):
-                    logger.info("🎯 Multi-task: used Gemini direct (better Arabic)")
+                    logger.info(f"🎯 Multi-task: used {key_name} (Gemini direct)")
                     return json.dumps(result, ensure_ascii=False)
                 return result
             except Exception as e:
+                last_error = e
+                err_msg = str(e).lower()
+                # Daily quota exhausted → try next key
+                if "resource_exhausted" in err_msg or "quota" in err_msg:
+                    logger.warning(
+                        f"⚠️ {key_name} daily quota exhausted, "
+                        f"trying next key"
+                    )
+                    continue
+                # Other error → log but try next
                 logger.warning(
-                    f"⚠️ Multi-task Gemini direct failed ({e}) — "
-                    f"falling back to pool"
+                    f"⚠️ {key_name} failed ({type(e).__name__}: {e}), "
+                    f"trying next key"
                 )
 
-        # Fall back to legacy pool with failover
+        # All Gemini keys exhausted — fail loudly
+        raise RuntimeError(
+            f"All Gemini keys exhausted for multi-task script. "
+            f"Last error: {last_error}"
+        )
+
+    def _call_llm_legacy_pool_REMOVED(self, prompt: str) -> str:
+        """Legacy fallback path — disabled in v22.5.6.
+
+        Previously fell back to ScriptEngine pool which included Groq.
+        Removed because Groq Llama-3.3 produced doctrinally weak Arabic
+        that consistently failed Gemini's tafsir review.
+        """
+        # Kept as method stub in case any old call site references it
         for method_name in [
             "_call_llm_with_failover",
             "_call_llm",
@@ -399,14 +423,6 @@ class UnifiedScriptEngine:
                 if isinstance(result, dict):
                     return json.dumps(result, ensure_ascii=False)
                 return result
-
-        # Last resort: use the provider pool directly
-        pool = getattr(self._legacy, "_provider_pool", None)
-        if pool is not None and hasattr(pool, "execute"):
-            return pool.execute(
-                lambda provider: provider.generate(prompt),
-                operation_name="multi_task_script",
-            )
 
         raise RuntimeError(
             "Cannot find LLM call method on legacy ScriptEngine — "
