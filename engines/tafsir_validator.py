@@ -60,6 +60,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
+from pydantic import BaseModel, Field
+
 import requests
 
 logger = logging.getLogger(__name__)
@@ -776,6 +778,9 @@ class GeminiReviewer:
     ) -> List[TafsirValidationResult]:
         """Make ONE Gemini call and parse the array response.
 
+        v22.5.5: Uses response_schema (Pydantic) to FORCE valid JSON.
+        Eliminates Arabic apostrophe/quote issues that broke previous parser.
+
         Raises on transient errors (caught by review_batch retry loop).
         Returns one result per input ayah on success.
         """
@@ -787,10 +792,21 @@ class GeminiReviewer:
             raise RuntimeError("No active Gemini client (all keys exhausted)")
 
         from google.genai import types as genai_types
-        # Output: ~150 tokens × N ayahs. For 7 ayahs ≈ 1050 tokens. Cap at 4096
-        # to give some headroom but stay well under the 8192 model limit.
+
+        # v22.5.5: Pydantic schema FORCES Gemini to produce valid JSON.
+        # No more "Expecting ',' delimiter" errors with Arabic apostrophes.
+        class _AyahReview(BaseModel):
+            ayah_number: int = Field(description="Ayah number (1-7)")
+            passed: bool = Field(description="True if explanation matches authentic tafsir")
+            confidence: float = Field(description="Confidence 0.0-1.0", ge=0.0, le=1.0)
+            concerns: List[str] = Field(default_factory=list, description="Specific issues found")
+
+        class _BatchReviewResponse(BaseModel):
+            reviews: List[_AyahReview]
+
         config = genai_types.GenerateContentConfig(
             response_mime_type="application/json",
+            response_schema=_BatchReviewResponse,
             temperature=0.1,
             max_output_tokens=4096,
         )
@@ -801,68 +817,83 @@ class GeminiReviewer:
             config=config,
         )
 
-        text = response.text or ""
-        # Strip markdown fences if Gemini added them
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = (text
-            .replace("\u201c", '"').replace("\u201d", '"')
-            .replace("\u2018", "'").replace("\u2019", "'")
-            .replace("\u00ab", '"').replace("\u00bb", '"')
-        )
+        # v22.5.5: SDK auto-parses response_schema responses into typed objects
+        # via response.parsed. This bypasses ALL JSON parsing concerns.
+        reviews: List[Dict[str, Any]] = []
+        parsed = getattr(response, "parsed", None)
+        if parsed is not None and hasattr(parsed, "reviews"):
+            reviews = [
+                {
+                    "ayah_number": r.ayah_number,
+                    "passed": r.passed,
+                    "confidence": r.confidence,
+                    "concerns": list(r.concerns),
+                }
+                for r in parsed.reviews
+            ]
+            logger.debug(
+                f"✅ Schema-parsed {len(reviews)} reviews (no JSON.loads needed)"
+            )
+        else:
+            # SDK didn't auto-parse — fall back to manual parsing with salvage
+            text = response.text or ""
+            # Strip markdown fences if Gemini added them despite schema
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.startswith("```"):
+                text = text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = (text
+                .replace("\u201c", '"').replace("\u201d", '"')
+                .replace("\u2018", "'").replace("\u2019", "'")
+                .replace("\u00ab", '"').replace("\u00bb", '"')
+            )
 
-        # Parse the JSON array — try clean parse, then progressive salvage
-        data: Dict[str, Any] = {}
-        try:
-            data = json.loads(text.strip())
-        except (json.JSONDecodeError, ValueError):
-            # Salvage 1: find { ... }
-            import re as _re
-            match = _re.search(r'\{.*\}', text, flags=_re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group(0))
-                except (json.JSONDecodeError, ValueError):
-                    # Salvage 2: trailing-comma fix
-                    fixed = _re.sub(r',\s*([\]}])', r'\1', match.group(0))
+            # Parse with progressive salvage
+            data: Dict[str, Any] = {}
+            try:
+                data = json.loads(text.strip())
+            except (json.JSONDecodeError, ValueError):
+                import re as _re
+                match = _re.search(r'\{.*\}', text, flags=_re.DOTALL)
+                if match:
                     try:
-                        data = json.loads(fixed)
+                        data = json.loads(match.group(0))
                     except (json.JSONDecodeError, ValueError):
-                        pass
+                        fixed = _re.sub(r',\s*([\]}])', r'\1', match.group(0))
+                        try:
+                            data = json.loads(fixed)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
 
-        reviews = data.get("reviews", []) if data else []
-        if not isinstance(reviews, list):
-            reviews = []
+            reviews = data.get("reviews", []) if data else []
+            if not isinstance(reviews, list):
+                reviews = []
 
-        # If batch parse failed completely, fall back to per-ayah field extraction
-        if not reviews:
-            logger.warning(
-                f"⚠️ Batch JSON unparseable, salvaging individual ayah fields. "
-                f"Raw (first 300 chars): {text[:300]!r}"
-            )
-            import re as _re
-            # Find every { passed: ..., confidence: ..., ayah_number: ... } block
-            # Pattern allows them in any order (Gemini doesn't always output consistently)
-            block_pattern = _re.compile(
-                r'\{[^{}]*?"ayah_number"\s*:\s*(\d+)[^{}]*?\}',
-                flags=_re.DOTALL,
-            )
-            for block_match in block_pattern.finditer(text):
-                block = block_match.group(0)
-                ayah_match = block_match.group(1)
-                passed_m = _re.search(r'"passed"\s*:\s*(true|false)', block, _re.I)
-                conf_m = _re.search(r'"confidence"\s*:\s*([0-9.]+)', block)
-                if passed_m and conf_m:
-                    reviews.append({
-                        "ayah_number": int(ayah_match),
-                        "passed": passed_m.group(1).lower() == "true",
-                        "confidence": float(conf_m.group(1)),
-                        "concerns": ["[salvaged from malformed batch JSON]"],
-                    })
+            # Last-resort: per-ayah regex extraction
+            if not reviews:
+                logger.warning(
+                    f"⚠️ Batch JSON unparseable, salvaging individual ayah fields. "
+                    f"Raw (first 300 chars): {text[:300]!r}"
+                )
+                import re as _re
+                block_pattern = _re.compile(
+                    r'\{[^{}]*?"ayah_number"\s*:\s*(\d+)[^{}]*?\}',
+                    flags=_re.DOTALL,
+                )
+                for block_match in block_pattern.finditer(text):
+                    block = block_match.group(0)
+                    ayah_match = block_match.group(1)
+                    passed_m = _re.search(r'"passed"\s*:\s*(true|false)', block, _re.I)
+                    conf_m = _re.search(r'"confidence"\s*:\s*([0-9.]+)', block)
+                    if passed_m and conf_m:
+                        reviews.append({
+                            "ayah_number": int(ayah_match),
+                            "passed": passed_m.group(1).lower() == "true",
+                            "confidence": float(conf_m.group(1)),
+                            "concerns": ["[salvaged from malformed batch JSON]"],
+                        })
 
         # Build result list — one per input ayah, in input order
         results: List[TafsirValidationResult] = []
