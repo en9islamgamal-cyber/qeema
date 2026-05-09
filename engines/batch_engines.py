@@ -127,18 +127,22 @@ class SegmentTTSOut(BaseModel):
     that shape. Per-ayah voice knobs (speed/stability/style) are derived
     from `scene_emotion` via voice_emotion_mapper at synthesis time, not
     from this LLM call — that keeps audio identity stable across episodes.
+
+    v22.6.3: max_length constraints removed from string fields. Gemini's
+    response_schema validator rejects schemas where the cumulative state
+    space (array bound × per-element string bounds) exceeds an internal
+    threshold, returning HTTP 400 'too many states for serving'. We keep
+    Pydantic-side validation but drop the schema-side bounds.
     """
     segment_id: str = Field(
         description="Segment ID, e.g. 'intro_text', 'ayah_1.hook', "
                     "'ayah_3.story', 'outro_text'",
-        max_length=80,
     )
     directed_text: str = Field(
         description="The original Arabic text WITH inserted <break time=\"NNNms\"/> "
                     "tags at natural pause points. Words must NOT be changed. "
                     "Use 300ms for normal commas, 500ms before key insights, "
                     "800ms before a moral.",
-        max_length=2000,
     )
     pace: str = Field(
         description="One of: slow | normal | fast",
@@ -146,23 +150,27 @@ class SegmentTTSOut(BaseModel):
     pace_reason: str = Field(
         default="",
         description="Brief justification (Arabic), 1 sentence",
-        max_length=200,
     )
     pronunciation_notes: List[str] = Field(
         default_factory=list,
         description="Difficult Arabic words needing pronunciation hints. "
                     "Each item is a single word.",
-        max_length=10,
     )
 
 
 class BatchTTSOut(BaseModel):
-    """Batch TTS directions — one entry per segment across all ayahs."""
+    """Batch TTS directions — one entry per segment across all ayahs.
+
+    v22.6.3: array max_length removed from schema for the same reason as
+    SegmentTTSOut field bounds. Phase 2 produces ~23 segments per typical
+    episode; allowing the LLM unbounded array length here is fine because
+    the orchestrator iterates `directions` defensively.
+    """
     directions: List[SegmentTTSOut] = Field(
         description="Per-segment direction. Typical episode: 2 episode-level "
                     "(intro, outro) + 7 ayahs × 3 segments (hook, story, moral) "
-                    "= 23 segments. Bound is generous to allow flexibility.",
-        min_length=1, max_length=80,
+                    "= 23 segments.",
+        min_length=1,
     )
 
 
