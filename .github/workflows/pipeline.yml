@@ -1,662 +1,737 @@
-name: QEEMA Pipeline v22.5
+"""
+engines/batch_engines.py — VALUE / QEEMA v22.6.1
+=========================================================================
+Batch engines that process all 7 ayahs in a SINGLE Gemini call,
+with dedicated key per task, multi-key rotation on quota exhaustion,
+and rate limiter integration.
 
-# ═══════════════════════════════════════════════════════════════
-#  Triggers
-#  v22.5: Daily schedule for 3-day pipeline (10 episodes/month)
-#  Each episode runs Phase 1 on Day N, Phase 2 on N+1, Phase 3 on N+2
-# ═══════════════════════════════════════════════════════════════
-on:
-  schedule:
-    # v22.5: 3 runs per day to distribute load across 3 Gemini keys
-    # 08:00 / 09:00 / 10:00 UTC. Each run takes ~30-45 minutes worst-case.
-    # The phase router auto-detects which phase to run for each episode
-    # based on persistent state. Multi-key rotation in tafsir_validator
-    # ensures daily quota (20/key/day = 60/day total) is used efficiently.
-    - cron: "0 8 * * *"
-    - cron: "0 9 * * *"
-    - cron: "0 10 * * *"
-  workflow_dispatch:
-    inputs:
-      episode:
-        description: "Specific episode number (leave empty for next pending)"
-        required: false
-        type: string
-      phase:
-        description: "v22.5: Which phase to run (1=plan, 2=assets, 3=render). Leave empty for auto-detect."
-        required: false
-        type: choice
-        options: ["", "1", "2", "3"]
-        default: ""
-      dry_run:
-        description: "Skip YouTube upload"
-        required: false
-        type: boolean
-        default: false
-      approve:
-        description: "Bypass review gate (for already-reviewed episodes)"
-        required: false
-        type: boolean
-        default: false
-      review_threshold:
-        description: "Episodes ≤ this number need manual review"
-        required: false
-        type: string
-        default: "10"
-      mode:
-        description: "Quality mode (auto picks based on quota)"
-        required: false
-        type: choice
-        options: ["auto", "high", "balanced", "economy"]
-        default: "auto"
-      skip_supabase:
-        description: "Use local file-backed repo (no Supabase needed)"
-        required: false
-        type: boolean
-        default: false
-      reset_local_state:
-        description: "Wipe local repo state before run (dev only)"
-        required: false
-        type: boolean
-        default: false
-      force_regenerate:
-        description: "Clear script cache (forces fresh script generation)"
-        required: false
-        type: boolean
-        default: false
-      reset_tafsir_cache:
-        description: "v22: clear persistent tafsir cache (forces refetch)"
-        required: false
-        type: boolean
-        default: false
+v22.6.1 IMPROVEMENTS over v22.6:
+  ✓ Multi-key rotation on 429 RESOURCE_EXHAUSTED (was: fail to legacy)
+  ✓ Rate limiter integration (shared per-key sliding window)
+  ✓ Retry on transient failures (503, network errors)
+  ✓ Better diagnostic logging (which key, which retry, why fail)
+"""
+from __future__ import annotations
 
-# ═══════════════════════════════════════════════════════════════
-#  Concurrency: never run two pipelines at once (quota safety)
-# ═══════════════════════════════════════════════════════════════
-concurrency:
-  group: qeema-pipeline
-  cancel-in-progress: false
+import json
+import logging
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple, Type
 
-# ═══════════════════════════════════════════════════════════════
-#  Minimum permissions
-# ═══════════════════════════════════════════════════════════════
-permissions:
-  contents: read
+from pydantic import BaseModel, Field
 
-jobs:
-  # ───────────────────────────────────────────────────────────
-  #  Phase 1: Pre-check — fast unit tests before reserving runner
-  # ───────────────────────────────────────────────────────────
-  pre_check:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
+logger = logging.getLogger(__name__)
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: requirements.txt
 
-      - name: Install minimal deps for tests
-        run: |
-          python -m pip install --upgrade pip
-          pip install pydantic pytest requests cohere
+# ════════════════════════════════════════════════════════════════
+# Pydantic Schemas — Strict, descriptive, per-task
+# ════════════════════════════════════════════════════════════════
 
-      - name: Run unit tests
-        run: |
-          echo "═══ Running v22.5 test suite ═══"
-          PYTHONPATH=. python -m pytest tests/ --no-header -q --tb=short
+class AyahScriptOut(BaseModel):
+    """Schema for a single ayah's script."""
+    ayah_number: int = Field(description="Ayah number (1-7)")
+    hook_text: str = Field(
+        description="Opening hook (Egyptian Arabic, 1-2 sentences, "
+                    "amazing fact or question)",
+        max_length=300,
+    )
+    explain_text: str = Field(
+        description="Main explanation (Egyptian Arabic, 2-4 sentences, "
+                    "matches authentic tafsir, age 6-12)",
+        max_length=600,
+    )
+    story_text: str = Field(
+        description="Concrete analogy/story (Egyptian Arabic, 2-3 sentences)",
+        max_length=500,
+    )
+    moral_text: str = Field(
+        description="Take-away moral (Egyptian Arabic, 1 sentence)",
+        max_length=200,
+    )
+    scene_emotion: str = Field(
+        description="One of: warm, reverent, playful, peaceful, excited",
+    )
 
-      - name: Log trigger context
-        run: |
-          echo "ℹ️ Triggered by: ${{ github.event_name }}"
-          echo "ℹ️ Actor: ${{ github.actor }}"
-          echo "ℹ️ Mode: ${{ inputs.mode || 'auto (scheduled)' }}"
-          echo "ℹ️ Episode: ${{ inputs.episode || 'next pending' }}"
 
-  # ───────────────────────────────────────────────────────────
-  #  Phase 2: Main pipeline
-  # ───────────────────────────────────────────────────────────
-  pipeline:
-    needs: pre_check
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+class BatchScriptOut(BaseModel):
+    """Full episode script — all 7 ayahs + meta."""
+    title: str = Field(description="Episode title (Arabic, < 60 chars)", max_length=80)
+    youtube_title: str = Field(
+        description="YouTube title (Arabic, hook-driven, < 80 chars)",
+        max_length=100,
+    )
+    youtube_description: str = Field(
+        description="YouTube description (Arabic, 2-3 paragraphs)",
+        max_length=2000,
+    )
+    intro_text: str = Field(
+        description="Episode opening narration (Egyptian Arabic, 2-3 sentences)",
+        max_length=400,
+    )
+    outro_text: str = Field(
+        description="Episode closing narration (Egyptian Arabic, 2-3 sentences)",
+        max_length=400,
+    )
+    ayahs: List[AyahScriptOut] = Field(
+        description="One entry per ayah, in order (1-7)",
+        min_length=1, max_length=10,
+    )
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: requirements.txt
+class AyahReviewOut(BaseModel):
+    """Religious review for one ayah."""
+    ayah_number: int = Field(description="Ayah number being reviewed")
+    passed: bool = Field(
+        description="True if explanation matches authentic tafsir",
+    )
+    confidence: float = Field(
+        description="Confidence 0.0-1.0", ge=0.0, le=1.0,
+    )
+    concerns: List[str] = Field(
+        default_factory=list,
+        description="Specific issues found, in Arabic. Empty if passed.",
+        max_length=5,
+    )
 
-      - name: Install system packages (FFmpeg + Arabic fonts)
-        run: |
-          sudo apt-get update
-          # Required: ffmpeg + Noto fonts (always available)
-          sudo apt-get install -y \
-            ffmpeg \
-            fonts-noto \
-            fonts-noto-color-emoji \
-            fontconfig
-          # Arabic fonts: best-effort install (package names vary across
-          # Ubuntu releases — fonts-amiri was removed in Ubuntu 24.04 Noble)
-          INSTALLED=""
-          for pkg in fonts-hosny-amiri fonts-amiri fonts-tajawal fonts-cairo fonts-sil-scheherazade-new; do
-            if sudo apt-get install -y "$pkg" 2>/dev/null; then
-              INSTALLED="$INSTALLED $pkg"
-              echo "  ✅ Installed: $pkg"
-            else
-              echo "  ⚠️  Skipped: $pkg (not available in this Ubuntu)"
-            fi
-          done
-          echo "Installed Arabic fonts:$INSTALLED"
-          # Register bundled Amiri font as system-wide fallback for libass.
-          # This guarantees ASS subtitles render Arabic correctly even if
-          # no apt package supplied the font.
-          if [ -f assets/Amiri-Bold.ttf ]; then
-            sudo mkdir -p /usr/local/share/fonts/truetype/amiri
-            sudo cp assets/Amiri-Bold.ttf /usr/local/share/fonts/truetype/amiri/
-            sudo fc-cache -f -v 2>&1 | tail -3
-            echo "  ✅ Registered bundled Amiri-Bold.ttf system-wide"
-          else
-            echo "  ⚠️  No bundled Amiri TTF — relying on apt-installed fonts"
-          fi
-          # Verify Amiri is findable by libass
-          if fc-match Amiri 2>/dev/null | grep -qi amiri; then
-            echo "  ✅ libass can resolve 'Amiri' → $(fc-match Amiri)"
-          else
-            echo "  ⚠️  libass cannot resolve 'Amiri' — subtitles may use fallback"
-          fi
 
-      - name: Install Python packages
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install 'anthropic>=0.40.0' 'google-genai>=1.17.0'
+class BatchReviewOut(BaseModel):
+    """Batch tafsir review — all 7 ayahs."""
+    reviews: List[AyahReviewOut] = Field(
+        description="Reviews for each ayah, in order",
+        min_length=1, max_length=10,
+    )
 
-      # ─── Caches ───────────────────────────────────────────────
-      - name: Cache Playwright browsers
-        id: pw-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            playwright-${{ runner.os }}-
 
-      - name: Install Playwright Chromium
-        if: steps.pw-cache.outputs.cache-hit != 'true'
-        run: python -m playwright install --with-deps chromium
+class AyahTTSOut(BaseModel):
+    """TTS direction for one ayah."""
+    ayah_number: int = Field(description="Ayah number")
+    voice_speed: float = Field(
+        description="Speech rate (0.85-1.10)", ge=0.85, le=1.10,
+    )
+    voice_stability: float = Field(
+        description="ElevenLabs stability (0.30-0.70)", ge=0.30, le=0.70,
+    )
+    voice_style: float = Field(
+        description="ElevenLabs style (0.30-0.70)", ge=0.30, le=0.70,
+    )
+    emphasis_words: List[str] = Field(
+        default_factory=list, max_length=10,
+        description="Words to emphasize (in Arabic)",
+    )
 
-      - name: Install Playwright system deps (cache hit case)
-        if: steps.pw-cache.outputs.cache-hit == 'true'
-        run: python -m playwright install-deps chromium
 
-      - name: Cache Quran audio
-        uses: actions/cache@v4
-        with:
-          path: assets/quran_audio
-          key: quran-audio-${{ hashFiles('data/curriculum.py') }}
-          restore-keys: |
-            quran-audio-
+class BatchTTSOut(BaseModel):
+    """Batch TTS directions for all 7 ayahs."""
+    directions: List[AyahTTSOut] = Field(
+        description="TTS direction per ayah",
+        min_length=1, max_length=10,
+    )
 
-      - name: Cache TTS audio
-        uses: actions/cache@v4
-        with:
-          path: temp/tts_cache
-          key: tts-cache-${{ github.run_id }}
-          restore-keys: |
-            tts-cache-
 
-      - name: Cache rendered scenes
-        uses: actions/cache@v4
-        with:
-          path: temp/scene_cache
-          key: scene-cache-${{ github.run_id }}
-          restore-keys: |
-            scene-cache-
+class AyahVisualOut(BaseModel):
+    """Visual prompt for one ayah."""
+    ayah_number: int = Field(description="Ayah number")
+    subject: str = Field(
+        description="Main subject (English, for Leonardo.ai)",
+        max_length=400,  # v22.6.2: was 200, Gemini occasionally returns
+                         # rich watercolor descriptions that exceed it
+    )
+    environment: str = Field(
+        description="Environment/setting (English)", max_length=400,
+    )
+    mood_lighting: str = Field(
+        description="Mood + lighting (English)", max_length=300,
+    )
+    color_palette: str = Field(
+        description="Color palette (English)", max_length=250,
+    )
 
-      - name: Cache Leonardo images
-        uses: actions/cache@v4
-        with:
-          path: temp/image_cache
-          key: image-cache-${{ github.run_id }}
-          restore-keys: |
-            image-cache-
 
-      - name: Cache branding intro/outro
-        uses: actions/cache@v4
-        with:
-          path: assets/branding
-          key: branding-${{ hashFiles('engines/intro_outro_engine.py', 'core/config.py') }}
-          restore-keys: |
-            branding-
+class BatchVisualOut(BaseModel):
+    """Batch visual prompts for all 7 ayahs."""
+    prompts: List[AyahVisualOut] = Field(
+        description="Visual prompt per ayah",
+        min_length=1, max_length=10,
+    )
 
-      # v22 NEW: persistent tafsir cache — survives across runs
-      - name: Cache tafsir API responses (v22)
-        uses: actions/cache@v4
-        with:
-          path: state/tafsir_cache.json
-          key: tafsir-cache-v22-${{ github.run_id }}
-          restore-keys: |
-            tafsir-cache-v22-
 
-      # v22.2 NEW: HookOptimizer Thompson Sampling stats
-      - name: Cache hook strategy stats (v22.2)
-        uses: actions/cache@v4
-        with:
-          path: state/hook_stats.json
-          key: hook-stats-v22-${{ github.run_id }}
-          restore-keys: |
-            hook-stats-v22-
+# ════════════════════════════════════════════════════════════════
+# Multi-key client with rotation + rate limiting
+# ════════════════════════════════════════════════════════════════
 
-      # v22.3 FIX: critical state files that need to persist across runs
-      # Without these, quota tracking, idempotency replay, and skip_supabase
-      # state are LOST every run.
-      - name: Cache quota state (v19+ — was missing!)
-        uses: actions/cache@v4
-        with:
-          path: logs/quota_state.json
-          key: quota-state-v22-${{ github.run_id }}
-          restore-keys: |
-            quota-state-v22-
+class _KeyClient:
+    """A Gemini client paired with its rate limiter for the same key."""
+    def __init__(
+        self, name: str, client: Any, rate_limiter: Any = None,
+    ) -> None:
+        self.name = name
+        self.client = client
+        self.rate_limiter = rate_limiter  # already key-bound by adapter
 
-      - name: Cache idempotency checkpoints (v17+ — was missing!)
-        uses: actions/cache@v4
-        with:
-          path: state/checkpoints
-          key: checkpoints-v22-${{ github.run_id }}
-          restore-keys: |
-            checkpoints-v22-
 
-      - name: Cache local episodes repo (skip_supabase mode)
-        if: ${{ inputs.skip_supabase == true || inputs.skip_supabase == 'true' }}
-        uses: actions/cache@v4
-        with:
-          path: state/local_episodes.json
-          key: local-repo-v22-${{ github.run_id }}
-          restore-keys: |
-            local-repo-v22-
+def _build_clients_from_adapters(
+    adapters: Dict[str, Any],
+    preferred_order: Tuple[str, ...] = ("gemini-1", "gemini-2", "gemini-3"),
+) -> List[_KeyClient]:
+    """Extract clients in priority order from adapter dict.
 
-      # v22.3 NEW: cost tracking cache (so cumulative costs persist)
-      - name: Cache cost tracking
-        uses: actions/cache@v4
-        with:
-          path: logs/costs_*.jsonl
-          key: cost-log-v22-${{ github.run_id }}
-          restore-keys: |
-            cost-log-v22-
+    Each adapter has _client (genai.Client) and _rate_limiter (already
+    bound to that adapter's API key). We use those directly — no need
+    to look up rate limiters by key string.
+    """
+    clients: List[_KeyClient] = []
+    for name in preferred_order:
+        adapter = adapters.get(name)
+        if adapter is None:
+            continue
+        client = getattr(adapter, "_client", None)
+        rate_limiter = getattr(adapter, "_rate_limiter", None)
+        if client is None:
+            continue
+        clients.append(_KeyClient(
+            name=name, client=client, rate_limiter=rate_limiter,
+        ))
+    return clients
 
-      # v22.5 NEW: phase state cache — the 3-day pipeline depends on this
-      # to know what phase to run next for each episode.
-      - name: Cache phase state (v22.5 — REQUIRED for 3-day pipeline)
-        uses: actions/cache@v4
-        with:
-          path: state/phases
-          key: phase-state-v225-${{ github.run_id }}
-          restore-keys: |
-            phase-state-v225-
 
-      # ─── Optional resets ─────────────────────────────────────
-      - name: Force-regenerate scripts (if requested)
-        if: ${{ inputs.force_regenerate == true }}
-        run: |
-          echo "🔄 Clearing script cache (force regenerate)"
-          rm -rf temp/episodes/*.json || true
+def _is_quota_error(e: Exception) -> bool:
+    err_str = str(e).lower()
+    return (
+        "resource_exhausted" in err_str
+        or "429" in err_str
+        or "quota" in err_str
+        or "rate limit" in err_str
+    )
 
-      - name: Reset tafsir cache (if requested)
-        if: ${{ inputs.reset_tafsir_cache == true }}
-        run: |
-          echo "🔄 Clearing persistent tafsir cache"
-          rm -f state/tafsir_cache.json || true
 
-      # ─── Pre-flight asset check ──────────────────────────────
-      - name: Verify assets
-        run: |
-          echo "═══ Asset Check ═══"
-          mkdir -p assets state logs temp
-          [ -f assets/Amiri-Bold.ttf ] && echo "✅ Amiri font OK" || echo "⚠️  Amiri font MISSING (will use system Amiri)"
-          [ -f assets/logo.png ] && echo "✅ Logo PNG OK" || echo "⚠️  Logo PNG MISSING"
-          [ -f assets/overlays/bgm.mp3 ] && echo "✅ BGM nasheed OK" || echo "⚠️  BGM MISSING — silent skip"
-          [ -d assets/quran_audio ] && echo "✅ Quran audio dir OK" || echo "⚠️  Quran audio dir missing"
+def _is_transient_error(e: Exception) -> bool:
+    err_str = str(e).lower()
+    return (
+        "503" in err_str
+        or "service unavailable" in err_str
+        or "deadline exceeded" in err_str
+        or "internal error" in err_str
+        or "connection" in err_str
+        or "timeout" in err_str
+    )
 
-      # ─── Main pipeline run ───────────────────────────────────
-      - name: Run QEEMA pipeline v22.5
-        env:
-          # ── LLM providers (Gemini-only since v22.5.6)
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
-          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
-          # Groq removed in v22.5.6 — Llama-3.3 produced doctrinally weak Arabic
-          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
-          # ── TTS
-          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
-          ELEVENLABS_VOICE_ID: ${{ vars.ELEVENLABS_VOICE_ID || 'UR972wNGq3zluze0LoIp' }}
-          # CAMB.AI fallback (Arabic via MARS8) — only used if ElevenLabs fails
-          CAMB_AI_KEY: ${{ secrets.CAMB_AI_KEY }}
-          CAMB_AI_VOICE_ID: ${{ vars.CAMB_AI_VOICE_ID || '' }}
-          CAMB_AI_SPEECH_MODEL: ${{ vars.CAMB_AI_SPEECH_MODEL || 'mars-pro' }}
-          # Optional: skip /source-languages auto-discovery by hard-coding the ID
-          CAMB_AI_LANGUAGE_ID: ${{ vars.CAMB_AI_LANGUAGE_ID || '' }}
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-sa.json
-          # ── DB
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL || '' }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY || '' }}
-          SKIP_SUPABASE: ${{ inputs.skip_supabase && 'true' || 'false' }}
-          # ── YouTube
-          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-          # ── Image generation
-          LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
-          LEONARDO_CHARACTER_REF: ${{ vars.LEONARDO_CHARACTER_REF || '' }}
-          # ── Telegram
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '' }}
-          # ── Pipeline feature flags
-          ENABLE_SUBTITLES: 'true'
-          ENABLE_CROSSFADES: 'true'
-          ENABLE_COLOR_GRADE: 'true'
-          ENABLE_BGM: 'true'
-          # ── Quality gate threshold
-          QUALITY_THRESHOLD: '70'
-          # ── Voice tuning (v22.2 voice mapper overrides per-segment)
-          ELEVENLABS_SPEED: '1.00'
-          ELEVENLABS_STABILITY: '0.50'
-          ELEVENLABS_STYLE: '0.55'
-          # ── v22.5: Enable 3-day phase router for daily cron runs
-          QEEMA_USE_PHASE_ROUTER: 'true'
-          # ── Misc
-          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
-          PYTHONUNBUFFERED: '1'
-        run: |
-          # Write GCP service account if provided
-          GCP_KEY='${{ secrets.GCP_SA_KEY }}'
-          if [ -n "$GCP_KEY" ]; then
-            echo "$GCP_KEY" > "$GOOGLE_APPLICATION_CREDENTIALS"
-          fi
 
-          # Build CLI args
-          ARGS=""
-          EPISODE='${{ inputs.episode }}'
-          [ -n "$EPISODE" ] && ARGS="--episode $EPISODE"
-          [ "${{ inputs.dry_run }}" = "true" ] && ARGS="$ARGS --dry-run"
-          [ "${{ inputs.approve }}" = "true" ] && ARGS="$ARGS --approve"
-          [ -n "${{ inputs.review_threshold }}" ] && \
-            ARGS="$ARGS --review-threshold ${{ inputs.review_threshold }}"
-          [ -n "${{ inputs.mode }}" ] && ARGS="$ARGS --mode ${{ inputs.mode }}"
-          [ "${{ inputs.skip_supabase }}" = "true" ] && ARGS="$ARGS --skip-supabase"
-          [ "${{ inputs.reset_local_state }}" = "true" ] && \
-            ARGS="$ARGS --reset-local-state"
-          # v22.5: Pass --phase if explicitly provided (else auto-detect)
-          PHASE='${{ inputs.phase }}'
-          [ -n "$PHASE" ] && ARGS="$ARGS --phase $PHASE"
+def _call_gemini_with_rotation(
+    key_clients: List[_KeyClient],
+    prompt: str,
+    schema_class: Type[BaseModel],
+    *,
+    model: str = "gemini-2.5-flash",
+    temperature: float = 0.7,
+    max_tokens: int = 8192,
+    transient_max_retries: int = 2,
+) -> Optional[BaseModel]:
+    """Call Gemini with multi-key rotation + rate limiting + retries.
 
-          echo "═══ QEEMA Pipeline v22.5 (3-day phase router) ═══"
-          echo "Episode:        ${EPISODE:-<auto>}"
-          echo "Phase:          ${PHASE:-<auto-detect>}"
-          echo "Mode:           ${{ inputs.mode || 'auto' }}"
-          echo "Dry run:        ${{ inputs.dry_run || 'false' }}"
-          echo "Approve gate:   ${{ inputs.approve || 'false' }}"
-          echo "Review thresh:  ${{ inputs.review_threshold || '10' }}"
-          echo ""
-          echo "Voice defaults: speed=$ELEVENLABS_SPEED stab=$ELEVENLABS_STABILITY style=$ELEVENLABS_STYLE"
-          echo "(v22.2 voice mapper overrides per-segment)"
-          echo "(v22.5 phase router enabled — see state/phases/ for state)"
-          echo ""
+    Order per key:
+      1. Acquire rate limiter slot (4 RPM sliding window per key)
+      2. Make Gemini call with response_schema
+      3. On 429: rotate to next key
+      4. On 503/network: retry SAME key up to transient_max_retries times
+      5. On schema validation failure: try next key
 
-          # v22 internal stage_retry handles transient failures.
-          # External retry kept at 1 to avoid double-retry quota waste.
-          MAX_RETRIES=1
-          for i in $(seq 1 $MAX_RETRIES); do
-            echo "═══ Pipeline attempt $i/$MAX_RETRIES ═══"
-            if python main.py $ARGS; then
-              echo "✅ Pipeline succeeded on attempt $i"
-              exit 0
-            fi
-            EXIT_CODE=$?
-            echo "❌ Attempt $i failed with code $EXIT_CODE"
-            if [ $i -lt $MAX_RETRIES ]; then
-              echo "Waiting 30s before retry..."
-              sleep 30
-            fi
-          done
-          echo "❌ Pipeline failed after $MAX_RETRIES attempts"
-          exit 1
+    Returns the parsed BaseModel instance, or None on total failure.
+    """
+    if not key_clients:
+        logger.error("❌ No Gemini clients available for batch call")
+        return None
 
-      # ─── Reports ──────────────────────────────────────────────
-      - name: Cost summary
-        if: always()
-        continue-on-error: true
-        run: |
-          if [ -d logs ]; then
-            TODAY=$(date +%Y-%m-%d)
-            COST_FILE="logs/costs_${TODAY}.jsonl"
-            if [ -f "$COST_FILE" ]; then
-              echo "═══ Cost Summary (today) ═══"
-              python3 - <<'PYEOF'
-          import json, os
-          today = os.popen('date +%Y-%m-%d').read().strip()
-          fname = f'logs/costs_{today}.jsonl'
-          total = 0.0
-          by_provider = {}
-          with open(fname) as f:
-              for line in f:
-                  e = json.loads(line)
-                  total += e.get('cost_usd', 0.0)
-                  p = e.get('provider', 'unknown')
-                  by_provider[p] = by_provider.get(p, 0.0) + e.get('cost_usd', 0.0)
-          print(f'Total: ${total:.4f} USD')
-          for p, c in sorted(by_provider.items(), key=lambda x: -x[1]):
-              print(f'  {p:30s} ${c:.4f}')
-          PYEOF
-            else
-              echo "ℹ️ No cost log for today"
-            fi
-          fi
+    from google.genai import types as genai_types
 
-      - name: Quota report (v20+)
-        if: always()
-        continue-on-error: true
-        run: |
-          if [ -f logs/quota_state.json ]; then
-            echo "═══ Quota Status ═══"
-            python3 - <<'PYEOF'
-          import json
-          with open('logs/quota_state.json') as f:
-              s = json.load(f)
-          print(f'Month: {s.get("month_key", "?")}')
-          print(f'Episodes done: {s.get("episodes_completed_this_month", 0)}/7')
-          el = s.get('elevenlabs_used_this_month', 0)
-          el_total = 30000
-          pct_el = (el / el_total * 100) if el_total else 0
-          print(f'ElevenLabs: {el:,}/{el_total:,} ({pct_el:.1f}%)')
-          leo = s.get('leonardo_used_total', 0)
-          leo_total = 150
-          pct_leo = (leo / leo_total * 100) if leo_total else 0
-          print(f'Leonardo:   {leo}/{leo_total} ({pct_leo:.1f}%)')
-          PYEOF
-          fi
+    config = genai_types.GenerateContentConfig(
+        temperature=temperature,
+        response_mime_type="application/json",
+        response_schema=schema_class,
+        max_output_tokens=max_tokens,
+    )
 
-      - name: Tafsir cache stats (v22)
-        if: always()
-        continue-on-error: true
-        run: |
-          if [ -f state/tafsir_cache.json ]; then
-            echo "═══ Tafsir Cache Stats ═══"
-            python3 - <<'PYEOF'
-          import json, os
-          with open('state/tafsir_cache.json') as f:
-              data = json.load(f)
-          entries = data.get('entries', {})
-          size_kb = os.path.getsize('state/tafsir_cache.json') // 1024
-          print(f'Cached entries: {len(entries)}')
-          print(f'File size:      {size_kb} KB')
-          print(f'Schema version: {data.get("schema_version", "?")}')
-          PYEOF
-          fi
+    last_error: Optional[Exception] = None
 
-      # ─── v22.3 NEW: Telegram failure notification ────────────
-      - name: Notify Telegram on failure
-        if: failure()
-        continue-on-error: true
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
-            echo "ℹ️ Telegram secrets not set — skipping notification"
-            exit 0
-          fi
-          EP="${{ inputs.episode || 'auto' }}"
-          MODE="${{ inputs.mode || 'auto' }}"
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          MSG=$'🚨 *QEEMA Pipeline Failed*\n'"Episode: \`${EP}\`"$'\n'"Mode: \`${MODE}\`"$'\n'"Run: [#${{ github.run_number }}](${RUN_URL})"$'\n'"Triggered by: ${{ github.actor }}"
-          curl -s -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${MSG}" \
-            -d "parse_mode=Markdown" \
-            -d "disable_web_page_preview=true" > /dev/null && \
-            echo "✅ Failure notification sent to Telegram" || \
-            echo "⚠️ Telegram notification failed (non-critical)"
+    for key_idx, kc in enumerate(key_clients, start=1):
+        logger.info(f"🔑 Trying {kc.name} (key {key_idx}/{len(key_clients)})")
 
-      - name: Notify Telegram on success
-        if: success() && inputs.dry_run != true && inputs.dry_run != 'true'
-        continue-on-error: true
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
-            exit 0
-          fi
-          EP="${{ inputs.episode || 'next pending' }}"
-          MODE="${{ inputs.mode || 'auto' }}"
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          MSG=$'✅ *QEEMA Episode Published*\n'"Episode: \`${EP}\`"$'\n'"Mode: \`${MODE}\`"$'\n'"Run: [#${{ github.run_number }}](${RUN_URL})"
-          curl -s -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${MSG}" \
-            -d "parse_mode=Markdown" \
-            -d "disable_web_page_preview=true" > /dev/null || true
+        # Use the rate limiter that was already bound to this adapter's key
+        limiter = kc.rate_limiter
 
-      # ─── Cleanup ──────────────────────────────────────────────
-      - name: Clean up secrets
-        if: always()
-        run: rm -f "${{ github.workspace }}/gcp-sa.json"
+        # Retry loop for transient errors on this key
+        for attempt in range(1, transient_max_retries + 2):
+            try:
+                if limiter is not None:
+                    limiter.acquire(max_wait_seconds=60.0)
 
-      # ─── Artifacts ────────────────────────────────────────────
-      - name: Upload pipeline logs (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pipeline-logs-${{ github.run_id }}
-          path: |
-            logs/
-            temp/episodes/*.json
-            review/
-          retention-days: 7
-          if-no-files-found: ignore
+                response = kc.client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=config,
+                )
 
-      - name: Upload review files
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: review-files-${{ github.run_id }}
-          path: review/*.md
-          retention-days: 30
-          if-no-files-found: ignore
+                result = _parse_response(response, schema_class)
+                if result is not None:
+                    logger.info(
+                        f"✅ {kc.name} succeeded "
+                        f"({type(result).__name__}, attempt {attempt})"
+                    )
+                    return result
 
-      - name: Upload cost log
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: cost-log-${{ github.run_id }}
-          path: logs/costs_*.jsonl
-          retention-days: 30
-          if-no-files-found: ignore
+                logger.warning(
+                    f"⚠️ {kc.name}: response unparseable, trying next key"
+                )
+                last_error = ValueError("Response did not match schema")
+                break
 
-      - name: Upload quota state (persistent)
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: quota-state-${{ github.run_id }}
-          path: logs/quota_state.json
-          retention-days: 90
-          if-no-files-found: ignore
+            except Exception as e:
+                last_error = e
 
-      - name: Upload tafsir cache (v22 persistent)
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: tafsir-cache-${{ github.run_id }}
-          path: state/tafsir_cache.json
-          retention-days: 90
-          if-no-files-found: ignore
+                if _is_quota_error(e):
+                    logger.warning(
+                        f"⚠️ {kc.name}: daily quota exhausted (429), rotating"
+                    )
+                    break
 
-      - name: Upload hook stats (v22.2 persistent)
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: hook-stats-${{ github.run_id }}
-          path: state/hook_stats.json
-          retention-days: 90
-          if-no-files-found: ignore
+                if _is_transient_error(e) and attempt <= transient_max_retries:
+                    wait_s = 2.0 ** attempt
+                    logger.warning(
+                        f"⚠️ {kc.name}: transient error "
+                        f"(attempt {attempt}/{transient_max_retries+1}), "
+                        f"waiting {wait_s}s: {e}"
+                    )
+                    time.sleep(wait_s)
+                    continue
 
-      - name: Upload cost dashboards
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: dashboards-${{ github.run_id }}
-          path: |
-            logs/dashboard_*.md
-            logs/episode_*_breakdown.md
-          retention-days: 30
-          if-no-files-found: ignore
+                logger.warning(
+                    f"⚠️ {kc.name}: non-retryable error "
+                    f"({type(e).__name__}: {e}), trying next key"
+                )
+                break
 
-      - name: Upload quality reports (v22.1+)
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: quality-reports-${{ github.run_id }}
-          path: |
-            logs/polish_*.md
-            logs/age_check_*.md
-            logs/typography_*.md
-          retention-days: 30
-          if-no-files-found: ignore
+    logger.error(
+        f"❌ All {len(key_clients)} keys exhausted for batch call. "
+        f"Last error: {last_error}"
+    )
+    return None
 
-      - name: Upload local repo state (if --skip-supabase used)
-        if: always() && inputs.skip_supabase == true
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: local-repo-${{ github.run_id }}
-          path: state/local_episodes.json
-          retention-days: 90
-          if-no-files-found: ignore
 
-      # v22.5 NEW: phase state artifact — useful for debugging phase progression
-      - name: Upload phase state (v22.5)
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: phase-state-${{ github.run_id }}
-          path: state/phases/
-          retention-days: 90
-          if-no-files-found: ignore
+def _parse_response(
+    response: Any,
+    schema_class: Type[BaseModel],
+) -> Optional[BaseModel]:
+    """Parse Gemini response with progressive fallback.
+
+    Layer 1: response.parsed (SDK auto-validation)
+    Layer 2: json.loads + Pydantic.model_validate
+    Layer 3: regex salvage + smart-quote norm + Pydantic
+    """
+    # Layer 1
+    parsed = getattr(response, "parsed", None)
+    if parsed is not None:
+        if isinstance(parsed, schema_class):
+            return parsed
+        if isinstance(parsed, dict):
+            try:
+                return schema_class.model_validate(parsed)
+            except Exception as e:
+                logger.debug(f"Layer 1 dict→model failed: {e}")
+
+    # Layer 2
+    text = getattr(response, "text", "") or ""
+    if not text:
+        logger.warning("⚠️ Empty response.text from Gemini")
+        return None
+
+    text = re.sub(r'^\s*```(?:json)?\s*', '', text)
+    text = re.sub(r'\s*```\s*$', '', text)
+    text = text.strip()
+
+    text = (text
+        .replace("\u201c", '"').replace("\u201d", '"')
+        .replace("\u2018", "'").replace("\u2019", "'")
+        .replace("\u00ab", '"').replace("\u00bb", '"')
+    )
+
+    try:
+        data = json.loads(text)
+        return schema_class.model_validate(data)
+    except json.JSONDecodeError as e:
+        logger.warning(
+            f"⚠️ JSON parse failed at pos {e.pos}: trying regex salvage"
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ Pydantic validation failed: {e}")
+        return None
+
+    # Layer 3
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if not match:
+        logger.error(f"❌ No JSON object found in: {text[:200]}")
+        return None
+
+    salvage_str = match.group(0)
+    salvage_str = re.sub(r',\s*([\]}])', r'\1', salvage_str)
+
+    try:
+        data = json.loads(salvage_str)
+        return schema_class.model_validate(data)
+    except Exception as e:
+        logger.error(f"❌ Salvage layer failed: {e}")
+        return None
+
+
+# ════════════════════════════════════════════════════════════════
+# BatchScriptEngine — Phase 1
+# ════════════════════════════════════════════════════════════════
+
+class BatchScriptEngine:
+    """Generate full episode (7 ayahs + intro/outro) in 1 Gemini call.
+
+    Phase 1: Tries Key 1 → 2 → 3 on rotation.
+    """
+
+    def __init__(self, adapters: Dict[str, Any]) -> None:
+        self._key_clients = _build_clients_from_adapters(
+            adapters, preferred_order=("gemini-1", "gemini-2", "gemini-3"),
+        )
+        if not self._key_clients:
+            raise ValueError(
+                "BatchScriptEngine requires at least one Gemini adapter"
+            )
+
+    def generate_episode(
+        self,
+        surah_name: str,
+        surah_number: int,
+        ayahs: List[Dict[str, Any]],
+        tafsirs: Dict[int, str],
+    ) -> Optional[BatchScriptOut]:
+        prompt = self._build_prompt(surah_name, surah_number, ayahs, tafsirs)
+        logger.info(
+            f"📝 BatchScriptEngine: generating {len(ayahs)} ayahs in 1 call "
+            f"(surah {surah_number} {surah_name}, "
+            f"{len(self._key_clients)} keys available)"
+        )
+        t0 = time.monotonic()
+
+        result = _call_gemini_with_rotation(
+            self._key_clients, prompt, BatchScriptOut,
+            temperature=0.7, max_tokens=8192,
+        )
+
+        elapsed = time.monotonic() - t0
+        if result is None:
+            logger.error(
+                f"❌ BatchScriptEngine failed in {elapsed:.1f}s — "
+                f"caller will fall back to legacy per-ayah"
+            )
+            return None
+
+        logger.info(
+            f"✅ BatchScriptEngine: {len(result.ayahs)} ayahs done "
+            f"in {elapsed:.1f}s (1 Gemini call instead of {len(ayahs)})"
+        )
+        return result
+
+    @staticmethod
+    def _build_prompt(
+        surah_name: str,
+        surah_number: int,
+        ayahs: List[Dict[str, Any]],
+        tafsirs: Dict[int, str],
+    ) -> str:
+        ayah_blocks = []
+        for a in ayahs:
+            num = a["number"]
+            tafsir = tafsirs.get(num, "")
+            ayah_blocks.append(
+                f"━━━ آية {num} ━━━\n"
+                f"النص: {a['text']}\n"
+                f"التفسير المعتمد: {tafsir[:500]}"
+            )
+        ayah_section = "\n\n".join(ayah_blocks)
+
+        return f"""اكتب حلقة تعليمية كاملة عن سورة {surah_name} ({len(ayahs)} آيات).
+
+═══ الجمهور والأسلوب ═══
+🎯 الجمهور: أطفال 6-12 سنة
+🎬 الأسلوب: TED-Ed insight-first، شرح بسيط
+🗣️ اللهجة: عامية مصرية حديثة (مش فصحى)
+
+═══ الآيات والتفاسير المعتمدة ═══
+{ayah_section}
+
+═══ قواعد دقة دينية إلزامية (مهمة جداً) ═══
+
+1. الشرح يطابق التفسير المعتمد فوق — مش يضيف معاني من خياله
+2. الآيات اللي عن "اليوم الآخر" أو "يوم الحساب": ممنوع تشبيهها بالعمليات
+   البيولوجية للجسم. اليوم الآخر يوم محدد، مش حالة دائمة.
+3. العبادة والاستعانة: ممنوع تشبيهها بقوى ميكانيكية (مغناطيس، جاذبية).
+   العبادة اختيار حر بمحبة، مش انجذاب آلي.
+4. "غضب الله" أو "الضالين" (آية 7): ممنوع تشبيهها بأكل صحي/غير صحي.
+   المعنى أعمق من ذلك بكتير.
+5. "بسم الله": البركة والاستعانة، مش "كود سري" أو "كلمة سحرية".
+
+═══ قواعد الكتابة ═══
+
+1. لغة: عامية مصرية أصيلة
+   ✓ "ربنا قال لينا في الآية دي حاجة جميلة"
+   ✗ "إن الله تعالى يخبرنا"
+
+2. جملة قصيرة: حد أقصى 12 كلمة. الطفل بيفقد التركيز في الجمل الطويلة.
+
+3. تشبيهات ملموسة وصحيحة:
+   ✓ آية 1: "زي البذرة لما تنمو، بنبدأ كل حاجة باسم ربنا"
+   ✓ آية 6: "زي الخريطة بتدلنا على أحسن طريق نوصل بيه"
+
+4. هياكل ممنوعة:
+   ✗ "ربنا أمرنا أن نفعل كذا"
+   ✗ "تعالوا نتدبر سويا"
+   ✗ "نسأل الله أن يجعلنا..."
+
+═══ الـ Output ═══
+
+ارجع JSON مطابق للـ schema بالظبط:
+- title, youtube_title, youtube_description
+- intro_text, outro_text
+- ayahs: array of {len(ayahs)} entries، كل واحدة فيها:
+  - ayah_number (1 إلى {len(ayahs)})
+  - hook_text (1-2 جملة جذابة)
+  - explain_text (2-4 جمل، يطابق التفسير)
+  - story_text (تشبيه ملموس وصحيح دينياً)
+  - moral_text (جملة واحدة take-away)
+  - scene_emotion (واحد من: warm, reverent, playful, peaceful, excited)
+"""
+
+
+# ════════════════════════════════════════════════════════════════
+# BatchTafsirReviewer — Phase 1
+# ════════════════════════════════════════════════════════════════
+
+class BatchTafsirReviewer:
+    """Review all 7 ayah scripts against authentic tafsir in 1 call.
+
+    Phase 1: Tries Key 1 → 2 → 3 on rotation.
+    """
+
+    def __init__(self, adapters: Dict[str, Any]) -> None:
+        self._key_clients = _build_clients_from_adapters(
+            adapters, preferred_order=("gemini-1", "gemini-2", "gemini-3"),
+        )
+        if not self._key_clients:
+            raise ValueError(
+                "BatchTafsirReviewer requires at least one Gemini adapter"
+            )
+
+    def review_episode(
+        self,
+        ayah_scripts: List[Dict[str, Any]],
+        tafsirs: Dict[int, str],
+    ) -> Optional[BatchReviewOut]:
+        prompt = self._build_prompt(ayah_scripts, tafsirs)
+        logger.info(
+            f"🔍 BatchTafsirReviewer: reviewing {len(ayah_scripts)} ayahs "
+            f"in 1 call ({len(self._key_clients)} keys available)"
+        )
+        t0 = time.monotonic()
+
+        result = _call_gemini_with_rotation(
+            self._key_clients, prompt, BatchReviewOut,
+            temperature=0.1, max_tokens=4096,
+        )
+
+        elapsed = time.monotonic() - t0
+        if result is None:
+            logger.error(f"❌ BatchTafsirReviewer failed in {elapsed:.1f}s")
+            return None
+
+        passed = sum(1 for r in result.reviews if r.passed)
+        logger.info(
+            f"✅ BatchTafsirReviewer: {passed}/{len(result.reviews)} passed "
+            f"in {elapsed:.1f}s (1 call instead of {len(ayah_scripts)})"
+        )
+        return result
+
+    @staticmethod
+    def _build_prompt(
+        ayah_scripts: List[Dict[str, Any]],
+        tafsirs: Dict[int, str],
+    ) -> str:
+        blocks = []
+        for s in ayah_scripts:
+            num = s["number"]
+            tafsir = tafsirs.get(num, "")
+            blocks.append(
+                f"━━━ آية {num} ━━━\n"
+                f"التفسير المعتمد:\n{tafsir[:600]}\n\n"
+                f"الشرح المقترح:\n{s.get('explain', '')}\n\n"
+                f"التشبيه المقترح:\n{s.get('story', '')}\n"
+            )
+        body = "\n\n".join(blocks)
+
+        return f"""أنت مراجع ديني خبير. راجع شروحات هذه الآيات للأطفال
+وقارنها بالتفاسير المعتمدة.
+
+{body}
+
+═══ معايير القبول ═══
+1. الشرح لا يضيف معاني خارج التفسير
+2. التشبيه دقيق دينياً — مش يخلط بين أمور الدنيا والآخرة
+3. لا يستخدم تشبيهات ميكانيكية للعبادة (مغناطيس، جاذبية)
+4. لا يستخدم تشبيهات تقلل من جسامة المعنى الديني
+
+لكل آية، قرر:
+- passed: true إذا كل المعايير مستوفاة، false وإلا
+- confidence: 0.0-1.0
+- concerns: قائمة قصيرة بالمشاكل المحددة (بالعربي)، فارغة لو passed
+
+ارجع JSON مطابق للـ schema بالظبط، مع review لكل آية.
+"""
+
+
+# ════════════════════════════════════════════════════════════════
+# BatchTTSDirector — Phase 2
+# ════════════════════════════════════════════════════════════════
+
+class BatchTTSDirector:
+    """Generate TTS voice directions for all 7 ayahs in 1 call.
+
+    Phase 2: Uses Key 2 first (dedicated), falls back to 3 → 1.
+    """
+
+    def __init__(self, adapters: Dict[str, Any]) -> None:
+        self._key_clients = _build_clients_from_adapters(
+            adapters, preferred_order=("gemini-2", "gemini-3", "gemini-1"),
+        )
+        if not self._key_clients:
+            raise ValueError(
+                "BatchTTSDirector requires at least one Gemini adapter"
+            )
+
+    def direct_episode(
+        self,
+        ayah_scripts: List[Dict[str, Any]],
+    ) -> Optional[BatchTTSOut]:
+        prompt = self._build_prompt(ayah_scripts)
+        logger.info(
+            f"🎙️ BatchTTSDirector: directing {len(ayah_scripts)} ayahs "
+            f"in 1 call (Phase 2, {len(self._key_clients)} keys)"
+        )
+        t0 = time.monotonic()
+
+        result = _call_gemini_with_rotation(
+            self._key_clients, prompt, BatchTTSOut,
+            temperature=0.3, max_tokens=2048,
+        )
+
+        elapsed = time.monotonic() - t0
+        if result is None:
+            logger.error(f"❌ BatchTTSDirector failed in {elapsed:.1f}s")
+            return None
+
+        logger.info(
+            f"✅ BatchTTSDirector: {len(result.directions)} directions "
+            f"in {elapsed:.1f}s"
+        )
+        return result
+
+    @staticmethod
+    def _build_prompt(ayah_scripts: List[Dict[str, Any]]) -> str:
+        blocks = []
+        for s in ayah_scripts:
+            num = s["number"]
+            emotion = s.get("emotion", "warm")
+            text = s.get("text", "")[:200]
+            blocks.append(f"━━━ آية {num} (emotion: {emotion}) ━━━\n{text}")
+        body = "\n\n".join(blocks)
+
+        return f"""أنت مخرج صوتي للقصص الإسلامية للأطفال.
+لكل آية، حدد إعدادات صوتية تناسب المشهد.
+
+{body}
+
+═══ القواعد ═══
+- voice_speed: 0.85-1.10 (أبطأ للهيبة، أسرع للحماس)
+- voice_stability: 0.30-0.70 (أعلى للثبات الموقر)
+- voice_style: 0.30-0.70 (أعلى للتعبير العاطفي)
+- emphasis_words: 0-5 كلمات للتأكيد عليها
+
+ارجع JSON مع direction لكل آية في array واحدة.
+"""
+
+
+# ════════════════════════════════════════════════════════════════
+# BatchVisualPromptEngine — Phase 2
+# ════════════════════════════════════════════════════════════════
+
+class BatchVisualPromptEngine:
+    """Generate visual prompts for all 7 ayahs in 1 call.
+
+    Phase 2: Uses Key 3 first (dedicated), falls back to 1 → 2.
+    """
+
+    def __init__(self, adapters: Dict[str, Any]) -> None:
+        self._key_clients = _build_clients_from_adapters(
+            adapters, preferred_order=("gemini-3", "gemini-1", "gemini-2"),
+        )
+        if not self._key_clients:
+            raise ValueError(
+                "BatchVisualPromptEngine requires at least one Gemini adapter"
+            )
+
+    def generate_visuals(
+        self,
+        ayah_scripts: List[Dict[str, Any]],
+    ) -> Optional[BatchVisualOut]:
+        prompt = self._build_prompt(ayah_scripts)
+        logger.info(
+            f"🎨 BatchVisualPromptEngine: prompting {len(ayah_scripts)} ayahs "
+            f"in 1 call (Phase 2, {len(self._key_clients)} keys)"
+        )
+        t0 = time.monotonic()
+
+        result = _call_gemini_with_rotation(
+            self._key_clients, prompt, BatchVisualOut,
+            temperature=0.6, max_tokens=4096,
+        )
+
+        elapsed = time.monotonic() - t0
+        if result is None:
+            logger.error(f"❌ BatchVisualPromptEngine failed in {elapsed:.1f}s")
+            return None
+
+        logger.info(
+            f"✅ BatchVisualPromptEngine: {len(result.prompts)} prompts "
+            f"in {elapsed:.1f}s"
+        )
+        return result
+
+    @staticmethod
+    def _build_prompt(ayah_scripts: List[Dict[str, Any]]) -> str:
+        blocks = []
+        for s in ayah_scripts:
+            num = s["number"]
+            text = s.get("explain", "")[:300]
+            story = s.get("story", "")[:200]
+            blocks.append(f"━━━ آية {num} ━━━\nشرح: {text}\nتشبيه: {story}")
+        body = "\n\n".join(blocks)
+
+        return f"""You are a visual director for an Islamic children's
+educational video. For each ayah, generate Leonardo.ai-friendly visual
+prompts (in English) that capture the meaning visually.
+
+Style: Watercolor, paper texture, soft lighting, peaceful, child-friendly.
+Avoid: Human faces with detail, religious symbols controversies, dark themes.
+
+{body}
+
+═══ For each ayah, provide ═══
+- subject: main visual element (e.g., "a single seed sprouting in soil")
+- environment: setting (e.g., "warm garden at golden hour")
+- mood_lighting: emotional tone + light (e.g., "peaceful, soft golden light")
+- color_palette: dominant colors (e.g., "warm yellows, soft greens")
+
+Return JSON with prompts array, one entry per ayah.
+"""
