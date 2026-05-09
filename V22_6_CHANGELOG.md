@@ -171,3 +171,96 @@ Files touched:
 Verified: 532/532 tests pass in both states (google-genai installed and
 google-genai NOT installed), so the suite works in both pre_check and
 pipeline job environments.
+
+
+---
+
+## v22.6.2 hotfix — BatchTafsirReviewer recovery from malformed JSON
+
+### Incident
+
+Episode 1 first run: BatchScriptEngine succeeded ✅, BatchTafsirReviewer
+failed with `JSON parse failed at pos 406 → Salvage failed: Expecting ','
+delimiter: line 20 column 6 (char 330)`. The fallback chain (per-ayah
+multi-key rotation) caught the failure and finished Phase 1 successfully.
+But the user wants the batch path itself to succeed 100%.
+
+### Root cause analysis
+
+The character-level error position (330 of 406+) ruled out truncation —
+the failure was structural inside the response. Two compounding causes:
+
+1. **Tight `max_tokens=4096`** for tafsir batch review. Seven ayahs each
+   with potentially multi-sentence Arabic concerns can easily push the
+   output past 4 K tokens. When Gemini gets close to the ceiling, it
+   sometimes emits structurally-broken JSON.
+
+2. **Naive salvage layer** — the v22.6.0 cleaner only handled markdown
+   fences, smart quotes, and trailing commas. It did NOT escape literal
+   newlines that Arabic LLMs frequently insert mid-string for
+   readability. A raw `\n` inside a quoted string breaks `json.loads`.
+
+### Fixes
+
+**1. `_aggressive_json_clean()` — overhauled**
+
+A character-walking cleaner that handles all six known Gemini-with-Arabic
+failure modes:
+
+| # | Failure mode | Fix |
+|---|---|---|
+| 1 | Markdown fences (`` ```json ``` ``) | Strip leading/trailing |
+| 2 | Smart quotes around Arabic strings (`"` `"` `'` `'` `«` `»`) | Normalize to ASCII |
+| 3 | Trailing commas before `}` or `]` | Remove |
+| 4 | **Unescaped raw `\n` inside quoted Arabic strings** (the v22.6.1 cause) | Walk char-by-char with string-state tracking, escape `\n`/`\r`/`\t` only when inside `"..."` |
+| 5 | BOM and zero-width chars | Strip |
+| 6 | Leading/trailing chatter ("تمام، هكتبلك:") | Extract `{…}` block |
+
+**2. `_try_iterative_json_recovery()` — new layer**
+
+When the response is truncated but the prefix is balanced, walk back to
+the last `}` at depth 0 and parse the prefix. Properly tracks brace
+depth respecting strings (a `}` inside a quoted string is not counted).
+
+**3. BatchTafsirReviewer — `max_tokens` 4096 → 16384** + automatic retry
+
+- The tight 4 K budget was a real constraint for 7 ayahs of Arabic.
+- On first failure, retry with a simplified prompt (drops examples,
+  keeps doctrinal constraints) at `temperature=0.0` for determinism.
+- Both attempts use the new cleaner.
+
+**4. Diagnostic dump** — new `_dump_failed_response()`
+
+Any future `_call_gemini_with_schema` failure now writes the raw response
++ error summary to `logs/gemini_failures/{Schema}_{timestamp}.txt`.
+GitHub Actions artifact upload picks this up automatically. Controlled
+by env var `QEEMA_DEBUG_DIR`.
+
+### Test coverage
+
+Added 25 tests:
+
+- `TestAggressiveJsonClean` (13): each of the 6 failure modes in
+  isolation + combined real-world payloads + idempotency.
+- `TestIterativeJsonRecovery` (6): truncation patterns + nested objects
+  + braces inside strings.
+- `TestBatchTafsirReviewerRetry` (4): retry path triggers, simplified
+  prompt is shorter and still carries red flags, both-attempts-fail returns None.
+- `TestRealisticMalformedJsonE2E` (1): reconstructs the **exact**
+  v22.6.1 episode 1 incident pattern (smart quotes + unescaped Arabic
+  newline) and verifies the new cleaner recovers all 7 reviews.
+
+Total: **557 tests pass**, both with and without `google-genai`
+installed (matches CI pre_check vs pipeline job environments).
+
+### What is NOT verified
+
+- Real Gemini behaviour with the new `max_tokens=16384` is untested —
+  but raising the ceiling is conservative (the budget was previously too
+  tight, not too loose).
+- The diagnostic dump path is exercised by tests via mock, but the file
+  upload to GitHub Actions artifact happens at workflow level; no
+  changes were made there.
+- If a future failure mode emerges that none of the six cleaners handle,
+  the diagnostic dump will surface the exact raw response so we can
+  extend the cleaner with confidence.
