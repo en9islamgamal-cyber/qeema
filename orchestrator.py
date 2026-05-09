@@ -480,9 +480,37 @@ class Orchestrator:
     ) -> Optional[EpisodeScript]:
         """Reload an EpisodeScript from disk for Phase 2/3 continuation.
 
-        Uses the legacy script_engine's load_from_disk if available,
-        otherwise rebuilds from the episode JSON.
+        Resolution order:
+          1. v22.6.3: If a phase-state snapshot exists, restore the temp
+             episode JSON from it (it survives across runs via GitHub
+             Actions cache; the temp file does not).
+          2. Use script_engine's load_from_disk if available.
+          3. Fall back to UnifiedScriptEngine.generate (which does its own
+             cache lookup before regenerating).
+
+        Returns the script, or None if all paths fail.
         """
+        # v22.6.3: restore temp JSON from phase state snapshot if needed.
+        # This is what stops Phase 2 from re-generating the entire script
+        # via a fresh BatchScriptEngine call.
+        try:
+            phase_state = self._load_phase_state(episode_number)
+            snapshot = phase_state.get("episode_json_snapshot")
+            ep_json_path = (
+                self.paths.temp_episodes
+                / f"episode_{episode_number:03d}.json"
+            )
+            if snapshot and not ep_json_path.exists():
+                ep_json_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(ep_json_path, "w", encoding="utf-8") as f:
+                    json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                logger.info(
+                    f"♻️ Restored episode JSON from phase state snapshot "
+                    f"({len(snapshot.get('ayah_scenes', []))} scenes)"
+                )
+        except Exception as e:
+            logger.warning(f"⚠️ Snapshot restore failed: {e}")
+
         # Prefer script_engine's loader (knows how to inflate EpisodeScript)
         if hasattr(self.script_engine, "load_from_disk"):
             try:
@@ -656,6 +684,20 @@ class Orchestrator:
             )
             return
 
+        # v22.6.3: ALSO persist to phase state so Phase 3 (which may run on a
+        # different runner with a fresh disk) can recover. The temp/episodes
+        # JSON is ephemeral; only _phase_state.json survives across runs via
+        # GitHub Actions cache.
+        try:
+            self._save_phase_state(
+                episode_number,
+                deep_visuals=deep_visuals_payload,
+            )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Phase 2 deep visuals: phase-state persist failed: {e}"
+            )
+
         usable = sum(1 for d in deep_visuals_payload if d.get("is_usable"))
         logger.info(
             f"🎨 Phase 2 deep visuals: {usable}/{len(deep_visuals_payload)} usable"
@@ -807,6 +849,17 @@ class Orchestrator:
             )
             return
 
+        # v22.6.3: ALSO persist to phase state so Phase 3 can recover.
+        try:
+            self._save_phase_state(
+                episode_number,
+                tts_directions=directions_dict,
+            )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Phase 2 TTS director: phase-state persist failed: {e}"
+            )
+
         logger.info(
             f"🎙️ Phase 2 TTS director: {len(directions_dict)} segments "
             f"directed with SSML"
@@ -848,6 +901,12 @@ class Orchestrator:
         v22.6 BUG FIX: legacy code referenced episode_direction.directions
         but the dataclass field is `segments` — that meant legacy was
         always silently failing with AttributeError. Fixed here.
+
+        v22.6.3: Returns None if the legacy path produced a `fallback_used`
+        result (Gemini failed JSON parse → all SegmentDirection.directed_text
+        == original_text, no SSML). Previously this returned the fallback
+        dict and the orchestrator misreported "N segments directed". Now
+        the caller treats this as a true failure → logs honestly.
         """
         adapter = self._phase2_tts_gemini_adapter()
         if adapter is None:
@@ -863,6 +922,19 @@ class Orchestrator:
             segments = getattr(episode_direction, "segments", {}) or {}
             if not segments:
                 return None
+
+            # v22.6.3: honest reporting. If the legacy LLM call failed parse,
+            # TTSDirector populates segments with fallback entries where
+            # directed_text == original_text. That's not "directed with SSML"
+            # — it's no SSML at all. Treat as failure so the caller logs
+            # truthfully and downstream synthesis uses the original text.
+            if getattr(episode_direction, "fallback_used", False):
+                logger.warning(
+                    "⚠️ Legacy TTS produced fallback segments only "
+                    "(Gemini JSON parse failed); no SSML applied"
+                )
+                return None
+
             return {
                 sd.segment_id: {
                     "directed_text": sd.directed_text,
@@ -977,9 +1049,27 @@ class Orchestrator:
                     )
 
                 # ── Phase 1 close: save state + mark script_ready ──
+                # v22.6.3: persist the temp episode JSON content into the
+                # phase state so Phase 2 (which runs on a different runner
+                # with a fresh disk) doesn't have to regenerate the script.
+                ep_json_payload: Optional[Dict[str, Any]] = None
+                ep_json_path = (
+                    self.paths.temp_episodes
+                    / f"episode_{episode_number:03d}.json"
+                )
+                if ep_json_path.exists():
+                    try:
+                        with open(ep_json_path, encoding="utf-8") as f:
+                            ep_json_payload = json.load(f)
+                    except Exception as e:
+                        log.warning(
+                            f"⚠️ Could not snapshot episode JSON for state: {e}"
+                        )
+
                 self._save_phase_state(
                     episode_number,
                     phase1_completed_at=time.time(),
+                    episode_json_snapshot=ep_json_payload,
                 )
                 # Update repository status if running phase-only
                 if phase == EpisodePhase.PHASE_1:
@@ -1026,6 +1116,21 @@ class Orchestrator:
                 # Was in Phase 1, moved here to use a different daily quota.
                 # Reads the saved episode JSON, augments visual fields, saves back.
                 self._run_phase2_deep_visuals(episode_number, script)
+
+                # v22.6.3: After deep visuals are persisted, rebuild the
+                # in-memory script so its ayah_scenes[i].visual_prompt
+                # reflects the fresh deep_visuals. Without this, downstream
+                # _generate_ai_images sees empty visual_prompt and every
+                # scene falls back to CSS — the v22.6.2 episode 1 incident.
+                refreshed = self._reload_episode_script(episode_number)
+                if refreshed is not None:
+                    refreshed.episode_id = script.episode_id
+                    script = refreshed
+                else:
+                    log.warning(
+                        "⚠️ Could not refresh script after deep visuals — "
+                        "AI images may use stale (empty) visual_prompt"
+                    )
 
                 # ── Stage 2.5b (v22.5): TTS Director (Phase 2 Gemini)
                 # Was in Phase 1, moved here. Adds SSML directions to segments.
