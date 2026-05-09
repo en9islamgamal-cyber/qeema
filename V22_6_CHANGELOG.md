@@ -264,3 +264,127 @@ installed (matches CI pre_check vs pipeline job environments).
 - If a future failure mode emerges that none of the six cleaners handle,
   the diagnostic dump will surface the exact raw response so we can
   extend the cleaner with confidence.
+
+
+---
+
+## v22.6.3 — Phase 2 reliability overhaul
+
+### Incident summary
+
+Episode 1 Phase 2 reported `Pipeline succeeded` but five things were
+actually broken (caught by inspecting the phase-state artifact + log):
+
+| # | Surface symptom | Real cause |
+|---|---|---|
+| 1 | Gemini `400 INVALID_ARGUMENT` on TTS director batch | `BatchTTSOut` schema state space too large |
+| 2 | Log claimed "28 segments directed with SSML" | Legacy TTSDirector returned fallback (no SSML), orchestrator misreported |
+| 3 | All 7 Leonardo image generations fell back to CSS | `script.ayah_scenes[i].visual_prompt` was empty |
+| 4 | Phase 3 would not have any visuals or TTS to use | `_deep_visuals` and `_tts_directions` only persisted to ephemeral temp JSON |
+| 5 | Phase 2 wasted 23.3s + 1 Gemini call regenerating Phase 1's script | Temp episode JSON wiped between runners |
+
+### Fixes
+
+**Fix 1 — `SegmentTTSOut` / `BatchTTSOut` schema simplification**
+
+Removed `max_length` constraints from `segment_id`, `directed_text`,
+`pace_reason`, `pronunciation_notes`, and `directions` array. Gemini's
+JSON-Schema enforcer rejects schemas where `array_max × per_field_max`
+exceeds an internal limit, returning HTTP 400 with `'too many states for
+serving'`. We keep Pydantic-side validation post-response (still rejects
+empty arrays via `min_length=1` and missing required fields).
+
+The other batch schemas (`BatchScriptOut`, `BatchReviewOut`,
+`BatchVisualOut`) were not touched because they were already proven to
+work in production runs.
+
+**Fix 2 — Honest TTS fallback reporting**
+
+`_legacy_tts` now returns `None` when `episode_direction.fallback_used`
+is True (TTSDirector populates that flag when its Gemini call fails JSON
+parse and it produces no-SSML fallback segments). The orchestrator's
+caller logs `ℹ️ no directions produced — audio will use base voice
+settings` instead of the previous misleading `🎙️ N segments directed
+with SSML`.
+
+**Fix 3 — Persist Phase 2 outputs to phase state**
+
+`_run_phase2_deep_visuals` and `_run_phase2_tts_director` now also call
+`_save_phase_state(deep_visuals=...)` and `_save_phase_state(tts_directions=...)`
+after writing the temp JSON. Phase 3 (running on a fresh runner with no
+temp files) can recover both via `_load_phase_state`. The temp JSON
+remains the authoritative source within a single run; the phase state
+is the cross-run survivor.
+
+**Fix 4 — Refresh script after deep visuals augment it**
+
+After `_run_phase2_deep_visuals` finishes, the orchestrator now calls
+`_reload_episode_script` again to rebuild the in-memory script with the
+fresh `_deep_visuals` dictionary. Previously the script object was
+loaded BEFORE `_deep_visuals` existed, so its `ayah_scenes[i].visual_prompt`
+fields stayed empty and every AI image generation fell back to CSS.
+This was a v22.5 latent bug exposed by Episode 1.
+
+**Fix 5 — Phase 1 snapshots episode JSON for Phase 2/3 reload**
+
+After Phase 1 finishes, the temp episode JSON is read back and saved
+into the phase state under `episode_json_snapshot`. `_reload_episode_script`
+now restores the temp JSON from that snapshot before attempting
+`load_from_disk`. Eliminates the wasteful regeneration in Phase 2 (saved
+~23s + 1 Gemini call per episode) and makes Phase 2/3 deterministic
+even when the GitHub Actions runner restarts.
+
+### Test coverage
+
+11 new tests in `tests/test_v22_6_3_phase2_fixes.py`:
+
+- `TestSchemaStateSpace` (4): no `maxLength` on TTS schema fields, no
+  `maxItems` on `directions` array, Pydantic still enforces required
+  fields, `min_length=1` still enforced.
+- `TestLegacyTtsHonestReporting` (2): `_legacy_tts` returns `None` when
+  `fallback_used=True`, returns dict when real SSML produced.
+- `TestPhase2OutputsPersistedToState` (2): `_run_phase2_deep_visuals`
+  and `_run_phase2_tts_director` both call `_save_phase_state` with
+  their payloads.
+- `TestReloadFromSnapshot` (3): snapshot restored when temp JSON
+  missing, NOT overwritten when temp exists, falls through to
+  `load_from_disk` → `UnifiedScriptEngine` when neither exists.
+
+Total suite: **568 tests**, all pass with and without `google-genai` installed.
+
+### What is NOT verified
+
+- Real Gemini call against the simplified `BatchTTSOut` schema. Removing
+  the bounds is conservative (Pydantic still validates structure) but
+  the production behavior depends on Gemini accepting the schema. If
+  Gemini is happy, the legacy fallback is no longer needed.
+- The phase state is roughly twice as large now (it carries a full
+  episode JSON snapshot plus deep_visuals + tts_directions). The cache
+  upload still fits well under the 100MB Actions artifact limit
+  (Episode 1 phase state = ~50KB), but if episodes get larger we may
+  need to split.
+- `_reload_episode_script` is invoked twice per Phase 2 run now (once
+  before deep visuals, once after). Each call is a disk read, not a
+  Gemini call, so cost is negligible.
+
+### Deployment
+
+Replace these three files in the repo, push, re-run Phase 2 for episode 1:
+
+```
+engines/batch_engines.py        — schema bounds removed
+orchestrator.py                  — 5 fixes integrated
+tests/test_v22_6_3_phase2_fixes.py — NEW
+V22_6_CHANGELOG.md               — this section appended
+```
+
+Expected Phase 2 log markers indicating success:
+
+- `🎨 Phase 2 deep visuals: 7/7 usable` (already happened in Episode 1)
+- `♻️ Restored episode JSON from phase state snapshot (7 scenes)` (NEW —
+  no more BatchScriptEngine call in Phase 2)
+- `🎙️ BatchTTSDirector: directing 21 segments` followed by HTTP 200
+  (NOT the 400 from v22.6.2)
+- `🎙️ Phase 2 TTS director: 21 segments directed with SSML` (this time
+  truthful — backed by real SSML from BatchTTSDirector)
+- `✅ AI images: 7 generated` (NOT `0 generated` + CSS fallback)
