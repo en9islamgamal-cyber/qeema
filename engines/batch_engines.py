@@ -134,16 +134,17 @@ class AyahVisualOut(BaseModel):
     ayah_number: int = Field(description="Ayah number")
     subject: str = Field(
         description="Main subject (English, for Leonardo.ai)",
-        max_length=200,
+        max_length=400,  # v22.6.2: was 200, Gemini occasionally returns
+                         # rich watercolor descriptions that exceed it
     )
     environment: str = Field(
-        description="Environment/setting (English)", max_length=200,
+        description="Environment/setting (English)", max_length=400,
     )
     mood_lighting: str = Field(
-        description="Mood + lighting (English)", max_length=200,
+        description="Mood + lighting (English)", max_length=300,
     )
     color_palette: str = Field(
-        description="Color palette (English)", max_length=150,
+        description="Color palette (English)", max_length=250,
     )
 
 
