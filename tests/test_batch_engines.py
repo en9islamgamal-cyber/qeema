@@ -42,7 +42,9 @@ from engines.batch_engines import (
     BatchVisualOut,
     BatchVisualPromptEngine,
     SegmentTTSOut,
+    _aggressive_json_clean,
     _call_gemini_with_schema,
+    _try_iterative_json_recovery,
 )
 
 
@@ -625,3 +627,278 @@ class TestBatchVisualPromptEngine:
         assert "Prophet" in prompt or "prophet" in prompt
         assert "magnets" in prompt.lower() or "magnetic" in prompt.lower()
         assert "بسم" in prompt or "basmala" in prompt.lower() or "glowing" in prompt.lower()
+
+
+# ════════════════════════════════════════════════════════════════
+# v22.6.2 — Aggressive JSON cleaner (each failure mode in isolation)
+# ════════════════════════════════════════════════════════════════
+class TestAggressiveJsonClean:
+    """Each failure mode observed in production v22.6 gets one test.
+    These tests pin the contract for _aggressive_json_clean."""
+
+    def test_strips_markdown_fence(self):
+        raw = '```json\n{"foo": "bar"}\n```'
+        out = _aggressive_json_clean(raw)
+        assert out == '{"foo": "bar"}'
+
+    def test_strips_bare_markdown_fence(self):
+        raw = '```\n{"x": 1}\n```'
+        out = _aggressive_json_clean(raw)
+        assert json.loads(out) == {"x": 1}
+
+    def test_normalizes_arabic_smart_quotes(self):
+        raw = '{\u201cfoo\u201d: \u201cمرحبا\u201d}'
+        out = _aggressive_json_clean(raw)
+        assert json.loads(out) == {"foo": "مرحبا"}
+
+    def test_normalizes_french_guillemets(self):
+        raw = '{\u00abkey\u00bb: \u00abvalue\u00bb}'
+        out = _aggressive_json_clean(raw)
+        assert json.loads(out) == {"key": "value"}
+
+    def test_strips_leading_chatter(self):
+        raw = 'تمام، هكتبلك:\n{"foo": "bar"}\n\nعارف؟'
+        out = _aggressive_json_clean(raw)
+        assert json.loads(out) == {"foo": "bar"}
+
+    def test_strips_trailing_commas_in_object(self):
+        raw = '{"a": 1, "b": 2,}'
+        out = _aggressive_json_clean(raw)
+        assert json.loads(out) == {"a": 1, "b": 2}
+
+    def test_strips_trailing_commas_in_array(self):
+        raw = '{"items": [1, 2, 3,]}'
+        out = _aggressive_json_clean(raw)
+        assert json.loads(out) == {"items": [1, 2, 3]}
+
+    def test_escapes_unescaped_newline_inside_string(self):
+        """The ACTUAL v22.5.7 incident pattern: Arabic LLM emits a literal
+        newline INSIDE a quoted concern string. json.loads chokes on this."""
+        # Build a payload where the value has a raw newline mid-string
+        raw = '{"concern": "السطر الأول\nالسطر الثاني"}'
+        # Sanity: vanilla json.loads should fail on this
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(raw)
+        # Cleaner fixes it
+        cleaned = _aggressive_json_clean(raw)
+        parsed = json.loads(cleaned)
+        assert parsed["concern"] == "السطر الأول\nالسطر الثاني"
+
+    def test_escapes_unescaped_tab_inside_string(self):
+        raw = '{"x": "before\tafter"}'
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(raw)
+        cleaned = _aggressive_json_clean(raw)
+        assert json.loads(cleaned)["x"] == "before\tafter"
+
+    def test_preserves_already_escaped_sequences(self):
+        """We must not double-escape \\n that Gemini already escaped."""
+        raw = '{"x": "line1\\nline2"}'
+        cleaned = _aggressive_json_clean(raw)
+        assert json.loads(cleaned)["x"] == "line1\nline2"
+
+    def test_handles_combined_failures(self):
+        """One real-world payload exhibiting MULTIPLE failure modes at once."""
+        raw = (
+            'تمام:\n'
+            '```json\n'
+            '{\u201creviews\u201d: ['
+            '{\u201cayah_number\u201d: 1, \u201cpassed\u201d: true, '
+            '\u201cconfidence\u201d: 0.9, '
+            '\u201cconcerns\u201d: ["الشرح صحيح\nلكن طويل",]},]}\n'
+            '```'
+        )
+        cleaned = _aggressive_json_clean(raw)
+        parsed = json.loads(cleaned)
+        assert parsed["reviews"][0]["ayah_number"] == 1
+        assert "الشرح صحيح" in parsed["reviews"][0]["concerns"][0]
+
+    def test_strips_bom(self):
+        raw = '\ufeff{"x": 1}'
+        cleaned = _aggressive_json_clean(raw)
+        assert json.loads(cleaned) == {"x": 1}
+
+    def test_strips_zero_width_chars(self):
+        raw = '{"key\u200b": "val\u200c"}'
+        cleaned = _aggressive_json_clean(raw)
+        assert json.loads(cleaned) == {"key": "val"}
+
+    def test_idempotent_on_already_clean_json(self):
+        """Calling cleaner on already-clean JSON is a no-op."""
+        raw = '{"a": 1, "b": [2, 3]}'
+        cleaned = _aggressive_json_clean(raw)
+        assert json.loads(cleaned) == json.loads(raw)
+
+
+# ════════════════════════════════════════════════════════════════
+# v22.6.2 — Iterative JSON recovery (truncated responses)
+# ════════════════════════════════════════════════════════════════
+class TestIterativeJsonRecovery:
+    """When Gemini hits max_tokens mid-array, we walk back to the last
+    balanced } or ] and parse the prefix."""
+
+    def test_recovers_truncated_array(self):
+        """Output cut mid-array after the second item."""
+        truncated = '{"reviews": [{"a": 1}, {"a": 2}'  # missing ]}
+        # vanilla parse fails
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(truncated)
+        # iterative recovery returns None because no balanced prefix exists
+        # at depth 0 (the outer { never closed)
+        assert _try_iterative_json_recovery(truncated) is None
+
+    def test_recovers_truncated_inside_outer_object(self):
+        """If the outer object closes but inner array is truncated: nope."""
+        # Something like: {"reviews": [{"x": 1}, {"x": 2  ← truncated here
+        truncated = '{"reviews": [{"x": 1}, {"x": 2'
+        assert _try_iterative_json_recovery(truncated) is None
+
+    def test_returns_balanced_prefix_when_extra_garbage_follows(self):
+        """Output is fully valid JSON followed by garbage — recovery
+        should parse the JSON and ignore the trailing junk."""
+        garbage_after = '{"reviews": [{"a": 1}]}garbage trailing'
+        recovered = _try_iterative_json_recovery(garbage_after)
+        assert recovered == {"reviews": [{"a": 1}]}
+
+    def test_returns_none_for_truly_unparseable(self):
+        assert _try_iterative_json_recovery("not json at all") is None
+        assert _try_iterative_json_recovery("") is None
+
+    def test_handles_nested_objects(self):
+        good = '{"a": {"b": {"c": 1}}}extra'
+        recovered = _try_iterative_json_recovery(good)
+        assert recovered == {"a": {"b": {"c": 1}}}
+
+    def test_does_not_misparse_braces_inside_strings(self):
+        """A } inside a quoted string must not be counted as closing."""
+        s = '{"text": "this } is in a string"}post'
+        recovered = _try_iterative_json_recovery(s)
+        assert recovered == {"text": "this } is in a string"}
+
+
+# ════════════════════════════════════════════════════════════════
+# v22.6.2 — BatchTafsirReviewer retry path
+# ════════════════════════════════════════════════════════════════
+class TestBatchTafsirReviewerRetry:
+    """First attempt fails → second attempt with simplified prompt
+    succeeds. Verifies the fallback chain reaches a result."""
+
+    def test_simplified_prompt_is_shorter_than_full(self):
+        ayah_scripts = [
+            {"number": i, "explain": "x" * 200, "story": "y" * 150}
+            for i in range(1, 8)
+        ]
+        tafsirs = {i: "z" * 600 for i in range(1, 8)}
+        full = BatchTafsirReviewer._build_prompt(ayah_scripts, tafsirs)
+        simple = BatchTafsirReviewer._build_simplified_prompt(
+            ayah_scripts, tafsirs,
+        )
+        assert len(simple) < len(full), (
+            f"Simplified prompt ({len(simple)} chars) should be shorter "
+            f"than full ({len(full)} chars) to free output budget"
+        )
+
+    def test_simplified_prompt_still_carries_red_flags(self):
+        """Even the trimmed prompt must keep the 4 doctrinal rules so the
+        retry can still catch forbidden analogies."""
+        simple = BatchTafsirReviewer._build_simplified_prompt(
+            [{"number": 1, "explain": "x", "story": "y"}],
+            {1: "tafsir"},
+        )
+        assert "يوم الدين" in simple
+        assert "المغناطيس" in simple
+        assert "أكل" in simple
+        assert "السحر" in simple or "البسملة" in simple
+
+    def test_retry_succeeds_when_first_attempt_fails(self, fake_genai_types):
+        """If first call returns None (parse failure), retry with simpler
+        prompt → returns the result."""
+        good = BatchReviewOut(reviews=[
+            AyahReviewOut(ayah_number=1, passed=True, confidence=0.9),
+        ])
+
+        # Mock client: first call returns malformed text, second returns parsed.
+        client = MagicMock()
+        bad_response = MagicMock()
+        bad_response.parsed = None
+        bad_response.text = "not json"
+        good_response = MagicMock()
+        good_response.parsed = good
+        good_response.text = ""
+        client.models.generate_content.side_effect = [bad_response, good_response]
+
+        engine = BatchTafsirReviewer(client)
+        result = engine.review_episode(
+            ayah_scripts=[{"number": 1, "explain": "x", "story": "y"}],
+            tafsirs={1: "z"},
+        )
+        # Got the retry result
+        assert result is good
+        # Confirm two calls were made (first + retry)
+        assert client.models.generate_content.call_count == 2
+
+    def test_returns_none_when_both_attempts_fail(self, fake_genai_types):
+        """If retry also fails, return None — caller falls back to
+        per-ayah path."""
+        client = MagicMock()
+        bad = MagicMock(parsed=None, text="garbage")
+        client.models.generate_content.return_value = bad
+
+        engine = BatchTafsirReviewer(client)
+        result = engine.review_episode(
+            ayah_scripts=[{"number": 1, "explain": "x", "story": "y"}],
+            tafsirs={1: "z"},
+        )
+        assert result is None
+        # Both attempts were made
+        assert client.models.generate_content.call_count == 2
+
+
+# ════════════════════════════════════════════════════════════════
+# v22.6.2 — End-to-end test: realistic malformed Arabic JSON gets parsed
+# ════════════════════════════════════════════════════════════════
+class TestRealisticMalformedJsonE2E:
+    """Reconstruct the EXACT failure pattern from the v22.6.1 episode 1
+    incident: BatchTafsirReviewer received output that was truncated
+    after a few hundred chars. Verify the new pipeline now recovers."""
+
+    def test_truncated_review_with_unescaped_newline_recovers(
+        self, fake_genai_types,
+    ):
+        """Simulated v22.6.1 incident: 'JSON parse failed at pos 406,
+        salvage failed at char 330'. Recreate that and verify recovery."""
+        # A response that has both: unescaped newline inside a concern,
+        # AND smart quotes around keys (typical Gemini-Arabic combo)
+        gemini_output = (
+            '```json\n'
+            '{\u201creviews\u201d: ['
+            '{\u201cayah_number\u201d: 1, \u201cpassed\u201d: true, '
+            '\u201cconfidence\u201d: 0.92, \u201cconcerns\u201d: []},'
+            '{\u201cayah_number\u201d: 2, \u201cpassed\u201d: false, '
+            '\u201cconfidence\u201d: 0.85, '
+            '\u201cconcerns\u201d: ["الشرح يضيف معنى\nخارج التفسير"]},'
+            ']}\n'
+            '```'
+        )
+        # Sanity: vanilla json.loads explodes
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(gemini_output)
+
+        # Build a Gemini mock that returns this malformed text (with
+        # response.parsed=None, forcing the cleaner path).
+        client = MagicMock()
+        response = MagicMock()
+        response.parsed = None
+        response.text = gemini_output
+        client.models.generate_content.return_value = response
+
+        # The wrapper function recovers and returns the parsed schema
+        result = _call_gemini_with_schema(
+            client, "test prompt", BatchReviewOut,
+        )
+        assert result is not None
+        assert len(result.reviews) == 2
+        assert result.reviews[0].ayah_number == 1
+        assert result.reviews[0].passed is True
+        assert result.reviews[1].passed is False
+        assert "الشرح يضيف معنى" in result.reviews[1].concerns[0]
