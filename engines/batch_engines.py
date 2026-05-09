@@ -261,6 +261,117 @@ class BatchVisualOut(BaseModel):
 # Common helpers
 # ════════════════════════════════════════════════════════════════
 
+def _dump_failed_response(
+    text: str,
+    prompt: str,
+    schema_class: type,
+    error_summary: str,
+) -> Optional[str]:
+    """Save a malformed response to disk for post-mortem.
+
+    Returns the path written to, or None if dumping failed (we never let
+    a debug-aid failure crash the actual pipeline).
+    """
+    import os as _os
+    import time as _t
+    from pathlib import Path as _P
+    try:
+        out_dir = _P(_os.environ.get("QEEMA_DEBUG_DIR", "logs/gemini_failures"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = _t.strftime("%Y%m%d_%H%M%S")
+        path = out_dir / f"{schema_class.__name__}_{ts}.txt"
+        path.write_text(
+            f"=== Schema: {schema_class.__name__} ===\n"
+            f"=== Error: {error_summary} ===\n"
+            f"=== Prompt length: {len(prompt)} chars ===\n"
+            f"=== Response length: {len(text)} chars ===\n"
+            f"\n--- RAW RESPONSE ---\n{text}\n"
+            f"--- END RAW RESPONSE ---\n",
+            encoding="utf-8",
+        )
+        logger.info(f"💾 Failure dump → {path}")
+        return str(path)
+    except Exception as dump_err:
+        logger.debug(f"Could not dump response: {dump_err}")
+        return None
+
+
+def _aggressive_json_clean(text: str) -> str:
+    """Apply every known fix for Gemini's JSON-with-Arabic failure modes.
+
+    Each transformation is independent and additive — earlier ones don't
+    break later ones. Order matters for correctness, not for safety.
+
+    Failure modes observed in production v22.6 (and what we do about them):
+      1. Markdown code fences           → strip leading/trailing ```json ... ```
+      2. Unicode smart quotes in Arabic → normalize to ASCII " and '
+      3. Trailing commas before } or ]  → remove
+      4. Unescaped raw newlines INSIDE strings (Arabic LLMs often add line
+         breaks for readability — these break json.loads at the literal \n
+         inside a quoted string) → escape them
+      5. Unescaped raw \\t / \\r inside strings → escape them
+      6. Stray BOM / zero-width chars   → strip
+      7. Leading/trailing chatter ("تمام، هكتبلك:") → extract { … } block
+    """
+    # 0. BOM and zero-width characters at any position
+    text = text.replace("\ufeff", "").replace("\u200b", "").replace("\u200c", "")
+
+    # 1. Markdown fences
+    text = re.sub(r'^\s*```(?:json)?\s*', '', text)
+    text = re.sub(r'\s*```\s*$', '', text)
+    text = text.strip()
+
+    # 2. Smart quotes (Arabic LLMs often emit these around Arabic strings)
+    text = (text
+        .replace("\u201c", '"').replace("\u201d", '"')   # " "
+        .replace("\u2018", "'").replace("\u2019", "'")   # ' '
+        .replace("\u00ab", '"').replace("\u00bb", '"')   # « »
+    )
+
+    # 3. Extract the outermost {…} so leading/trailing chatter is dropped
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        text = match.group(0)
+
+    # 4. Escape unescaped raw newlines/CR/tab INSIDE strings.
+    # We walk the string and track whether we're inside a "..." string,
+    # respecting backslash escapes. This is the most common Gemini-Arabic
+    # failure: the model puts a literal newline inside a long Arabic
+    # concern, breaking json.loads.
+    out = []
+    in_string = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            out.append(ch)
+            escape_next = False
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        if in_string and ch == "\n":
+            out.append("\\n")
+            continue
+        if in_string and ch == "\r":
+            out.append("\\r")
+            continue
+        if in_string and ch == "\t":
+            out.append("\\t")
+            continue
+        out.append(ch)
+    text = "".join(out)
+
+    # 5. Trailing commas before closing brackets/braces
+    text = re.sub(r',\s*([\]}])', r'\1', text)
+
+    return text
+
+
 def _call_gemini_with_schema(
     client: Any,
     prompt: str,
@@ -273,6 +384,9 @@ def _call_gemini_with_schema(
     """Make a Gemini call with Pydantic response_schema.
 
     Returns the parsed BaseModel instance, or None on failure.
+
+    On any parse failure, dumps the raw response to disk for diagnosis
+    (controlled by env QEEMA_DEBUG_DIR, default logs/gemini_failures/).
     """
     from google.genai import types as genai_types
 
@@ -291,48 +405,106 @@ def _call_gemini_with_schema(
         logger.error(f"❌ Gemini call failed: {e}")
         raise
 
-    # Try response.parsed first (SDK auto-parses if schema valid)
+    # Layer 1: response.parsed (SDK auto-validates if schema is satisfied)
     parsed = getattr(response, "parsed", None)
     if parsed is not None:
         logger.debug(f"✅ Schema-parsed via response.parsed ({type(parsed).__name__})")
         return parsed
 
-    # Fallback: manual JSON parse + Pydantic validation
-    text = response.text or ""
-    if not text:
-        logger.warning("⚠️ Empty response text from Gemini")
+    raw_text = response.text or ""
+    if not raw_text:
+        logger.warning(f"⚠️ Empty response text from Gemini for {schema_class.__name__}")
         return None
 
-    # Strip markdown if present
-    text = re.sub(r'^\s*```(?:json)?\s*', '', text)
-    text = re.sub(r'\s*```\s*$', '', text)
-    text = text.strip()
-
-    # Normalize Arabic smart quotes
-    text = (text
-        .replace("\u201c", '"').replace("\u201d", '"')
-        .replace("\u2018", "'").replace("\u2019", "'")
-        .replace("\u00ab", '"').replace("\u00bb", '"')
-    )
+    # Layer 2: manual JSON parse + Pydantic validate, with aggressive cleaning
+    cleaned = _aggressive_json_clean(raw_text)
 
     try:
-        data = json.loads(text)
+        data = json.loads(cleaned)
         return schema_class.model_validate(data)
-    except json.JSONDecodeError as e:
-        logger.warning(f"⚠️ JSON parse failed at pos {e.pos}: trying regex salvage")
-        # Last-resort: extract { ... } block
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
+    except json.JSONDecodeError as je:
+        logger.warning(
+            f"⚠️ JSON parse failed at pos {je.pos} (msg: {je.msg}) "
+            f"for {schema_class.__name__}; trying iterative recovery"
+        )
+        # Layer 3: iterative recovery — try truncating at each {/[ boundary
+        # walking backwards. Useful when the response is truncated
+        # mid-element but the prefix is valid.
+        recovered = _try_iterative_json_recovery(cleaned)
+        if recovered is not None:
             try:
-                # Strip trailing commas
-                cleaned = re.sub(r',\s*([\]}])', r'\1', match.group(0))
-                data = json.loads(cleaned)
-                return schema_class.model_validate(data)
-            except Exception as e2:
-                logger.error(f"❌ Salvage failed: {e2}")
+                return schema_class.model_validate(recovered)
+            except Exception as ve:
+                logger.error(
+                    f"❌ Recovered JSON didn't satisfy {schema_class.__name__}: {ve}"
+                )
+
+        # All layers failed — dump for post-mortem
+        _dump_failed_response(
+            text=raw_text, prompt=prompt, schema_class=schema_class,
+            error_summary=f"json.JSONDecodeError at pos {je.pos}: {je.msg}",
+        )
         return None
-    except Exception as e:
-        logger.error(f"❌ Pydantic validation failed: {e}")
+    except Exception as ve:
+        logger.error(
+            f"❌ Pydantic validation failed for {schema_class.__name__}: {ve}"
+        )
+        _dump_failed_response(
+            text=raw_text, prompt=prompt, schema_class=schema_class,
+            error_summary=f"Pydantic ValidationError: {ve}",
+        )
+        return None
+
+
+def _try_iterative_json_recovery(text: str) -> Optional[Any]:
+    """If the response was truncated mid-array (common when output hits
+    max_tokens), try parsing successively-shorter prefixes that close
+    the structure cleanly.
+
+    Strategy: find the last position where we have a balanced JSON object,
+    by walking the text and tracking brace/bracket depth. If we find a
+    point where depth returns to 0 at a closing brace, parse up to there.
+
+    Returns the parsed object, or None if no clean prefix exists.
+    """
+    depth_curly = 0
+    depth_square = 0
+    in_string = False
+    escape_next = False
+    last_balanced = -1
+
+    for i, ch in enumerate(text):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\":
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth_curly += 1
+        elif ch == "}":
+            depth_curly -= 1
+            if depth_curly == 0 and depth_square == 0:
+                last_balanced = i
+        elif ch == "[":
+            depth_square += 1
+        elif ch == "]":
+            depth_square -= 1
+            if depth_curly == 0 and depth_square == 0:
+                last_balanced = i
+
+    if last_balanced < 0:
+        return None
+
+    candidate = text[: last_balanced + 1]
+    try:
+        return json.loads(candidate)
+    except Exception:
         return None
 
 
@@ -492,6 +664,15 @@ class BatchTafsirReviewer:
 
         Returns:
             BatchReviewOut with reviews for each ayah, or None on failure.
+
+        v22.6.2:
+          - max_tokens raised 4096 → 16384. Episode 1 first run hit the
+            4096 ceiling — output JSON truncated mid-Arabic-string at
+            char ~330, salvage couldn't recover. With 7 ayahs each
+            potentially having multiple Arabic concerns, 4096 was tight.
+          - One automatic retry on schema-validation failure with a
+            simplified prompt (drops some examples to leave more output
+            budget). This handles transient Gemini decoder hiccups.
         """
         prompt = self._build_prompt(ayah_scripts, tafsirs)
         logger.info(
@@ -501,12 +682,29 @@ class BatchTafsirReviewer:
 
         result = _call_gemini_with_schema(
             self._client, prompt, BatchReviewOut,
-            temperature=0.1, max_tokens=4096,
+            temperature=0.1, max_tokens=16384,
         )
+
+        # v22.6.2: one retry with a simplified prompt if first call fails.
+        # The retry uses lower temperature (0.0) for maximum determinism
+        # and a tighter prompt to free up output budget.
+        if result is None:
+            elapsed1 = time.monotonic() - t0
+            logger.warning(
+                f"⚠️ BatchTafsirReviewer first attempt failed in {elapsed1:.1f}s — "
+                f"retrying with simplified prompt"
+            )
+            simple_prompt = self._build_simplified_prompt(ayah_scripts, tafsirs)
+            result = _call_gemini_with_schema(
+                self._client, simple_prompt, BatchReviewOut,
+                temperature=0.0, max_tokens=16384,
+            )
 
         elapsed = time.monotonic() - t0
         if result is None:
-            logger.error(f"❌ BatchTafsirReviewer failed in {elapsed:.1f}s")
+            logger.error(
+                f"❌ BatchTafsirReviewer failed (both attempts) in {elapsed:.1f}s"
+            )
             return None
 
         passed = sum(1 for r in result.reviews if r.passed)
@@ -515,6 +713,33 @@ class BatchTafsirReviewer:
             f"in {elapsed:.1f}s (1 call instead of {len(ayah_scripts)})"
         )
         return result
+
+    @staticmethod
+    def _build_simplified_prompt(
+        ayah_scripts: List[Dict[str, Any]],
+        tafsirs: Dict[int, str],
+    ) -> str:
+        """Tighter retry prompt — drops the long red-flag examples and
+        relies on the schema description to convey constraints. Frees up
+        roughly 1.5K input tokens for output budget."""
+        blocks = []
+        for s in ayah_scripts:
+            num = s["number"]
+            tafsir = (tafsirs.get(num) or "")[:400]  # tighter cap
+            blocks.append(
+                f"آية {num}:\n"
+                f"تفسير: {tafsir}\n"
+                f"شرح: {s.get('explain', '')[:300]}\n"
+                f"تشبيه: {s.get('story', '')[:200]}"
+            )
+        body = "\n\n".join(blocks)
+        return (
+            f"راجع شرح هذه الآيات للأطفال ضد التفاسير المعتمدة.\n\n{body}\n\n"
+            f"لكل آية أعطِ: passed (bool), confidence (0-1), "
+            f"concerns (قائمة قصيرة بالعربي).\n"
+            f"red flags ممنوعة: تشبيه يوم الدين بالبيولوجيا، "
+            f"العبادة بالمغناطيس، الضلال بالأكل، البسملة بالسحر."
+        )
 
     @staticmethod
     def _build_prompt(
