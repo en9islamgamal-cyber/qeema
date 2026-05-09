@@ -700,6 +700,121 @@ class Orchestrator:
                 "Leonardo will use shallow visual_subject/action from script"
             )
 
+        # v22.6.2 BUG FIX: After writing _deep_visuals to disk, ALSO wire the
+        # prompts into the in-memory script.ayah_scenes[i].visual_prompt so
+        # _generate_ai_images() can find them. Without this, the batch flow
+        # leaves visual_prompt="" and every Leonardo call falls back to CSS.
+        try:
+            self._wire_deep_visuals_into_script(episode_number, script)
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not wire deep visuals into script object: {e}"
+            )
+
+    def _wire_deep_visuals_into_script(
+        self, episode_number: int, script: Any,
+    ) -> None:
+        """Read _deep_visuals from saved JSON and populate script's
+        in-memory ayah_scenes[i].visual_prompt fields.
+
+        v22.6.2: Without this, the batch path leaves visual_prompt empty
+        and AI image generation silently falls back to CSS for every scene.
+        """
+        import json
+        ep_path = (
+            self.paths.temp_episodes / f"episode_{episode_number:03d}.json"
+        )
+        if not ep_path.exists():
+            return
+        try:
+            with open(ep_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+
+        deep_list = data.get("_deep_visuals") or []
+        if not deep_list:
+            return
+
+        # Build prompts via VisualPromptEngineer for proper style locking
+        try:
+            from engines.visual_prompt_engineer import VisualPromptEngineer
+        except ImportError:
+            return
+
+        scenes = list(getattr(script, "ayah_scenes", []) or [])
+        wired = 0
+        for i, scene in enumerate(scenes):
+            if i >= len(deep_list):
+                break
+            deep = deep_list[i] or {}
+            if not deep.get("subject"):
+                continue
+            emotion_str = (
+                getattr(scene.scene_emotion, "value", None)
+                or str(getattr(scene, "scene_emotion", "warm"))
+            )
+            try:
+                # Build a single subject string from the batch fields
+                subject = deep.get("subject", "").strip()
+                env = deep.get("environment", "").strip()
+                mood = deep.get("mood_lighting") or deep.get("mood", "")
+                palette = deep.get("color_palette", "").strip()
+                combined = ", ".join(
+                    p for p in (subject, env, mood, palette) if p
+                )
+                if not combined:
+                    continue
+                # Use build_legacy for safe locked style (always works)
+                positive, _ = VisualPromptEngineer.build_legacy(
+                    combined, emotion=emotion_str,
+                )
+                scene.visual_prompt = positive
+                wired += 1
+            except Exception as e:
+                logger.debug(f"Skipping scene {i} visual wire: {e}")
+
+        # Wire intro and outro too if available
+        intro_scene = getattr(script, "intro_scene", None)
+        outro_scene = getattr(script, "outro_scene", None)
+        if (
+            intro_scene is not None
+            and not getattr(intro_scene, "visual_prompt", "")
+            and deep_list
+        ):
+            try:
+                first = deep_list[0] or {}
+                subject = first.get("subject", "").strip()
+                if subject:
+                    positive, _ = VisualPromptEngineer.build_legacy(
+                        subject, emotion="warm",
+                    )
+                    intro_scene.visual_prompt = positive
+                    wired += 1
+            except Exception:
+                pass
+        if (
+            outro_scene is not None
+            and not getattr(outro_scene, "visual_prompt", "")
+            and deep_list
+        ):
+            try:
+                last = deep_list[-1] or {}
+                subject = last.get("subject", "").strip()
+                if subject:
+                    positive, _ = VisualPromptEngineer.build_legacy(
+                        subject, emotion="peaceful",
+                    )
+                    outro_scene.visual_prompt = positive
+                    wired += 1
+            except Exception:
+                pass
+
+        if wired:
+            logger.info(
+                f"🔗 Wired {wired} deep visual prompts into script.scene.visual_prompt"
+            )
+
     def _run_phase2_tts_director(
         self, episode_number: int, script: Any,
     ) -> None:
