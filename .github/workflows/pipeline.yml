@@ -1,0 +1,662 @@
+name: QEEMA Pipeline v22.5
+
+# ═══════════════════════════════════════════════════════════════
+#  Triggers
+#  v22.5: Daily schedule for 3-day pipeline (10 episodes/month)
+#  Each episode runs Phase 1 on Day N, Phase 2 on N+1, Phase 3 on N+2
+# ═══════════════════════════════════════════════════════════════
+on:
+  schedule:
+    # v22.5: 3 runs per day to distribute load across 3 Gemini keys
+    # 08:00 / 09:00 / 10:00 UTC. Each run takes ~30-45 minutes worst-case.
+    # The phase router auto-detects which phase to run for each episode
+    # based on persistent state. Multi-key rotation in tafsir_validator
+    # ensures daily quota (20/key/day = 60/day total) is used efficiently.
+    - cron: "0 8 * * *"
+    - cron: "0 9 * * *"
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+    inputs:
+      episode:
+        description: "Specific episode number (leave empty for next pending)"
+        required: false
+        type: string
+      phase:
+        description: "v22.5: Which phase to run (1=plan, 2=assets, 3=render). Leave empty for auto-detect."
+        required: false
+        type: choice
+        options: ["", "1", "2", "3"]
+        default: ""
+      dry_run:
+        description: "Skip YouTube upload"
+        required: false
+        type: boolean
+        default: false
+      approve:
+        description: "Bypass review gate (for already-reviewed episodes)"
+        required: false
+        type: boolean
+        default: false
+      review_threshold:
+        description: "Episodes ≤ this number need manual review"
+        required: false
+        type: string
+        default: "10"
+      mode:
+        description: "Quality mode (auto picks based on quota)"
+        required: false
+        type: choice
+        options: ["auto", "high", "balanced", "economy"]
+        default: "auto"
+      skip_supabase:
+        description: "Use local file-backed repo (no Supabase needed)"
+        required: false
+        type: boolean
+        default: false
+      reset_local_state:
+        description: "Wipe local repo state before run (dev only)"
+        required: false
+        type: boolean
+        default: false
+      force_regenerate:
+        description: "Clear script cache (forces fresh script generation)"
+        required: false
+        type: boolean
+        default: false
+      reset_tafsir_cache:
+        description: "v22: clear persistent tafsir cache (forces refetch)"
+        required: false
+        type: boolean
+        default: false
+
+# ═══════════════════════════════════════════════════════════════
+#  Concurrency: never run two pipelines at once (quota safety)
+# ═══════════════════════════════════════════════════════════════
+concurrency:
+  group: qeema-pipeline
+  cancel-in-progress: false
+
+# ═══════════════════════════════════════════════════════════════
+#  Minimum permissions
+# ═══════════════════════════════════════════════════════════════
+permissions:
+  contents: read
+
+jobs:
+  # ───────────────────────────────────────────────────────────
+  #  Phase 1: Pre-check — fast unit tests before reserving runner
+  # ───────────────────────────────────────────────────────────
+  pre_check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install minimal deps for tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install pydantic pytest requests cohere
+
+      - name: Run unit tests
+        run: |
+          echo "═══ Running v22.5 test suite ═══"
+          PYTHONPATH=. python -m pytest tests/ --no-header -q --tb=short
+
+      - name: Log trigger context
+        run: |
+          echo "ℹ️ Triggered by: ${{ github.event_name }}"
+          echo "ℹ️ Actor: ${{ github.actor }}"
+          echo "ℹ️ Mode: ${{ inputs.mode || 'auto (scheduled)' }}"
+          echo "ℹ️ Episode: ${{ inputs.episode || 'next pending' }}"
+
+  # ───────────────────────────────────────────────────────────
+  #  Phase 2: Main pipeline
+  # ───────────────────────────────────────────────────────────
+  pipeline:
+    needs: pre_check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install system packages (FFmpeg + Arabic fonts)
+        run: |
+          sudo apt-get update
+          # Required: ffmpeg + Noto fonts (always available)
+          sudo apt-get install -y \
+            ffmpeg \
+            fonts-noto \
+            fonts-noto-color-emoji \
+            fontconfig
+          # Arabic fonts: best-effort install (package names vary across
+          # Ubuntu releases — fonts-amiri was removed in Ubuntu 24.04 Noble)
+          INSTALLED=""
+          for pkg in fonts-hosny-amiri fonts-amiri fonts-tajawal fonts-cairo fonts-sil-scheherazade-new; do
+            if sudo apt-get install -y "$pkg" 2>/dev/null; then
+              INSTALLED="$INSTALLED $pkg"
+              echo "  ✅ Installed: $pkg"
+            else
+              echo "  ⚠️  Skipped: $pkg (not available in this Ubuntu)"
+            fi
+          done
+          echo "Installed Arabic fonts:$INSTALLED"
+          # Register bundled Amiri font as system-wide fallback for libass.
+          # This guarantees ASS subtitles render Arabic correctly even if
+          # no apt package supplied the font.
+          if [ -f assets/Amiri-Bold.ttf ]; then
+            sudo mkdir -p /usr/local/share/fonts/truetype/amiri
+            sudo cp assets/Amiri-Bold.ttf /usr/local/share/fonts/truetype/amiri/
+            sudo fc-cache -f -v 2>&1 | tail -3
+            echo "  ✅ Registered bundled Amiri-Bold.ttf system-wide"
+          else
+            echo "  ⚠️  No bundled Amiri TTF — relying on apt-installed fonts"
+          fi
+          # Verify Amiri is findable by libass
+          if fc-match Amiri 2>/dev/null | grep -qi amiri; then
+            echo "  ✅ libass can resolve 'Amiri' → $(fc-match Amiri)"
+          else
+            echo "  ⚠️  libass cannot resolve 'Amiri' — subtitles may use fallback"
+          fi
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install 'anthropic>=0.40.0' 'google-genai>=1.17.0'
+
+      # ─── Caches ───────────────────────────────────────────────
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Install Playwright Chromium
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install --with-deps chromium
+
+      - name: Install Playwright system deps (cache hit case)
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: python -m playwright install-deps chromium
+
+      - name: Cache Quran audio
+        uses: actions/cache@v4
+        with:
+          path: assets/quran_audio
+          key: quran-audio-${{ hashFiles('data/curriculum.py') }}
+          restore-keys: |
+            quran-audio-
+
+      - name: Cache TTS audio
+        uses: actions/cache@v4
+        with:
+          path: temp/tts_cache
+          key: tts-cache-${{ github.run_id }}
+          restore-keys: |
+            tts-cache-
+
+      - name: Cache rendered scenes
+        uses: actions/cache@v4
+        with:
+          path: temp/scene_cache
+          key: scene-cache-${{ github.run_id }}
+          restore-keys: |
+            scene-cache-
+
+      - name: Cache Leonardo images
+        uses: actions/cache@v4
+        with:
+          path: temp/image_cache
+          key: image-cache-${{ github.run_id }}
+          restore-keys: |
+            image-cache-
+
+      - name: Cache branding intro/outro
+        uses: actions/cache@v4
+        with:
+          path: assets/branding
+          key: branding-${{ hashFiles('engines/intro_outro_engine.py', 'core/config.py') }}
+          restore-keys: |
+            branding-
+
+      # v22 NEW: persistent tafsir cache — survives across runs
+      - name: Cache tafsir API responses (v22)
+        uses: actions/cache@v4
+        with:
+          path: state/tafsir_cache.json
+          key: tafsir-cache-v22-${{ github.run_id }}
+          restore-keys: |
+            tafsir-cache-v22-
+
+      # v22.2 NEW: HookOptimizer Thompson Sampling stats
+      - name: Cache hook strategy stats (v22.2)
+        uses: actions/cache@v4
+        with:
+          path: state/hook_stats.json
+          key: hook-stats-v22-${{ github.run_id }}
+          restore-keys: |
+            hook-stats-v22-
+
+      # v22.3 FIX: critical state files that need to persist across runs
+      # Without these, quota tracking, idempotency replay, and skip_supabase
+      # state are LOST every run.
+      - name: Cache quota state (v19+ — was missing!)
+        uses: actions/cache@v4
+        with:
+          path: logs/quota_state.json
+          key: quota-state-v22-${{ github.run_id }}
+          restore-keys: |
+            quota-state-v22-
+
+      - name: Cache idempotency checkpoints (v17+ — was missing!)
+        uses: actions/cache@v4
+        with:
+          path: state/checkpoints
+          key: checkpoints-v22-${{ github.run_id }}
+          restore-keys: |
+            checkpoints-v22-
+
+      - name: Cache local episodes repo (skip_supabase mode)
+        if: ${{ inputs.skip_supabase == true || inputs.skip_supabase == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: state/local_episodes.json
+          key: local-repo-v22-${{ github.run_id }}
+          restore-keys: |
+            local-repo-v22-
+
+      # v22.3 NEW: cost tracking cache (so cumulative costs persist)
+      - name: Cache cost tracking
+        uses: actions/cache@v4
+        with:
+          path: logs/costs_*.jsonl
+          key: cost-log-v22-${{ github.run_id }}
+          restore-keys: |
+            cost-log-v22-
+
+      # v22.5 NEW: phase state cache — the 3-day pipeline depends on this
+      # to know what phase to run next for each episode.
+      - name: Cache phase state (v22.5 — REQUIRED for 3-day pipeline)
+        uses: actions/cache@v4
+        with:
+          path: state/phases
+          key: phase-state-v225-${{ github.run_id }}
+          restore-keys: |
+            phase-state-v225-
+
+      # ─── Optional resets ─────────────────────────────────────
+      - name: Force-regenerate scripts (if requested)
+        if: ${{ inputs.force_regenerate == true }}
+        run: |
+          echo "🔄 Clearing script cache (force regenerate)"
+          rm -rf temp/episodes/*.json || true
+
+      - name: Reset tafsir cache (if requested)
+        if: ${{ inputs.reset_tafsir_cache == true }}
+        run: |
+          echo "🔄 Clearing persistent tafsir cache"
+          rm -f state/tafsir_cache.json || true
+
+      # ─── Pre-flight asset check ──────────────────────────────
+      - name: Verify assets
+        run: |
+          echo "═══ Asset Check ═══"
+          mkdir -p assets state logs temp
+          [ -f assets/Amiri-Bold.ttf ] && echo "✅ Amiri font OK" || echo "⚠️  Amiri font MISSING (will use system Amiri)"
+          [ -f assets/logo.png ] && echo "✅ Logo PNG OK" || echo "⚠️  Logo PNG MISSING"
+          [ -f assets/overlays/bgm.mp3 ] && echo "✅ BGM nasheed OK" || echo "⚠️  BGM MISSING — silent skip"
+          [ -d assets/quran_audio ] && echo "✅ Quran audio dir OK" || echo "⚠️  Quran audio dir missing"
+
+      # ─── Main pipeline run ───────────────────────────────────
+      - name: Run QEEMA pipeline v22.5
+        env:
+          # ── LLM providers (Gemini-only since v22.5.6)
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          # Groq removed in v22.5.6 — Llama-3.3 produced doctrinally weak Arabic
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+          # ── TTS
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_VOICE_ID: ${{ vars.ELEVENLABS_VOICE_ID || 'UR972wNGq3zluze0LoIp' }}
+          # CAMB.AI fallback (Arabic via MARS8) — only used if ElevenLabs fails
+          CAMB_AI_KEY: ${{ secrets.CAMB_AI_KEY }}
+          CAMB_AI_VOICE_ID: ${{ vars.CAMB_AI_VOICE_ID || '' }}
+          CAMB_AI_SPEECH_MODEL: ${{ vars.CAMB_AI_SPEECH_MODEL || 'mars-pro' }}
+          # Optional: skip /source-languages auto-discovery by hard-coding the ID
+          CAMB_AI_LANGUAGE_ID: ${{ vars.CAMB_AI_LANGUAGE_ID || '' }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-sa.json
+          # ── DB
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL || '' }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY || '' }}
+          SKIP_SUPABASE: ${{ inputs.skip_supabase && 'true' || 'false' }}
+          # ── YouTube
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          # ── Image generation
+          LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
+          LEONARDO_CHARACTER_REF: ${{ vars.LEONARDO_CHARACTER_REF || '' }}
+          # ── Telegram
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '' }}
+          # ── Pipeline feature flags
+          ENABLE_SUBTITLES: 'true'
+          ENABLE_CROSSFADES: 'true'
+          ENABLE_COLOR_GRADE: 'true'
+          ENABLE_BGM: 'true'
+          # ── Quality gate threshold
+          QUALITY_THRESHOLD: '70'
+          # ── Voice tuning (v22.2 voice mapper overrides per-segment)
+          ELEVENLABS_SPEED: '1.00'
+          ELEVENLABS_STABILITY: '0.50'
+          ELEVENLABS_STYLE: '0.55'
+          # ── v22.5: Enable 3-day phase router for daily cron runs
+          QEEMA_USE_PHASE_ROUTER: 'true'
+          # ── Misc
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          PYTHONUNBUFFERED: '1'
+        run: |
+          # Write GCP service account if provided
+          GCP_KEY='${{ secrets.GCP_SA_KEY }}'
+          if [ -n "$GCP_KEY" ]; then
+            echo "$GCP_KEY" > "$GOOGLE_APPLICATION_CREDENTIALS"
+          fi
+
+          # Build CLI args
+          ARGS=""
+          EPISODE='${{ inputs.episode }}'
+          [ -n "$EPISODE" ] && ARGS="--episode $EPISODE"
+          [ "${{ inputs.dry_run }}" = "true" ] && ARGS="$ARGS --dry-run"
+          [ "${{ inputs.approve }}" = "true" ] && ARGS="$ARGS --approve"
+          [ -n "${{ inputs.review_threshold }}" ] && \
+            ARGS="$ARGS --review-threshold ${{ inputs.review_threshold }}"
+          [ -n "${{ inputs.mode }}" ] && ARGS="$ARGS --mode ${{ inputs.mode }}"
+          [ "${{ inputs.skip_supabase }}" = "true" ] && ARGS="$ARGS --skip-supabase"
+          [ "${{ inputs.reset_local_state }}" = "true" ] && \
+            ARGS="$ARGS --reset-local-state"
+          # v22.5: Pass --phase if explicitly provided (else auto-detect)
+          PHASE='${{ inputs.phase }}'
+          [ -n "$PHASE" ] && ARGS="$ARGS --phase $PHASE"
+
+          echo "═══ QEEMA Pipeline v22.5 (3-day phase router) ═══"
+          echo "Episode:        ${EPISODE:-<auto>}"
+          echo "Phase:          ${PHASE:-<auto-detect>}"
+          echo "Mode:           ${{ inputs.mode || 'auto' }}"
+          echo "Dry run:        ${{ inputs.dry_run || 'false' }}"
+          echo "Approve gate:   ${{ inputs.approve || 'false' }}"
+          echo "Review thresh:  ${{ inputs.review_threshold || '10' }}"
+          echo ""
+          echo "Voice defaults: speed=$ELEVENLABS_SPEED stab=$ELEVENLABS_STABILITY style=$ELEVENLABS_STYLE"
+          echo "(v22.2 voice mapper overrides per-segment)"
+          echo "(v22.5 phase router enabled — see state/phases/ for state)"
+          echo ""
+
+          # v22 internal stage_retry handles transient failures.
+          # External retry kept at 1 to avoid double-retry quota waste.
+          MAX_RETRIES=1
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "═══ Pipeline attempt $i/$MAX_RETRIES ═══"
+            if python main.py $ARGS; then
+              echo "✅ Pipeline succeeded on attempt $i"
+              exit 0
+            fi
+            EXIT_CODE=$?
+            echo "❌ Attempt $i failed with code $EXIT_CODE"
+            if [ $i -lt $MAX_RETRIES ]; then
+              echo "Waiting 30s before retry..."
+              sleep 30
+            fi
+          done
+          echo "❌ Pipeline failed after $MAX_RETRIES attempts"
+          exit 1
+
+      # ─── Reports ──────────────────────────────────────────────
+      - name: Cost summary
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -d logs ]; then
+            TODAY=$(date +%Y-%m-%d)
+            COST_FILE="logs/costs_${TODAY}.jsonl"
+            if [ -f "$COST_FILE" ]; then
+              echo "═══ Cost Summary (today) ═══"
+              python3 - <<'PYEOF'
+          import json, os
+          today = os.popen('date +%Y-%m-%d').read().strip()
+          fname = f'logs/costs_{today}.jsonl'
+          total = 0.0
+          by_provider = {}
+          with open(fname) as f:
+              for line in f:
+                  e = json.loads(line)
+                  total += e.get('cost_usd', 0.0)
+                  p = e.get('provider', 'unknown')
+                  by_provider[p] = by_provider.get(p, 0.0) + e.get('cost_usd', 0.0)
+          print(f'Total: ${total:.4f} USD')
+          for p, c in sorted(by_provider.items(), key=lambda x: -x[1]):
+              print(f'  {p:30s} ${c:.4f}')
+          PYEOF
+            else
+              echo "ℹ️ No cost log for today"
+            fi
+          fi
+
+      - name: Quota report (v20+)
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f logs/quota_state.json ]; then
+            echo "═══ Quota Status ═══"
+            python3 - <<'PYEOF'
+          import json
+          with open('logs/quota_state.json') as f:
+              s = json.load(f)
+          print(f'Month: {s.get("month_key", "?")}')
+          print(f'Episodes done: {s.get("episodes_completed_this_month", 0)}/7')
+          el = s.get('elevenlabs_used_this_month', 0)
+          el_total = 30000
+          pct_el = (el / el_total * 100) if el_total else 0
+          print(f'ElevenLabs: {el:,}/{el_total:,} ({pct_el:.1f}%)')
+          leo = s.get('leonardo_used_total', 0)
+          leo_total = 150
+          pct_leo = (leo / leo_total * 100) if leo_total else 0
+          print(f'Leonardo:   {leo}/{leo_total} ({pct_leo:.1f}%)')
+          PYEOF
+          fi
+
+      - name: Tafsir cache stats (v22)
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f state/tafsir_cache.json ]; then
+            echo "═══ Tafsir Cache Stats ═══"
+            python3 - <<'PYEOF'
+          import json, os
+          with open('state/tafsir_cache.json') as f:
+              data = json.load(f)
+          entries = data.get('entries', {})
+          size_kb = os.path.getsize('state/tafsir_cache.json') // 1024
+          print(f'Cached entries: {len(entries)}')
+          print(f'File size:      {size_kb} KB')
+          print(f'Schema version: {data.get("schema_version", "?")}')
+          PYEOF
+          fi
+
+      # ─── v22.3 NEW: Telegram failure notification ────────────
+      - name: Notify Telegram on failure
+        if: failure()
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "ℹ️ Telegram secrets not set — skipping notification"
+            exit 0
+          fi
+          EP="${{ inputs.episode || 'auto' }}"
+          MODE="${{ inputs.mode || 'auto' }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MSG=$'🚨 *QEEMA Pipeline Failed*\n'"Episode: \`${EP}\`"$'\n'"Mode: \`${MODE}\`"$'\n'"Run: [#${{ github.run_number }}](${RUN_URL})"$'\n'"Triggered by: ${{ github.actor }}"
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" \
+            -d "parse_mode=Markdown" \
+            -d "disable_web_page_preview=true" > /dev/null && \
+            echo "✅ Failure notification sent to Telegram" || \
+            echo "⚠️ Telegram notification failed (non-critical)"
+
+      - name: Notify Telegram on success
+        if: success() && inputs.dry_run != true && inputs.dry_run != 'true'
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            exit 0
+          fi
+          EP="${{ inputs.episode || 'next pending' }}"
+          MODE="${{ inputs.mode || 'auto' }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MSG=$'✅ *QEEMA Episode Published*\n'"Episode: \`${EP}\`"$'\n'"Mode: \`${MODE}\`"$'\n'"Run: [#${{ github.run_number }}](${RUN_URL})"
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" \
+            -d "parse_mode=Markdown" \
+            -d "disable_web_page_preview=true" > /dev/null || true
+
+      # ─── Cleanup ──────────────────────────────────────────────
+      - name: Clean up secrets
+        if: always()
+        run: rm -f "${{ github.workspace }}/gcp-sa.json"
+
+      # ─── Artifacts ────────────────────────────────────────────
+      - name: Upload pipeline logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs-${{ github.run_id }}
+          path: |
+            logs/
+            temp/episodes/*.json
+            review/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload review files
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-files-${{ github.run_id }}
+          path: review/*.md
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload cost log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: cost-log-${{ github.run_id }}
+          path: logs/costs_*.jsonl
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload quota state (persistent)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: quota-state-${{ github.run_id }}
+          path: logs/quota_state.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Upload tafsir cache (v22 persistent)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: tafsir-cache-${{ github.run_id }}
+          path: state/tafsir_cache.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Upload hook stats (v22.2 persistent)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: hook-stats-${{ github.run_id }}
+          path: state/hook_stats.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Upload cost dashboards
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboards-${{ github.run_id }}
+          path: |
+            logs/dashboard_*.md
+            logs/episode_*_breakdown.md
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload quality reports (v22.1+)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-reports-${{ github.run_id }}
+          path: |
+            logs/polish_*.md
+            logs/age_check_*.md
+            logs/typography_*.md
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload local repo state (if --skip-supabase used)
+        if: always() && inputs.skip_supabase == true
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-repo-${{ github.run_id }}
+          path: state/local_episodes.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # v22.5 NEW: phase state artifact — useful for debugging phase progression
+      - name: Upload phase state (v22.5)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase-state-${{ github.run_id }}
+          path: state/phases/
+          retention-days: 90
+          if-no-files-found: ignore
