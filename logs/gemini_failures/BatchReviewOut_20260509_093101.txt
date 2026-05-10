@@ -1,0 +1,8 @@
+=== Schema: BatchReviewOut ===
+=== Error: json.JSONDecodeError at pos 0: Expecting value ===
+=== Prompt length: 260 chars ===
+=== Response length: 7 chars ===
+
+--- RAW RESPONSE ---
+garbage
+--- END RAW RESPONSE ---

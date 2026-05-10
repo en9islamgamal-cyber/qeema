@@ -1,0 +1,8 @@
+=== Schema: _TinySchema ===
+=== Error: json.JSONDecodeError at pos 0: Expecting value ===
+=== Prompt length: 6 chars ===
+=== Response length: 11 chars ===
+
+--- RAW RESPONSE ---
+ايه يا باشا
+--- END RAW RESPONSE ---
