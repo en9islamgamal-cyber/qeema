@@ -23,6 +23,21 @@ Procedural visual rendering using BrowserPool + scene templates + FFmpeg.
 [Failure model]
   Any per-scene failure raises VisualRenderError.
   The orchestrator decides whether to retry the whole episode.
+
+[v22.7.4 — restored missing asset resolvers]
+  _resolve_logo_path() and _resolve_amiri_font_path() existed in earlier
+  versions of this file but were lost during a refactor. They are called
+  unconditionally inside _render_fresh, so without them every scene
+  render dies with AttributeError before any frame is drawn.
+
+  Both methods return Optional[str]: an absolute path string when the
+  asset is found on disk, or None when it isn't. Callers (build_scene_html
+  in scene_templates.py) handle None gracefully — the logo falls back to
+  CSS text and the font falls back to the Google Fonts CDN. So this code
+  works even on a clean checkout that doesn't ship the optional asset PNGs.
+
+  Resolution results are cached on the instance so we don't stat() the
+  same paths once per scene (~30 calls per episode).
 """
 from __future__ import annotations
 
@@ -33,7 +48,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from core.config import (
     BrandingConfig,
@@ -136,10 +151,135 @@ class ProceduralRenderer(VisualRenderer):
             render_size=(video_cfg.width, video_cfg.height),
         )
         self._warmed_up: bool = False
+
+        # v22.7.4: cached asset path lookups. Resolved on first scene render,
+        # reused for the rest of the episode. Each cache slot has a "resolved"
+        # flag so we can store a legitimate None result without re-scanning.
+        self._cached_logo_path: Optional[str] = None
+        self._logo_path_resolved: bool = False
+        self._cached_font_path: Optional[str] = None
+        self._font_path_resolved: bool = False
+
         # Ensure cache + render dirs exist
         paths.scene_cache.mkdir(parents=True, exist_ok=True)
         paths.web_renders.mkdir(parents=True, exist_ok=True)
         paths.html_templates.mkdir(parents=True, exist_ok=True)
+
+    # ───────────────────────────────────────────────────────────
+    # v22.7.4: asset path resolvers (restored from earlier version)
+    # ───────────────────────────────────────────────────────────
+    def _resolve_logo_path(self) -> Optional[str]:
+        """Find the channel logo PNG.
+
+        Checks (in order):
+          1. self._branding.logo_path if explicitly set on BrandingConfig
+          2. assets/branding/logo.png      (canonical location)
+          3. assets/branding/qeema-logo.png
+          4. assets/logo.png
+          5. assets/qeema_logo.png
+
+        Returns absolute path string if found, else None. When None,
+        scene_templates.build_scene_html falls back to a CSS-rendered
+        text logo — the pipeline still produces a valid frame.
+
+        Result is cached so we only stat() the disk once per renderer
+        instance regardless of how many scenes are rendered.
+        """
+        if self._logo_path_resolved:
+            return self._cached_logo_path
+
+        candidates: List[Path] = []
+
+        # 1. Explicit override on BrandingConfig (if the attr exists)
+        branding_logo = getattr(self._branding, "logo_path", None)
+        if branding_logo:
+            candidates.append(Path(branding_logo))
+
+        # 2. Standard locations under the repo root
+        root = self._paths.root
+        candidates.extend([
+            root / "assets" / "branding" / "logo.png",
+            root / "assets" / "branding" / "qeema-logo.png",
+            root / "assets" / "branding" / "qeema_logo.png",
+            root / "assets" / "logo.png",
+            root / "assets" / "qeema_logo.png",
+        ])
+
+        resolved: Optional[str] = None
+        for c in candidates:
+            try:
+                if c.is_file():
+                    resolved = str(c.absolute())
+                    break
+            except OSError:
+                continue
+
+        self._cached_logo_path = resolved
+        self._logo_path_resolved = True
+        if resolved:
+            logger.info(f"🎨 Logo PNG resolved: {resolved}")
+        else:
+            logger.info(
+                "ℹ️ No logo PNG found in assets/ — scenes will use CSS text logo"
+            )
+        return resolved
+
+    def _resolve_amiri_font_path(self) -> Optional[str]:
+        """Find the Amiri Arabic font file.
+
+        Checks (in order):
+          1. self._branding.font_path if explicitly set on BrandingConfig
+          2. assets/fonts/Amiri-Bold.ttf   (preferred — matches scene CSS weight 700)
+          3. assets/fonts/Amiri-Regular.ttf
+          4. assets/fonts/Amiri.ttf
+          5. assets/Amiri-Bold.ttf
+          6. assets/Amiri.ttf
+
+        Returns absolute path string if found, else None. When None,
+        scene_templates.build_scene_html falls back to fetching Amiri
+        from the Google Fonts CDN at render time (slightly slower and
+        adds a network dependency on the runner).
+
+        Result is cached so we only stat() the disk once per renderer
+        instance.
+        """
+        if self._font_path_resolved:
+            return self._cached_font_path
+
+        candidates: List[Path] = []
+
+        branding_font = getattr(self._branding, "font_path", None)
+        if branding_font:
+            candidates.append(Path(branding_font))
+
+        root = self._paths.root
+        candidates.extend([
+            root / "assets" / "fonts" / "Amiri-Bold.ttf",
+            root / "assets" / "fonts" / "Amiri-Regular.ttf",
+            root / "assets" / "fonts" / "Amiri.ttf",
+            root / "assets" / "Amiri-Bold.ttf",
+            root / "assets" / "Amiri.ttf",
+        ])
+
+        resolved: Optional[str] = None
+        for c in candidates:
+            try:
+                if c.is_file():
+                    resolved = str(c.absolute())
+                    break
+            except OSError:
+                continue
+
+        self._cached_font_path = resolved
+        self._font_path_resolved = True
+        if resolved:
+            logger.info(f"🅰️ Amiri font resolved: {resolved}")
+        else:
+            logger.info(
+                "ℹ️ No local Amiri font found in assets/fonts/ — "
+                "scenes will fetch from Google Fonts CDN at render time"
+            )
+        return resolved
 
     def _resolve_color_grade(self, emotion: Optional[str]) -> Optional[str]:
         """v18: pick filter by emotion, fallback to default."""
