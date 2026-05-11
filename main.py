@@ -1,7 +1,12 @@
 """
-main.py — VALUE / QEEMA v22.5 (UNIFIED PRODUCTION)
+main.py — VALUE / QEEMA v22.7 (UNIFIED PRODUCTION)
 ==================================================
 Composition root — wires everything together.
+
+[v22.7 — Persistent asset layer for cross-runner phase pipeline]
+  ✓ AssetStorage wired into PhaseRouter (Supabase Storage bucket)
+  ✓ Phase 2 uploads its output dir; Phase 3 downloads before render
+  ✓ Manifest carried in phase state (already cached by GitHub Actions)
 
 [v22.5 — Gemini-only architecture]
   ✓ Multi-task script generation (single Gemini call)
@@ -35,7 +40,7 @@ import sys
 import traceback
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from core.config import AppConfig
 from core.exceptions import ConfigurationError
@@ -170,7 +175,15 @@ try:
 except ImportError:
     _HAS_MULTI_TASK = False
 
-VERSION: str = "22.6.3"
+# v22.7: Persistent asset storage layer (cross-runner files via Supabase Storage)
+try:
+    from infrastructure.asset_storage import AssetStorage
+    _HAS_ASSET_STORAGE = True
+except ImportError:
+    _HAS_ASSET_STORAGE = False
+    AssetStorage = None  # type: ignore
+
+VERSION: str = "22.7.0"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -323,6 +336,81 @@ def _build_tafsir_validator(
         return v
     except Exception as e:
         log.error(f"❌ TafsirValidator init failed: {e}")
+        return None
+
+
+# ════════════════════════════════════════════════════════════════
+# v22.7: AssetStorage builder (cross-runner persistence)
+# ════════════════════════════════════════════════════════════════
+def _build_asset_storage(
+    config: AppConfig,
+    *,
+    skip_supabase: bool,
+) -> Any:
+    """Build an AssetStorage instance for cross-runner asset persistence.
+
+    Returns:
+        AssetStorage instance, or None if not applicable.
+
+    Returns None in these cases (each logged with a clear reason):
+      - --skip-supabase passed (no Supabase available)
+      - Supabase URL/key not configured
+      - asset_storage module not importable (file missing from repo)
+      - supabase-py client init failed
+      - AssetStorage init failed (bucket access, network, etc.)
+
+    When None, the PhaseRouter will warn and Phase 3 will only work on the
+    same runner as Phase 2.
+    """
+    log = logging.getLogger("main")
+
+    if skip_supabase:
+        log.info(
+            "ℹ️ AssetStorage: skipping (--skip-supabase). "
+            "Phase 3 must run on same runner as Phase 2."
+        )
+        return None
+
+    if not _HAS_ASSET_STORAGE:
+        log.warning(
+            "⚠️ AssetStorage: infrastructure/asset_storage.py not found. "
+            "Add it to enable cross-runner persistence."
+        )
+        return None
+
+    if not config.api_keys.supabase_url or not config.api_keys.supabase_key:
+        log.warning(
+            "⚠️ AssetStorage: SUPABASE_URL/SUPABASE_KEY missing — cannot "
+            "wire cross-runner persistence."
+        )
+        return None
+
+    try:
+        from supabase import create_client  # type: ignore
+    except ImportError:
+        log.warning(
+            "⚠️ AssetStorage: supabase-py not installed — cannot wire."
+        )
+        return None
+
+    try:
+        sb_client = create_client(
+            config.api_keys.supabase_url,
+            config.api_keys.supabase_key,
+        )
+    except Exception as e:
+        log.warning(f"⚠️ AssetStorage: Supabase client init failed: {e}")
+        return None
+
+    try:
+        storage = AssetStorage(sb_client)
+        log.info(
+            "☁️  AssetStorage wired (bucket=episode-artifacts) — "
+            "Phase 2 will persist, Phase 3 will rehydrate."
+        )
+        return storage
+    except Exception as e:
+        log.warning(f"⚠️ AssetStorage init failed: {e}")
         return None
 
 
@@ -784,9 +872,28 @@ def main() -> int:
 
             phase_state_dir = Path(args.phase_state_dir)
             state_manager = PhaseStateManager(phase_state_dir)
+
+            # ────────────────────────────────────────────────────
+            # v22.7: Wire AssetStorage for cross-runner persistence
+            # ────────────────────────────────────────────────────
+            # Phase 2 will upload its temp/episodes output to the
+            # `episode-artifacts` Supabase Storage bucket; Phase 3
+            # (on a different runner, different day) will download
+            # before rendering. Without this, Phase 3 crashes with
+            # "Audio missing for render" because GitHub Actions wipes
+            # temp/ between runs.
+            #
+            # When None (no Supabase, init failed, etc.), the
+            # PhaseRouter logs a clear warning and Phase 3 will only
+            # work on the same runner that ran Phase 2.
+            asset_storage = _build_asset_storage(
+                config, skip_supabase=args.skip_supabase,
+            )
+
             router = PhaseRouter(
                 orchestrator=orchestrator,
                 state_manager=state_manager,
+                asset_storage=asset_storage,
             )
 
             # Determine episode number
