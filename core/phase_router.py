@@ -341,7 +341,12 @@ class PhaseRouter:
         # runner (different day) where ep_dir is empty. We mirror the
         # whole directory to Supabase Storage now so Phase 3 can pull
         # it back down before rendering.
-        if self._asset_storage is not None:
+        #
+        # Defensive getattr: some tests construct PhaseRouter via __new__
+        # without going through __init__, so _asset_storage may not exist
+        # on those instances. Treat missing attribute the same as None.
+        asset_storage = getattr(self, "_asset_storage", None)
+        if asset_storage is not None:
             if not ep_dir.is_dir():
                 # Should never happen — the orchestrator just wrote to this
                 # dir — but guard anyway so we get a clean error message.
@@ -350,7 +355,7 @@ class PhaseRouter:
                     f"reported success: {ep_dir}. Cannot persist to Storage."
                 )
             try:
-                manifest = self._asset_storage.upload_episode_dir(
+                manifest = asset_storage.upload_episode_dir(
                     episode_number=episode_number,
                     local_dir=str(ep_dir),
                 )
@@ -411,9 +416,12 @@ class PhaseRouter:
         # is empty. Pull every file from Phase 2's manifest before letting
         # the orchestrator's render stage start, so paths in mastered_map
         # actually resolve to files on disk.
+        #
+        # Defensive getattr: see _run_phase_2 for why.
+        asset_storage = getattr(self, "_asset_storage", None)
         manifest = state.asset_paths.get("_storage_manifest")
         if manifest:
-            if self._asset_storage is None:
+            if asset_storage is None:
                 raise RuntimeError(
                     "Phase 3: state contains a _storage_manifest from Phase 2, "
                     "but AssetStorage is not wired in this run. Cannot fetch "
@@ -426,7 +434,7 @@ class PhaseRouter:
             )
             ep_dir.mkdir(parents=True, exist_ok=True)
             try:
-                downloaded = self._asset_storage.download_from_manifest(
+                downloaded = asset_storage.download_from_manifest(
                     episode_number=episode_number,
                     manifest=manifest,
                     local_dir=str(ep_dir),
