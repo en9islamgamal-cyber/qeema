@@ -449,16 +449,46 @@ class PhaseRouter:
                     f"Storage: {type(e).__name__}: {e}. Cannot render."
                 ) from e
         else:
-            # No manifest = Phase 2 ran on an older orchestrator version that
-            # didn't persist, OR Phase 2 ran with AssetStorage disabled.
-            # If we're on the same runner as Phase 2, files are still in temp/.
-            # If not, the orchestrator's render stage will fail with a clear
-            # "Audio missing" error.
-            logger.warning(
-                "⚠️ v22.7: Phase 3 has no _storage_manifest in state. "
-                "Assuming same-runner execution. If this is a fresh runner, "
-                "the renderer will fail on the first missing audio file."
-            )
+            # No manifest in state. Two legitimate reasons + one bug case:
+            #   (a) Phase 2 ran with AssetStorage disabled (--skip-supabase).
+            #       Files might still exist locally if same-runner execution.
+            #   (b) State was created by pre-v22.7 Phase 2 on a previous
+            #       runner. Files DON'T exist locally — render will fail.
+            # We tell (a) and (b) apart by checking if the mastered audio
+            # files actually exist on disk. If not, fail fast with a clear
+            # recovery message instead of letting the renderer die with a
+            # confusing "Audio missing" error 5 seconds later.
+            mastered_map = state.asset_paths.get("mastered_map", {}) or {}
+            if mastered_map:
+                existing = [
+                    p for p in mastered_map.values()
+                    if p and Path(p).is_file()
+                ]
+                if not existing:
+                    raise RuntimeError(
+                        "Phase 3 cannot start: state.asset_paths has no "
+                        "_storage_manifest AND none of the mastered audio "
+                        "files exist on this runner's filesystem.\n\n"
+                        "Likely cause: state was created by Phase 2 in a "
+                        "previous run (pre-v22.7 code, or with AssetStorage "
+                        "disabled) on a different GitHub Actions runner whose "
+                        "filesystem is now gone.\n\n"
+                        "Recovery: trigger the workflow manually with "
+                        "PHASE=2 to re-run Phase 2 on the current codebase. "
+                        "This will regenerate the assets AND upload them to "
+                        "Supabase Storage. Phase 3 (auto-detected next day) "
+                        "will then download them and render successfully."
+                    )
+                logger.info(
+                    f"ℹ️ v22.7: Phase 3 has no manifest, but "
+                    f"{len(existing)}/{len(mastered_map)} mastered audio "
+                    f"files exist locally — assuming same-runner execution."
+                )
+            else:
+                logger.warning(
+                    "⚠️ v22.7: Phase 3 has no _storage_manifest AND no "
+                    "mastered_map in state. The renderer will likely fail."
+                )
 
         report = self._orchestrator.run(
             episode_number, phase=EpisodePhase.PHASE_3,
