@@ -804,6 +804,18 @@ def main() -> int:
     if args.skip_supabase:
         os.environ["SKIP_SUPABASE"] = "true"
 
+    # v22.7.5: Auto-approve via env var — set QEEMA_AUTO_APPROVE=true in the
+    # workflow YAML to bypass the Review Gate. With this enabled, every
+    # episode is uploaded to YouTube as soon as Phase 3 finishes rendering.
+    # The user reviews on YouTube and deletes any episode that's not OK.
+    # To restore manual review, remove the env var (or set it to "false").
+    if os.environ.get("QEEMA_AUTO_APPROVE", "").lower() in ("true", "1", "yes"):
+        args.approve = True
+        print(
+            "✅ QEEMA_AUTO_APPROVE=true — Review Gate bypassed "
+            "(episodes auto-upload to YouTube)"
+        )
+
     # ─── 1. Load + validate config ──────────────────────────────
     project_root = Path(__file__).parent.resolve()
     config = AppConfig.load(project_root)
