@@ -1,17 +1,13 @@
-name: QEEMA Pipeline v22.6.3
+name: QEEMA Pipeline v22.7
 
 # ═══════════════════════════════════════════════════════════════
 #  Triggers
 #  v22.5: Daily schedule for 3-day pipeline (10 episodes/month)
 #  Each episode runs Phase 1 on Day N, Phase 2 on N+1, Phase 3 on N+2
+#  v22.7: QEEMA_AUTO_APPROVE bypasses Review Gate → episodes auto-upload
 # ═══════════════════════════════════════════════════════════════
 on:
   schedule:
-    # v22.5: 3 runs per day to distribute load across 3 Gemini keys
-    # 08:00 / 09:00 / 10:00 UTC. Each run takes ~30-45 minutes worst-case.
-    # The phase router auto-detects which phase to run for each episode
-    # based on persistent state. Multi-key rotation in tafsir_validator
-    # ensures daily quota (20/key/day = 60/day total) is used efficiently.
     - cron: "0 8 * * *"
     - cron: "0 9 * * *"
     - cron: "0 10 * * *"
@@ -33,12 +29,12 @@ on:
         type: boolean
         default: false
       approve:
-        description: "Bypass review gate (for already-reviewed episodes)"
+        description: "Bypass review gate (now redundant — QEEMA_AUTO_APPROVE env var forces approve always)"
         required: false
         type: boolean
         default: false
       review_threshold:
-        description: "Episodes ≤ this number need manual review"
+        description: "Episodes ≤ this number need manual review (ignored when QEEMA_AUTO_APPROVE=true)"
         required: false
         type: string
         default: "10"
@@ -69,23 +65,18 @@ on:
         type: boolean
         default: false
 
-# ═══════════════════════════════════════════════════════════════
-#  Concurrency: never run two pipelines at once (quota safety)
-# ═══════════════════════════════════════════════════════════════
 concurrency:
   group: qeema-pipeline
   cancel-in-progress: false
 
-# ═══════════════════════════════════════════════════════════════
-#  Minimum permissions
-# ═══════════════════════════════════════════════════════════════
 permissions:
   contents: read
 
+# v22.7: silence Node.js 20 deprecation warnings
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
-  # ───────────────────────────────────────────────────────────
-  #  Phase 1: Pre-check — fast unit tests before reserving runner
-  # ───────────────────────────────────────────────────────────
   pre_check:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -105,7 +96,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          echo "═══ Running v22.6 test suite ═══"
+          echo "═══ Running v22.7 test suite ═══"
           PYTHONPATH=. python -m pytest tests/ --no-header -q --tb=short
 
       - name: Log trigger context
@@ -115,9 +106,6 @@ jobs:
           echo "ℹ️ Mode: ${{ inputs.mode || 'auto (scheduled)' }}"
           echo "ℹ️ Episode: ${{ inputs.episode || 'next pending' }}"
 
-  # ───────────────────────────────────────────────────────────
-  #  Phase 2: Main pipeline
-  # ───────────────────────────────────────────────────────────
   pipeline:
     needs: pre_check
     runs-on: ubuntu-24.04
@@ -137,14 +125,11 @@ jobs:
       - name: Install system packages (FFmpeg + Arabic fonts)
         run: |
           sudo apt-get update
-          # Required: ffmpeg + Noto fonts (always available)
           sudo apt-get install -y \
             ffmpeg \
             fonts-noto \
             fonts-noto-color-emoji \
             fontconfig
-          # Arabic fonts: best-effort install (package names vary across
-          # Ubuntu releases — fonts-amiri was removed in Ubuntu 24.04 Noble)
           INSTALLED=""
           for pkg in fonts-hosny-amiri fonts-amiri fonts-tajawal fonts-cairo fonts-sil-scheherazade-new; do
             if sudo apt-get install -y "$pkg" 2>/dev/null; then
@@ -155,9 +140,6 @@ jobs:
             fi
           done
           echo "Installed Arabic fonts:$INSTALLED"
-          # Register bundled Amiri font as system-wide fallback for libass.
-          # This guarantees ASS subtitles render Arabic correctly even if
-          # no apt package supplied the font.
           if [ -f assets/Amiri-Bold.ttf ]; then
             sudo mkdir -p /usr/local/share/fonts/truetype/amiri
             sudo cp assets/Amiri-Bold.ttf /usr/local/share/fonts/truetype/amiri/
@@ -166,7 +148,6 @@ jobs:
           else
             echo "  ⚠️  No bundled Amiri TTF — relying on apt-installed fonts"
           fi
-          # Verify Amiri is findable by libass
           if fc-match Amiri 2>/dev/null | grep -qi amiri; then
             echo "  ✅ libass can resolve 'Amiri' → $(fc-match Amiri)"
           else
@@ -179,7 +160,6 @@ jobs:
           pip install -r requirements.txt
           pip install 'anthropic>=0.40.0' 'google-genai>=1.17.0'
 
-      # ─── Caches ───────────────────────────────────────────────
       - name: Cache Playwright browsers
         id: pw-cache
         uses: actions/cache@v4
@@ -237,7 +217,6 @@ jobs:
           restore-keys: |
             branding-
 
-      # v22 NEW: persistent tafsir cache — survives across runs
       - name: Cache tafsir API responses (v22)
         uses: actions/cache@v4
         with:
@@ -246,7 +225,6 @@ jobs:
           restore-keys: |
             tafsir-cache-v22-
 
-      # v22.2 NEW: HookOptimizer Thompson Sampling stats
       - name: Cache hook strategy stats (v22.2)
         uses: actions/cache@v4
         with:
@@ -255,10 +233,7 @@ jobs:
           restore-keys: |
             hook-stats-v22-
 
-      # v22.3 FIX: critical state files that need to persist across runs
-      # Without these, quota tracking, idempotency replay, and skip_supabase
-      # state are LOST every run.
-      - name: Cache quota state (v19+ — was missing!)
+      - name: Cache quota state
         uses: actions/cache@v4
         with:
           path: logs/quota_state.json
@@ -266,7 +241,7 @@ jobs:
           restore-keys: |
             quota-state-v22-
 
-      - name: Cache idempotency checkpoints (v17+ — was missing!)
+      - name: Cache idempotency checkpoints
         uses: actions/cache@v4
         with:
           path: state/checkpoints
@@ -283,7 +258,6 @@ jobs:
           restore-keys: |
             local-repo-v22-
 
-      # v22.3 NEW: cost tracking cache (so cumulative costs persist)
       - name: Cache cost tracking
         uses: actions/cache@v4
         with:
@@ -292,9 +266,7 @@ jobs:
           restore-keys: |
             cost-log-v22-
 
-      # v22.5 NEW: phase state cache — the 3-day pipeline depends on this
-      # to know what phase to run next for each episode.
-      - name: Cache phase state (v22.5 — REQUIRED for 3-day pipeline)
+      - name: Cache phase state (v22.5)
         uses: actions/cache@v4
         with:
           path: state/phases
@@ -302,7 +274,6 @@ jobs:
           restore-keys: |
             phase-state-v225-
 
-      # ─── Optional resets ─────────────────────────────────────
       - name: Force-regenerate scripts (if requested)
         if: ${{ inputs.force_regenerate == true }}
         run: |
@@ -315,73 +286,59 @@ jobs:
           echo "🔄 Clearing persistent tafsir cache"
           rm -f state/tafsir_cache.json || true
 
-      # ─── Pre-flight asset check ──────────────────────────────
       - name: Verify assets
         run: |
           echo "═══ Asset Check ═══"
           mkdir -p assets state logs temp
-          [ -f assets/Amiri-Bold.ttf ] && echo "✅ Amiri font OK" || echo "⚠️  Amiri font MISSING (will use system Amiri)"
+          [ -f assets/Amiri-Bold.ttf ] && echo "✅ Amiri font OK" || echo "⚠️  Amiri font MISSING"
           [ -f assets/logo.png ] && echo "✅ Logo PNG OK" || echo "⚠️  Logo PNG MISSING"
           [ -f assets/overlays/bgm.mp3 ] && echo "✅ BGM nasheed OK" || echo "⚠️  BGM MISSING — silent skip"
           [ -d assets/quran_audio ] && echo "✅ Quran audio dir OK" || echo "⚠️  Quran audio dir missing"
 
-      # ─── Main pipeline run ───────────────────────────────────
-      - name: Run QEEMA pipeline v22.6
+      - name: Run QEEMA pipeline v22.7
         env:
-          # ── LLM providers (Gemini-only since v22.5.6)
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
-          # Groq removed in v22.5.6 — Llama-3.3 produced doctrinally weak Arabic
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
-          # ── TTS
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           ELEVENLABS_VOICE_ID: ${{ vars.ELEVENLABS_VOICE_ID || 'UR972wNGq3zluze0LoIp' }}
-          # CAMB.AI fallback (Arabic via MARS8) — only used if ElevenLabs fails
           CAMB_AI_KEY: ${{ secrets.CAMB_AI_KEY }}
           CAMB_AI_VOICE_ID: ${{ vars.CAMB_AI_VOICE_ID || '' }}
           CAMB_AI_SPEECH_MODEL: ${{ vars.CAMB_AI_SPEECH_MODEL || 'mars-pro' }}
-          # Optional: skip /source-languages auto-discovery by hard-coding the ID
           CAMB_AI_LANGUAGE_ID: ${{ vars.CAMB_AI_LANGUAGE_ID || '' }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-sa.json
-          # ── DB
           SUPABASE_URL: ${{ secrets.SUPABASE_URL || '' }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY || '' }}
           SKIP_SUPABASE: ${{ inputs.skip_supabase && 'true' || 'false' }}
-          # ── YouTube
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-          # ── Image generation
           LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
           LEONARDO_CHARACTER_REF: ${{ vars.LEONARDO_CHARACTER_REF || '' }}
-          # ── Telegram
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '' }}
-          # ── Pipeline feature flags
           ENABLE_SUBTITLES: 'true'
           ENABLE_CROSSFADES: 'true'
           ENABLE_COLOR_GRADE: 'true'
           ENABLE_BGM: 'true'
-          # ── Quality gate threshold
           QUALITY_THRESHOLD: '70'
-          # ── Voice tuning (v22.2 voice mapper overrides per-segment)
           ELEVENLABS_SPEED: '1.00'
           ELEVENLABS_STABILITY: '0.50'
           ELEVENLABS_STYLE: '0.55'
-          # ── v22.5: Enable 3-day phase router for daily cron runs
           QEEMA_USE_PHASE_ROUTER: 'true'
-          # ── Misc
+          # v22.7: Auto-approve — bypass Review Gate so every episode
+          # uploads to YouTube directly. User reviews on YouTube.
+          # To restore manual review, set this to 'false'.
+          QEEMA_AUTO_APPROVE: 'true'
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
           PYTHONUNBUFFERED: '1'
         run: |
-          # Write GCP service account if provided
           GCP_KEY='${{ secrets.GCP_SA_KEY }}'
           if [ -n "$GCP_KEY" ]; then
             echo "$GCP_KEY" > "$GOOGLE_APPLICATION_CREDENTIALS"
           fi
 
-          # Build CLI args
           ARGS=""
           EPISODE='${{ inputs.episode }}'
           [ -n "$EPISODE" ] && ARGS="--episode $EPISODE"
@@ -393,25 +350,21 @@ jobs:
           [ "${{ inputs.skip_supabase }}" = "true" ] && ARGS="$ARGS --skip-supabase"
           [ "${{ inputs.reset_local_state }}" = "true" ] && \
             ARGS="$ARGS --reset-local-state"
-          # v22.5: Pass --phase if explicitly provided (else auto-detect)
           PHASE='${{ inputs.phase }}'
           [ -n "$PHASE" ] && ARGS="$ARGS --phase $PHASE"
 
-          echo "═══ QEEMA Pipeline v22.6 (3-day phase router) ═══"
+          echo "═══ QEEMA Pipeline v22.7 (3-day phase router + auto-upload) ═══"
           echo "Episode:        ${EPISODE:-<auto>}"
           echo "Phase:          ${PHASE:-<auto-detect>}"
           echo "Mode:           ${{ inputs.mode || 'auto' }}"
           echo "Dry run:        ${{ inputs.dry_run || 'false' }}"
-          echo "Approve gate:   ${{ inputs.approve || 'false' }}"
-          echo "Review thresh:  ${{ inputs.review_threshold || '10' }}"
+          echo "Approve gate:   QEEMA_AUTO_APPROVE=true (forced)"
+          echo "Review thresh:  ${{ inputs.review_threshold || '10' }} (ignored — auto-approve on)"
           echo ""
           echo "Voice defaults: speed=$ELEVENLABS_SPEED stab=$ELEVENLABS_STABILITY style=$ELEVENLABS_STYLE"
-          echo "(v22.2 voice mapper overrides per-segment)"
-          echo "(v22.5 phase router enabled — see state/phases/ for state)"
+          echo "(v22.7 AssetStorage enabled — Phase 2 → Supabase Storage → Phase 3)"
           echo ""
 
-          # v22 internal stage_retry handles transient failures.
-          # External retry kept at 1 to avoid double-retry quota waste.
           MAX_RETRIES=1
           for i in $(seq 1 $MAX_RETRIES); do
             echo "═══ Pipeline attempt $i/$MAX_RETRIES ═══"
@@ -429,7 +382,6 @@ jobs:
           echo "❌ Pipeline failed after $MAX_RETRIES attempts"
           exit 1
 
-      # ─── Reports ──────────────────────────────────────────────
       - name: Cost summary
         if: always()
         continue-on-error: true
@@ -460,7 +412,7 @@ jobs:
             fi
           fi
 
-      - name: Quota report (v20+)
+      - name: Quota report
         if: always()
         continue-on-error: true
         run: |
@@ -483,7 +435,7 @@ jobs:
           PYEOF
           fi
 
-      - name: Tafsir cache stats (v22)
+      - name: Tafsir cache stats
         if: always()
         continue-on-error: true
         run: |
@@ -497,11 +449,9 @@ jobs:
           size_kb = os.path.getsize('state/tafsir_cache.json') // 1024
           print(f'Cached entries: {len(entries)}')
           print(f'File size:      {size_kb} KB')
-          print(f'Schema version: {data.get("schema_version", "?")}')
           PYEOF
           fi
 
-      # ─── v22.3 NEW: Telegram failure notification ────────────
       - name: Notify Telegram on failure
         if: failure()
         continue-on-error: true
@@ -523,7 +473,7 @@ jobs:
             --data-urlencode "text=${MSG}" \
             -d "parse_mode=Markdown" \
             -d "disable_web_page_preview=true" > /dev/null && \
-            echo "✅ Failure notification sent to Telegram" || \
+            echo "✅ Failure notification sent" || \
             echo "⚠️ Telegram notification failed (non-critical)"
 
       - name: Notify Telegram on success
@@ -547,12 +497,24 @@ jobs:
             -d "parse_mode=Markdown" \
             -d "disable_web_page_preview=true" > /dev/null || true
 
-      # ─── Cleanup ──────────────────────────────────────────────
       - name: Clean up secrets
         if: always()
         run: rm -f "${{ github.workspace }}/gcp-sa.json"
 
-      # ─── Artifacts ────────────────────────────────────────────
+      # v22.7 NEW: Upload the FINAL VIDEO + thumbnails
+      - name: Upload final episode video + thumbnails
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: episode-video-${{ github.run_id }}
+          path: |
+            temp/episodes/*/branded_episode.mp4
+            temp/episodes/*/subs_episode.mp4
+            temp/episodes/*/ep_*.jpg
+          retention-days: 14
+          if-no-files-found: ignore
+
       - name: Upload pipeline logs (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
@@ -585,7 +547,7 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
 
-      - name: Upload quota state (persistent)
+      - name: Upload quota state
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -595,7 +557,7 @@ jobs:
           retention-days: 90
           if-no-files-found: ignore
 
-      - name: Upload tafsir cache (v22 persistent)
+      - name: Upload tafsir cache
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -605,7 +567,7 @@ jobs:
           retention-days: 90
           if-no-files-found: ignore
 
-      - name: Upload hook stats (v22.2 persistent)
+      - name: Upload hook stats
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -627,7 +589,7 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
 
-      - name: Upload quality reports (v22.1+)
+      - name: Upload quality reports
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -650,8 +612,7 @@ jobs:
           retention-days: 90
           if-no-files-found: ignore
 
-      # v22.5 NEW: phase state artifact — useful for debugging phase progression
-      - name: Upload phase state (v22.5)
+      - name: Upload phase state
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
