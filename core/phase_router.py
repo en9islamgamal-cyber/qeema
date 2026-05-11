@@ -1,5 +1,5 @@
 """
-core/phase_router.py — VALUE / QEEMA v22.5 (NEW)
+core/phase_router.py — VALUE / QEEMA v22.7 (Persistence layer added)
 =========================================================================
 Multi-day phase-based orchestration.
 
@@ -26,11 +26,28 @@ the work done in Phases 1 & 2.
 [Failure handling]
 If any phase fails, the next-day workflow can retry that same phase.
 After max_retries (default 2), the episode is marked FAILED_PERMANENT.
+
+[v22.7 — Persistence layer]
+Phase 2 generates audio/image files into the runner's `temp/episodes/`
+directory. GitHub Actions wipes this between runs, so Phase 3 on a fresh
+runner used to crash with "Audio missing for render".
+
+v22.7 introduces AssetStorage (Supabase Storage): Phase 2 uploads its
+output directory after the orchestrator succeeds; Phase 3 downloads
+everything back into the same local path before the orchestrator runs.
+The upload manifest is stored inside `asset_paths["_storage_manifest"]`
+and survives via the existing `state/phases/` GitHub Actions cache.
+
+If `asset_storage` is None (e.g. --skip-supabase, or Supabase init
+failed), Phase 2 logs a warning but still completes. Phase 3 will only
+work on the same runner that ran Phase 2 in that case.
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -60,6 +77,15 @@ class PhaseRouter:
         state_manager: PhaseStateManager for persistence.
         max_retries_per_phase: After this many failed attempts on a phase,
                               the episode is marked permanently failed.
+        asset_storage: v22.7 — Optional AssetStorage for cross-runner asset
+                       persistence. When wired:
+                         • Phase 2 uploads its output dir to Supabase Storage
+                           after orchestrator success, and embeds the manifest
+                           in the returned asset_paths.
+                         • Phase 3 downloads the manifest's files into the
+                           local temp dir before the orchestrator runs.
+                       When None (e.g. --skip-supabase), Phase 2 logs a
+                       warning and Phase 3 assumes same-runner execution.
     """
 
     def __init__(
@@ -68,10 +94,23 @@ class PhaseRouter:
         state_manager: PhaseStateManager,
         *,
         max_retries_per_phase: int = 2,
+        asset_storage: Any = None,  # v22.7: infrastructure.asset_storage.AssetStorage
     ) -> None:
         self._orchestrator = orchestrator
         self._state_manager = state_manager
         self._max_retries = max_retries_per_phase
+        self._asset_storage = asset_storage
+        if asset_storage is None:
+            logger.warning(
+                "⚠️ PhaseRouter: AssetStorage not wired — Phase 2 outputs will "
+                "NOT be persisted to Supabase Storage. Phase 3 will fail if it "
+                "runs on a different GitHub Actions runner than Phase 2."
+            )
+        else:
+            logger.info(
+                "☁️  PhaseRouter: AssetStorage wired — Phase 2 will persist "
+                "outputs and Phase 3 will rehydrate them automatically."
+            )
 
     # ─── Public API ──────────────────────────────────────────
     def run_phase(
@@ -219,14 +258,20 @@ class PhaseRouter:
     ) -> Dict[str, Any]:
         """Phase 2: Asset generation (Leonardo + ElevenLabs).
 
-        v22.5 FIX: Delegates to orchestrator.run(phase=PHASE_2). The
+        v22.5: Delegates to orchestrator.run(phase=PHASE_2). The
         orchestrator reads Phase 1's outputs from disk and generates assets.
 
-        v22.6.3: also extracts the orchestrator's _deep_visuals and
+        v22.6.3: Extracts the orchestrator's _deep_visuals and
         _tts_directions (written into temp/episodes/episode_NNN.json
         during Phase 2) into asset_paths so they propagate to the
-        persistent phase state. Without this, Phase 3 running on a
-        different runner has no way to access them.
+        persistent phase state.
+
+        v22.7: After the orchestrator succeeds, uploads the entire episode
+        temp directory to Supabase Storage and embeds the manifest into
+        asset_paths. This is the bridge that lets Phase 3 run on a fresh
+        runner — without it, Phase 3 crashes with "Audio missing".
+        Hard-fails if upload fails: better to retry Phase 2 today than
+        let Phase 3 silently break on day three.
         """
         from core.models import EpisodePhase
 
@@ -264,9 +309,8 @@ class PhaseRouter:
         )
         if ep_json_path.exists():
             try:
-                import json as _json
                 with open(ep_json_path, encoding="utf-8") as f:
-                    ep_data = _json.load(f)
+                    ep_data = json.load(f)
                 deep_visuals = ep_data.get("_deep_visuals") or []
                 tts_directions = ep_data.get("_tts_directions") or {}
             except Exception as e:
@@ -275,36 +319,137 @@ class PhaseRouter:
                     f"from episode JSON: {e}"
                 )
 
-        return {
-            "asset_paths": {
-                "ep_dir": str(ep_dir),
-                "audio_map": orch_phase_state.get("audio_map", {}),
-                "mastered_map": orch_phase_state.get("mastered_map", {}),
-                # Image paths can be derived from ep_dir/ai_images/
-                "ai_images_dir": str(ep_dir / "ai_images"),
-                # v22.6.3: ensure these survive cross-run restarts.
-                # Phase 3 may run on a fresh runner; without these in
-                # persistent state, the rendered video would have no
-                # cinematic visual prompts and no SSML pacing.
-                "_deep_visuals": deep_visuals,
-                "_tts_directions": tts_directions,
-            }
+        asset_paths: Dict[str, Any] = {
+            "ep_dir": str(ep_dir),
+            "audio_map": orch_phase_state.get("audio_map", {}),
+            "mastered_map": orch_phase_state.get("mastered_map", {}),
+            # Image paths can be derived from ep_dir/ai_images/
+            "ai_images_dir": str(ep_dir / "ai_images"),
+            # v22.6.3: ensure these survive cross-run restarts.
+            # Phase 3 may run on a fresh runner; without these in
+            # persistent state, the rendered video would have no
+            # cinematic visual prompts and no SSML pacing.
+            "_deep_visuals": deep_visuals,
+            "_tts_directions": tts_directions,
         }
+
+        # ════════════════════════════════════════════════════════════════
+        # v22.7: persist physical assets to Supabase Storage
+        # ════════════════════════════════════════════════════════════════
+        # The orchestrator's Phase 2 wrote audio/image files into ep_dir
+        # on THIS runner's filesystem. Phase 3 will run on a DIFFERENT
+        # runner (different day) where ep_dir is empty. We mirror the
+        # whole directory to Supabase Storage now so Phase 3 can pull
+        # it back down before rendering.
+        if self._asset_storage is not None:
+            if not ep_dir.is_dir():
+                # Should never happen — the orchestrator just wrote to this
+                # dir — but guard anyway so we get a clean error message.
+                raise RuntimeError(
+                    f"Phase 2: episode directory missing after orchestrator "
+                    f"reported success: {ep_dir}. Cannot persist to Storage."
+                )
+            try:
+                manifest = self._asset_storage.upload_episode_dir(
+                    episode_number=episode_number,
+                    local_dir=str(ep_dir),
+                )
+            except Exception as e:
+                # Re-raise so the phase is marked failed and tomorrow's
+                # workflow retries it. Silent success here would mean
+                # Phase 3 crashes on day three with "Audio missing".
+                raise RuntimeError(
+                    f"Phase 2: AssetStorage upload failed — Phase 3 cannot "
+                    f"run on a fresh runner without these files. "
+                    f"Underlying error: {type(e).__name__}: {e}"
+                ) from e
+
+            asset_paths["_storage_manifest"] = manifest
+            asset_paths["_storage_uploaded_at"] = (
+                datetime.now(timezone.utc).isoformat()
+            )
+            logger.info(
+                f"☁️ v22.7: Phase 2 assets persisted to Supabase Storage "
+                f"({len(manifest)} files, prefix=episode_{episode_number:03d})"
+            )
+        else:
+            # No storage wired — Phase 3 will only work if it runs on the
+            # same runner as Phase 2 (e.g. local dev with --skip-supabase,
+            # or both phases in one workflow job).
+            logger.warning(
+                "⚠️ v22.7: AssetStorage not wired — Phase 2 outputs NOT "
+                "persisted. Phase 3 will fail if it runs on a different runner."
+            )
+
+        return {"asset_paths": asset_paths}
 
     def _run_phase_3(
         self, episode_number: int, state: PhaseState,
     ) -> Dict[str, Any]:
         """Phase 3: Render + upload.
 
-        v22.5 FIX: Delegates to orchestrator.run(phase=PHASE_3) which
-        reuses the Phase 1+2 outputs from disk and runs only the render
-        and upload stages.
+        v22.5: Delegates to orchestrator.run(phase=PHASE_3) which
+        reuses the Phase 1+2 outputs from disk.
+
+        v22.7: BEFORE delegating to the orchestrator, downloads Phase 2's
+        assets from Supabase Storage into the local temp directory. The
+        manifest lives in state.asset_paths["_storage_manifest"]. After
+        download, the orchestrator's existing logic (which reads paths from
+        persistent state and finds the files in temp/) just works.
         """
         from core.models import EpisodePhase
 
         if not state.asset_paths:
             raise RuntimeError(
                 "Phase 3 requires Phase 2's asset_paths — none found in state"
+            )
+
+        # ════════════════════════════════════════════════════════════════
+        # v22.7: rehydrate physical assets from Supabase Storage
+        # ════════════════════════════════════════════════════════════════
+        # GitHub Actions gave us a fresh runner. temp/episodes/episode_NNN/
+        # is empty. Pull every file from Phase 2's manifest before letting
+        # the orchestrator's render stage start, so paths in mastered_map
+        # actually resolve to files on disk.
+        manifest = state.asset_paths.get("_storage_manifest")
+        if manifest:
+            if self._asset_storage is None:
+                raise RuntimeError(
+                    "Phase 3: state contains a _storage_manifest from Phase 2, "
+                    "but AssetStorage is not wired in this run. Cannot fetch "
+                    "Phase 2 assets. Re-enable Supabase (remove --skip-supabase) "
+                    "and re-run Phase 3."
+                )
+            ep_dir = (
+                self._orchestrator.paths.temp_episodes
+                / f"episode_{episode_number:03d}"
+            )
+            ep_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                downloaded = self._asset_storage.download_from_manifest(
+                    episode_number=episode_number,
+                    manifest=manifest,
+                    local_dir=str(ep_dir),
+                )
+                logger.info(
+                    f"☁️ v22.7: Phase 3 rehydrated {downloaded} assets into "
+                    f"{ep_dir}"
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Phase 3: failed to download Phase 2 assets from Supabase "
+                    f"Storage: {type(e).__name__}: {e}. Cannot render."
+                ) from e
+        else:
+            # No manifest = Phase 2 ran on an older orchestrator version that
+            # didn't persist, OR Phase 2 ran with AssetStorage disabled.
+            # If we're on the same runner as Phase 2, files are still in temp/.
+            # If not, the orchestrator's render stage will fail with a clear
+            # "Audio missing" error.
+            logger.warning(
+                "⚠️ v22.7: Phase 3 has no _storage_manifest in state. "
+                "Assuming same-runner execution. If this is a fresh runner, "
+                "the renderer will fail on the first missing audio file."
             )
 
         report = self._orchestrator.run(
@@ -325,14 +470,14 @@ class PhaseRouter:
 
     def _load_script_json(self, episode_number: int) -> Dict[str, Any]:
         """Load the saved episode JSON (written by Phase 1) for state storage."""
-        import json
         ep_path = (
             self._orchestrator.paths.temp_episodes
             / f"episode_{episode_number:03d}.json"
         )
         if not ep_path.exists():
             logger.warning(
-                f"⚠️ Episode JSON not found at {ep_path} — Phase 1 may not have saved properly"
+                f"⚠️ Episode JSON not found at {ep_path} — "
+                f"Phase 1 may not have saved properly"
             )
             return {}
         try:
@@ -362,4 +507,3 @@ class PhaseRouter:
         elif phase == Phase.RENDER:
             return state.phase_3_attempts
         return 0
-
