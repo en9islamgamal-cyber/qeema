@@ -456,3 +456,4 @@ class AssetStorage:
     @staticmethod
     def _guess_mime(p: Path) -> str:
         return _MIME_BY_EXT.get(p.suffix.lower(), "application/octet-stream")
+
