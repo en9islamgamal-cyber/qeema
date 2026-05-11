@@ -449,30 +449,38 @@ class PhaseRouter:
                     f"Storage: {type(e).__name__}: {e}. Cannot render."
                 ) from e
         else:
-            # No manifest in state. Two legitimate reasons + one bug case:
-            #   (a) Phase 2 ran with AssetStorage disabled (--skip-supabase).
-            #       Files might still exist locally if same-runner execution.
-            #   (b) State was created by pre-v22.7 Phase 2 on a previous
-            #       runner. Files DON'T exist locally — render will fail.
-            # We tell (a) and (b) apart by checking if the mastered audio
-            # files actually exist on disk. If not, fail fast with a clear
-            # recovery message instead of letting the renderer die with a
-            # confusing "Audio missing" error 5 seconds later.
+            # No manifest in state. Three possible reasons:
+            #   (a) Phase 2 ran with AssetStorage disabled (--skip-supabase
+            #       or no Supabase credentials). Files might exist locally
+            #       if Phase 2 ran on the same runner.
+            #   (b) Tests with mocked orchestrators — Phase 3 won't really
+            #       render, so file existence doesn't matter.
+            #   (c) State was created by pre-v22.7 Phase 2 on a previous
+            #       runner, with AssetStorage NOW available in this run.
+            #       Files DON'T exist locally — render WILL fail.
+            #
+            # Only case (c) is a real bug we can detect cleanly: we expected
+            # to use Storage (asset_storage is wired) but the state pre-dates
+            # the storage layer. We fail fast there with a clear recovery
+            # message. Cases (a) and (b) fall through to the renderer, which
+            # either succeeds (files do exist) or fails naturally with its
+            # own error message.
             mastered_map = state.asset_paths.get("mastered_map", {}) or {}
-            if mastered_map:
+            if asset_storage is not None and mastered_map:
                 existing = [
                     p for p in mastered_map.values()
                     if p and Path(p).is_file()
                 ]
                 if not existing:
                     raise RuntimeError(
-                        "Phase 3 cannot start: state.asset_paths has no "
-                        "_storage_manifest AND none of the mastered audio "
-                        "files exist on this runner's filesystem.\n\n"
-                        "Likely cause: state was created by Phase 2 in a "
-                        "previous run (pre-v22.7 code, or with AssetStorage "
-                        "disabled) on a different GitHub Actions runner whose "
-                        "filesystem is now gone.\n\n"
+                        "Phase 3 cannot start: AssetStorage IS wired in this "
+                        "run, but state has no _storage_manifest AND none of "
+                        "the mastered audio files exist on this runner's "
+                        "filesystem.\n\n"
+                        "Likely cause: state was created by Phase 2 on a "
+                        "previous run (pre-v22.7 code, or AssetStorage was "
+                        "unwired then) on a different GitHub Actions runner "
+                        "whose filesystem is now gone.\n\n"
                         "Recovery: trigger the workflow manually with "
                         "PHASE=2 to re-run Phase 2 on the current codebase. "
                         "This will regenerate the assets AND upload them to "
@@ -486,8 +494,9 @@ class PhaseRouter:
                 )
             else:
                 logger.warning(
-                    "⚠️ v22.7: Phase 3 has no _storage_manifest AND no "
-                    "mastered_map in state. The renderer will likely fail."
+                    "⚠️ v22.7: Phase 3 has no _storage_manifest in state. "
+                    "Assuming same-runner execution. If files are missing, "
+                    "the renderer will fail with its own error."
                 )
 
         report = self._orchestrator.run(
