@@ -1,9 +1,33 @@
 """
-orchestrator.py — VALUE / QEEMA v22.5 — orchestrator (3-phase pipeline coordinator)
+orchestrator.py — VALUE / QEEMA v22.7.6 — orchestrator (3-phase pipeline coordinator)
 ==========================================================
 [v22.5 — Phase-aware Strategy-driven Orchestration]
 Every decision point queries PipelineStrategy. No dead code paths.
 Phases run on different days using independent Gemini API keys.
+
+[v22.7.6 — three critical bug fixes]
+  1. MERGE BUG (CRITICAL): _run_phase2_deep_visuals now writes the rich
+     visual prompt directly into ayah_scenes[i].visual_prompt BEFORE
+     saving the JSON. Previously it only wrote a top-level _deep_visuals
+     key, which Pydantic's extra="ignore" silently dropped on reload —
+     meaning every scene.visual_prompt stayed empty, Leonardo was skipped,
+     and ALL scenes fell back to CSS. The "rebuild in-memory script after
+     deep visuals" workaround in _run_pipeline never actually worked
+     because the reload re-ran Pydantic validation on the SAME stale data.
+     This fix puts the prompt where Pydantic looks for it.
+
+  2. CLEANUP FILENAME BUG: _safe_cleanup wrote to
+        videos/episode_branded_episode.mp4
+     for EVERY episode (used branded.stem which is always
+     "branded_episode"). Each new episode overwrote the previous local
+     backup. Now uses episode_NNN.mp4 with the actual episode_number.
+
+  3. ARTIFACT-FRIENDLY CLEANUP: _safe_cleanup used to MOVE branded out
+     of temp/episodes/episode_NNN/. The v22.7 workflow uploads
+     temp/episodes/*/branded_episode.mp4 as a GitHub Actions artifact,
+     but it ran AFTER cleanup — so the file was gone. Now we COPY
+     instead of move, keeping the original in place for the artifact
+     step. The local archive at videos/episode_NNN.mp4 is a second copy.
 
 [Pipeline Stages — driven by strategy + phase]
 
@@ -11,22 +35,15 @@ PHASE 1 — Day 1 (key #1): Script + Religious validation
   1. script             → Multi-task (1 Gemini call) OR legacy 6-call
   2. tafsir_validation  → Per-ayah Gemini, sequential, rate-limited
                           → Saves Phase 1 state to disk
-  Phase 1 budget:  ~14 Gemini calls on key #1
-                   • 1 multi-task script call (or up to 7 legacy calls)
-                   • 7 tafsir validation calls (one per ayah)
-  Throttled to:    4 RPM via shared per-key limiter
-                   → Phase 1 takes ~3.5–4 minutes in steady state
 
-PHASE 2 — Day 2 (key #2): Visual + Audio assets
-  3. deep_visuals       → 3 chained Gemini calls × 7 scenes = 21 calls
-  4. tts_director       → 1 SSML directive call per ayah (7 calls)
-  5. ai_images          → Up to N Leonardo images (strategy.max_ai_images)
+PHASE 2 — Day 2 (keys #2, #3): Visual + Audio assets
+  3. deep_visuals       → Batch (1 call, Key 3) OR legacy chained
+                          → MERGED INTO scene.visual_prompt (v22.7.6 fix)
+  4. tts_director       → Batch (1 call, Key 2) OR legacy
+  5. ai_images          → Leonardo (now actually runs — was failing
+                          silently due to empty visual_prompt before fix #1)
   6. audio              → ElevenLabs TTS (no Gemini quota)
   7. audio_master       → VoiceEngine.master_episode (FFmpeg)
-                          → Saves Phase 2 state to disk
-  Phase 2 budget:  ~28 Gemini calls on key #2
-  Throttled to:    4 RPM via shared per-key limiter
-                   → Deep visuals stage takes ~7 minutes; total Phase 2 ~12 min
 
 PHASE 3 — Day 3 (no Gemini): Render + Publish
   8.  render_scenes     → 6-segment cinematic structure
@@ -35,26 +52,10 @@ PHASE 3 — Day 3 (no Gemini): Render + Publish
   11. subtitles         → ASS subtitles burned in (if enabled)
   12. wrap_branded      → Intro + outro + CTA
   13. thumbnail         → 3 variants for A/B testing
-  14. review_gate       → Block first N episodes for manual review
+  14. review_gate       → Bypassed when QEEMA_AUTO_APPROVE=true (v22.7)
   15. upload            → YouTube
   16. dashboard         → Per-episode + monthly markdown
-  17. cleanup           → Remove temp files after upload confirmed
-
-[v22.5 architectural decisions — what the rate limiting actually does]
-  - ALL Gemini calls go through a shared per-key sliding-window rate limiter
-    (core.gemini_rate_limiter). 4 requests/min, 60s window. This means:
-      * ScriptEngine and TafsirValidator using the same key #1 in Phase 1
-        automatically combine into one 4-RPM bucket
-      * Phase 2's deep-visuals + tts-director on key #2 also share their bucket
-      * No matter how many concurrent threads call Gemini, the SAME-KEY traffic
-        cannot exceed 4 calls in any 60-second window
-
-[v22.5 architectural decisions — religious validation]
-  - Tafsir validation is mandatory whenever Gemini key is set
-    (no use_claude_tafsir gate)
-  - Per-ayah validation, max_workers=1, serial only (Gemini 5 RPM does not
-    tolerate parallelism even with rate limiting at acquire time)
-  - All Anthropic / Claude / Heuristic code paths removed — Gemini-only
+  17. cleanup           → COPY (not move) so artifact upload sees the file
 """
 from __future__ import annotations
 
@@ -99,7 +100,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-PIPELINE_VERSION: str = "21.0.0"
+PIPELINE_VERSION: str = "22.7.6"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -125,9 +126,9 @@ class EpisodeRunReport:
     tafsir_validation: List[Dict[str, Any]] = field(default_factory=list)
     quality_score: Optional[float] = None
     cost_usd: Optional[float] = None
-    strategy_summary: Optional[str] = None  # v21
-    phase_run: Optional[str] = None  # v22.5: which phase(s) executed
-    next_phase: Optional[str] = None  # v22.5: what to run next, or None if done
+    strategy_summary: Optional[str] = None
+    phase_run: Optional[str] = None
+    next_phase: Optional[str] = None
 
     def summary(self) -> str:
         emoji = "✅" if self.success else "❌"
@@ -150,7 +151,7 @@ class EpisodeRunReport:
 
 
 # ════════════════════════════════════════════════════════════════
-# Orchestrator v21
+# Orchestrator v22.7.6
 # ════════════════════════════════════════════════════════════════
 class Orchestrator:
     """Production orchestrator with strategy-driven decision making."""
@@ -158,7 +159,6 @@ class Orchestrator:
     def __init__(
         self,
         *,
-        # Core engines (required)
         script_engine: ScriptEngine,
         voice_engine: VoiceEngine,
         visual_renderer: VisualRenderer,
@@ -170,7 +170,6 @@ class Orchestrator:
         quality_validator: QualityValidator,
         paths: PathsConfig,
         video_cfg: VideoConfig,
-        # Optional engines
         bgm_mixer: Optional[BGMMixer] = None,
         subtitle_engine: Optional[SubtitleEngine] = None,
         image_engine: Any = None,
@@ -178,24 +177,18 @@ class Orchestrator:
         hook_optimizer: Any = None,
         review_gate: Any = None,
         cost_tracker: Any = None,
-        # v19+
         quota_manager: Any = None,
-        # v20
         cost_dashboard: Any = None,
-        # v21 — strategy-driven
         strategy_factory: Any = None,
-        requested_mode: Any = None,           # QualityMode enum
+        requested_mode: Any = None,
         has_multi_task_engine: bool = False,
-        # Per-emotion features
         color_grades_by_emotion: Optional[Dict[str, str]] = None,
-        # Flags
         approval_explicit: bool = False,
         dry_run: bool = False,
         enable_subtitles: bool = True,
         enable_color_grade: bool = True,
         enable_crossfades: bool = True,
     ) -> None:
-        # Core engines
         self.script_engine = script_engine
         self.voice_engine = voice_engine
         self.visual_renderer = visual_renderer
@@ -209,7 +202,6 @@ class Orchestrator:
         self.video_cfg = video_cfg
         self.dry_run = dry_run
 
-        # Optional engines
         self.bgm_mixer = bgm_mixer or BGMMixer(paths=paths)
         self.subtitle_engine = subtitle_engine
         self.image_engine = image_engine
@@ -217,23 +209,15 @@ class Orchestrator:
         self.hook_optimizer = hook_optimizer
         self.review_gate = review_gate
         self.cost_tracker = cost_tracker
-
-        # v19+
         self.quota_manager = quota_manager
-
-        # v20
         self.cost_dashboard = cost_dashboard
-
-        # v21 strategy
         self.strategy_factory = strategy_factory
         self.requested_mode = requested_mode
         self.has_multi_task_engine = has_multi_task_engine
 
-        # Per-emotion features
         self.color_grades_by_emotion = color_grades_by_emotion or {}
         self.approval_explicit = approval_explicit
 
-        # Feature flags
         self.enable_subtitles = enable_subtitles
         self.enable_color_grade = enable_color_grade
         self.enable_crossfades = enable_crossfades
@@ -242,7 +226,6 @@ class Orchestrator:
             env_bgm.lower() == "true" if env_bgm is not None else True
         )
 
-        # Initialize subtitle engine if needed but not provided
         if self.enable_subtitles and self.subtitle_engine is None:
             try:
                 self.subtitle_engine = SubtitleEngine(paths=paths)
@@ -250,21 +233,19 @@ class Orchestrator:
                 logger.warning(f"⚠️ Subtitle engine init failed: {e}")
                 self.enable_subtitles = False
 
-        # State
         self._shutdown_requested: bool = False
-        self._current_strategy: Optional[Any] = None  # PipelineStrategy
+        self._current_strategy: Optional[Any] = None
 
         checkpoints_root = paths.root / "state" / "checkpoints"
         self._checkpoints = CheckpointStore(checkpoints_root)
         self._emitter: SpanEmitter = get_emitter()
 
-    # ─── Lifecycle ───────────────────────────────────────────────
     def warmup(self) -> None:
-        logger.info("🔥 Warming up v21 orchestrator")
+        logger.info("🔥 Warming up v22.7.6 orchestrator")
         self.visual_renderer.warmup()
         self.intro_outro.build_intro()
         self.intro_outro.build_outro()
-        logger.info("✅ Orchestrator v21 warm")
+        logger.info("✅ Orchestrator v22.7.6 warm")
 
     def shutdown(self) -> None:
         logger.info("🧹 Shutting down orchestrator")
@@ -277,11 +258,8 @@ class Orchestrator:
         self._shutdown_requested = True
         logger.warning("⚠️ Shutdown requested")
 
-    # ─── Strategy computation ────────────────────────────────────
     def _compute_strategy(self, episode_number: int) -> Any:
-        """v21: Compute the pipeline strategy for this episode."""
         if self.strategy_factory is None:
-            # Fallback: pretend HIGH mode
             from core.pipeline_strategy import (
                 StrategyFactory as _SF, QualityMode as _QM,
             )
@@ -302,7 +280,6 @@ class Orchestrator:
         logger.info(strategy.detailed_report())
         return strategy
 
-    # ─── Public entry points ─────────────────────────────────────
     def run_next(self) -> Optional[EpisodeRunReport]:
         record = self.repository.get_pending()
         if not record:
@@ -314,25 +291,8 @@ class Orchestrator:
         self,
         episode_number: int,
         *,
-        phase: Any = None,  # EpisodePhase | str | None
+        phase: Any = None,
     ) -> EpisodeRunReport:
-        """Run the pipeline for an episode.
-
-        v22.5: Now supports phase-split execution for the 3-day pipeline.
-
-        Args:
-            episode_number: 1-based episode number
-            phase: One of EpisodePhase.{PHASE_1, PHASE_2, PHASE_3, AUTO, ALL}.
-                   - None or ALL: run all stages in one go (legacy behavior)
-                   - PHASE_1: stop after tafsir validation + phase 1 outputs
-                   - PHASE_2: skip script/tafsir, do Leonardo + ElevenLabs
-                   - PHASE_3: skip phase 1+2, do render + publish
-                   - AUTO: pick the next pending phase based on episode status
-
-        Returns:
-            EpisodeRunReport with stages completed in this phase.
-        """
-        # Normalize phase argument
         from core.models import EpisodePhase
         if phase is None:
             resolved_phase = EpisodePhase.ALL
@@ -347,7 +307,6 @@ class Orchestrator:
         else:
             resolved_phase = EpisodePhase.ALL
 
-        # Resolve AUTO → concrete phase based on episode status
         if resolved_phase == EpisodePhase.AUTO:
             try:
                 record = self.repository.get_or_create(episode_number)
@@ -374,7 +333,6 @@ class Orchestrator:
             logger, episode_number=episode_number, stage="orchestrator",
         )
 
-        # Compute strategy ONCE for this episode
         try:
             self._current_strategy = self._compute_strategy(episode_number)
             report.strategy_summary = self._current_strategy.summary()
@@ -415,27 +373,12 @@ class Orchestrator:
                 phase=resolved_phase,
             )
 
-    # ════════════════════════════════════════════════════════════════
-    # v22.5: Phase state persistence helpers
-    # ════════════════════════════════════════════════════════════════
     def _phase_state_path(self, episode_number: int) -> Path:
-        """Path where phase state (audio_map, mastered_map etc.) is persisted."""
         ep_dir = self.paths.temp_episodes / f"episode_{episode_number:03d}"
         ep_dir.mkdir(parents=True, exist_ok=True)
         return ep_dir / "_phase_state.json"
 
-    def _save_phase_state(
-        self, episode_number: int, **kwargs: Any,
-    ) -> None:
-        """Save phase outputs to disk for later phases to reload.
-
-        Stored as JSON with all paths converted to strings so it survives
-        across runner restarts. Each call MERGES into existing state — so
-        Phase 2 doesn't wipe Phase 1's data.
-
-        v22.5: writes are atomic (tmp file + rename). Even if a concurrent
-        runner crashes mid-write, the on-disk file remains valid.
-        """
+    def _save_phase_state(self, episode_number: int, **kwargs: Any) -> None:
         state_path = self._phase_state_path(episode_number)
         existing: Dict[str, Any] = {}
         if state_path.exists():
@@ -445,7 +388,6 @@ class Orchestrator:
             except Exception:
                 pass
 
-        # Convert any Path values to strings
         def _serialize(obj: Any) -> Any:
             if isinstance(obj, Path):
                 return str(obj)
@@ -457,14 +399,12 @@ class Orchestrator:
 
         existing.update({k: _serialize(v) for k, v in kwargs.items()})
 
-        # v22.5: atomic write — never leaves partial JSON on disk
         tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(existing, f, ensure_ascii=False, indent=2)
         tmp_path.replace(state_path)
 
     def _load_phase_state(self, episode_number: int) -> Dict[str, Any]:
-        """Load phase state from disk. Returns empty dict if not found."""
         state_path = self._phase_state_path(episode_number)
         if not state_path.exists():
             return {}
@@ -478,30 +418,11 @@ class Orchestrator:
     def _reload_episode_script(
         self, episode_number: int,
     ) -> Optional[EpisodeScript]:
-        """Reload an EpisodeScript from disk for Phase 2/3 continuation.
-
-        v22.6.3 (corrected): The 'snapshot' lives in the persistent phase
-        state system (state/phases/episode_NNN.json, populated by
-        PhaseStateManager and uploaded as a GitHub Actions artifact).
-        We do NOT use orchestrator._save_phase_state for snapshots
-        because that writes to temp/episodes/ which is ephemeral
-        between workflow runs.
-
-        Resolution order:
-          1. If state/phases/episode_NNN.json has script_data and the
-             temp episode JSON is missing, materialize the temp JSON
-             from script_data so script_engine.load_from_disk can find it.
-          2. Use script_engine's load_from_disk.
-          3. Fall back to UnifiedScriptEngine.generate.
-        """
         ep_json_path = (
             self.paths.temp_episodes
             / f"episode_{episode_number:03d}.json"
         )
 
-        # v22.6.3: restore temp JSON from PERSISTENT phase state if needed.
-        # The PhaseStateManager (core/phase_state.py) saves script_data to
-        # state/phases/ which IS persisted across workflow runs via cache.
         try:
             from core.phase_state import PhaseStateManager
             psm = PhaseStateManager(Path("state/phases"))
@@ -519,7 +440,6 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"⚠️ Persistent state restore failed: {e}")
 
-        # Prefer script_engine's loader (knows how to inflate EpisodeScript)
         if hasattr(self.script_engine, "load_from_disk"):
             try:
                 cached = self.script_engine.load_from_disk(episode_number)
@@ -528,8 +448,6 @@ class Orchestrator:
             except Exception as e:
                 logger.warning(f"⚠️ load_from_disk failed: {e}")
 
-        # Fallback: rebuild via UnifiedScriptEngine.generate()
-        # (it will use the saved JSON if force_regenerate isn't set)
         try:
             from engines.script_engine_unified import UnifiedScriptEngine
             unified = UnifiedScriptEngine(
@@ -543,31 +461,10 @@ class Orchestrator:
             logger.error(f"❌ Could not reload script for episode {episode_number}: {e}")
             return None
 
-    # ════════════════════════════════════════════════════════════════
-    # v22.5: Phase 2 Gemini-heavy work (moved from Phase 1)
-    # v22.6: Split into two dedicated keys — Key 2 for TTS, Key 3 for visual
-    # ════════════════════════════════════════════════════════════════
     def _phase2_gemini_adapter(self) -> Optional[Any]:
-        """v22.5 backward-compat alias — returns the Key-2 (TTS) adapter.
-
-        Kept as a stable name in case any older code path references it.
-        New code should call _phase2_tts_gemini_adapter or
-        _phase2_visual_gemini_adapter directly.
-        """
         return self._phase2_tts_gemini_adapter()
 
     def _phase2_tts_gemini_adapter(self) -> Optional[Any]:
-        """Build a Gemini adapter for Phase 2 TTS work using key #2.
-
-        v22.6: Phase 2 splits into two dedicated keys:
-          - Key 2 (this method) → TTS direction
-          - Key 3 (sibling)     → visual prompts
-
-        Each key is a separate Google account → separate 20/day quota.
-
-        Returns None if neither GEMINI_API_KEY_2 nor a fallback is set
-        (callers must skip gracefully — never crash).
-        """
         return self._build_phase2_adapter(
             primary_env="GEMINI_API_KEY_2",
             instance_name="phase2-gemini-tts",
@@ -575,11 +472,6 @@ class Orchestrator:
         )
 
     def _phase2_visual_gemini_adapter(self) -> Optional[Any]:
-        """Build a Gemini adapter for Phase 2 visual prompts using key #3.
-
-        v22.6: dedicated key for visual prompt generation. Falls back to
-        Key 2 if Key 3 is not configured (legacy single-Phase-2-key setups).
-        """
         return self._build_phase2_adapter(
             primary_env="GEMINI_API_KEY_3",
             instance_name="phase2-gemini-visual",
@@ -590,15 +482,6 @@ class Orchestrator:
     def _build_phase2_adapter(
         *, primary_env: str, instance_name: str, purpose: str,
     ) -> Optional[Any]:
-        """Generic Phase 2 adapter builder.
-
-        Resolution order:
-            1. The requested env var (e.g. GEMINI_API_KEY_3)
-            2. GEMINI_API_KEY_2 (Phase 2 fallback)
-            3. GEMINI_API_KEY   (single-key setups)
-
-        Returns None on any failure so callers degrade gracefully.
-        """
         try:
             key = (
                 os.getenv(primary_env)
@@ -623,22 +506,26 @@ class Orchestrator:
             )
             return None
 
+    # ════════════════════════════════════════════════════════════════
+    # v22.7.6 CRITICAL FIX: deep visuals now merge into scene.visual_prompt
+    # ════════════════════════════════════════════════════════════════
     def _run_phase2_deep_visuals(
         self, episode_number: int, script: Any,
     ) -> None:
-        """v22.6: Generate deep visual prompts.
+        """v22.7.6: Generate deep visual prompts AND merge them into the
+        per-scene visual_prompt field.
 
-        Strategy:
-          1. Try BatchVisualPromptEngine (1 Gemini call on Key 3)
-          2. On batch failure → fall back to legacy DeepVisualPromptGenerator
-             (3 chained calls × 7 scenes = 21 calls on Key 2 fallback)
-          3. On any unhandled exception → episode_data left unchanged;
-             Leonardo will use shallow visual_subject/action from script.
+        Previously this method only wrote a top-level `_deep_visuals` key.
+        Pydantic's extra="ignore" silently dropped it on EpisodeScript
+        reload, leaving every scene.visual_prompt empty → Leonardo got
+        empty prompts → all 7 scenes fell back to CSS rendering.
 
-        Persists results into `episode_data["_deep_visuals"]` (list of dicts
-        with the 14 fields consumed by VisualPromptEngineer.build_from_deep_result).
+        Now we ALSO update each ayah_scenes[i]["visual_prompt"] with a
+        rich string built from the 14-field deep visual dict. When the
+        script is reloaded after this method, the Pydantic-validated
+        AyahScene has its visual_prompt field populated and Leonardo
+        actually has something to work with.
         """
-        import json
         ep_path = (
             self.paths.temp_episodes / f"episode_{episode_number:03d}.json"
         )
@@ -664,10 +551,10 @@ class Orchestrator:
             )
             return
 
-        # ── Path 1: BatchVisualPromptEngine on Key 3 (1 call) ─────────
+        # Path 1: BatchVisualPromptEngine on Key 3 (1 call)
         deep_visuals_payload = self._try_batch_visual_prompts(ayah_scenes)
 
-        # ── Path 2: legacy chained DeepVisualPromptGenerator on Key 2 ─
+        # Path 2: legacy chained DeepVisualPromptGenerator on Key 2
         if deep_visuals_payload is None:
             logger.info(
                 "📉 Phase 2 deep visuals: batch path unavailable/failed — "
@@ -682,7 +569,75 @@ class Orchestrator:
             )
             return
 
+        # Persist top-level _deep_visuals (legacy callers expect it here)
         episode_data["_deep_visuals"] = deep_visuals_payload
+
+        # ════════════════════════════════════════════════════════════════
+        # v22.7.6 CRITICAL FIX: merge rich prompts into scene.visual_prompt
+        # ════════════════════════════════════════════════════════════════
+        # Without this loop, the Pydantic-validated EpisodeScript reload
+        # silently drops _deep_visuals and every scene.visual_prompt stays
+        # empty. By writing into ayah_scenes[i]["visual_prompt"] directly,
+        # we put the data where Pydantic's AyahScene.visual_prompt field
+        # actually looks for it.
+        try:
+            from engines.visual_prompt_engineer import VisualPromptEngineer
+            _builder: Any = VisualPromptEngineer
+        except ImportError:
+            _builder = None
+
+        merged_count = 0
+        for i, scene_dict in enumerate(ayah_scenes):
+            if i >= len(deep_visuals_payload):
+                break
+            dv = deep_visuals_payload[i]
+            if not dv.get("is_usable"):
+                continue
+            try:
+                # Preferred path: use VisualPromptEngineer's builder so the
+                # locked style template (positive + negative prompts) is
+                # applied consistently with the standalone-call code path.
+                prompt: str = ""
+                if (
+                    _builder is not None
+                    and hasattr(_builder, "build_from_deep_result")
+                ):
+                    try:
+                        prompt = _builder.build_from_deep_result(dv) or ""
+                    except Exception as e:
+                        logger.debug(
+                            f"build_from_deep_result failed for ayah index "
+                            f"{i}: {e} — using simple join fallback"
+                        )
+                        prompt = ""
+                # Defensive fallback: simple comma-joined concatenation.
+                # Loses the locked style template but produces a usable
+                # Leonardo prompt instead of empty string.
+                if not prompt:
+                    parts = [
+                        dv.get("subject", ""),
+                        dv.get("action", ""),
+                        dv.get("environment", ""),
+                        dv.get("time_of_day", ""),
+                        dv.get("mood", ""),
+                        dv.get("color_palette", ""),
+                        dv.get("lighting_direction", ""),
+                        dv.get("camera_angle", ""),
+                        dv.get("depth_of_field", ""),
+                        dv.get("foreground", ""),
+                        dv.get("midground", ""),
+                        dv.get("background", ""),
+                        dv.get("focal_point", ""),
+                    ]
+                    prompt = ", ".join(p for p in parts if p and p.strip())
+                if prompt:
+                    scene_dict["visual_prompt"] = prompt
+                    merged_count += 1
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ Could not merge visual_prompt for ayah index {i}: {e}"
+                )
+
         try:
             with open(ep_path, "w", encoding="utf-8") as f:
                 json.dump(episode_data, f, ensure_ascii=False, indent=2)
@@ -694,22 +649,18 @@ class Orchestrator:
 
         usable = sum(1 for d in deep_visuals_payload if d.get("is_usable"))
         logger.info(
-            f"🎨 Phase 2 deep visuals: {usable}/{len(deep_visuals_payload)} usable"
+            f"🎨 Phase 2 deep visuals: {usable}/{len(deep_visuals_payload)} "
+            f"usable; merged {merged_count} prompts into ayah_scenes "
+            f"(v22.7.6 fix — Leonardo will now receive non-empty prompts)"
         )
 
     def _try_batch_visual_prompts(
         self, ayah_scenes: List[Dict[str, Any]],
     ) -> Optional[List[Dict[str, Any]]]:
-        """v22.6: Try BatchVisualPromptEngine on Key 3.
-
-        Returns _deep_visuals-shaped list, or None on failure (caller falls
-        back to legacy chained generator).
-        """
         adapter = self._phase2_visual_gemini_adapter()
         if adapter is None or getattr(adapter, "_client", None) is None:
             return None
 
-        # Build the input the batch engine expects
         ayah_scripts: List[Dict[str, Any]] = []
         for i, scene in enumerate(ayah_scenes, start=1):
             ayah_obj = scene.get("ayah") or {}
@@ -744,11 +695,6 @@ class Orchestrator:
     def _legacy_deep_visuals(
         self, ayah_scenes: List[Dict[str, Any]],
     ) -> Optional[List[Dict[str, Any]]]:
-        """Legacy fallback: chained DeepVisualPromptGenerator on Key 2 adapter.
-
-        Returns the same shape as the batch path so the caller can persist
-        either result identically.
-        """
         adapter = self._phase2_tts_gemini_adapter()
         if adapter is None:
             return None
@@ -784,19 +730,6 @@ class Orchestrator:
     def _run_phase2_tts_director(
         self, episode_number: int, script: Any,
     ) -> None:
-        """v22.6: Generate per-segment SSML directions.
-
-        Strategy:
-          1. Try BatchTTSDirector (1 Gemini call on Key 2)
-          2. On batch failure → fall back to legacy TTSDirector
-             (1 Gemini call but using the older un-schema'd path)
-          3. On any unhandled exception → audio uses base emotion presets
-             only (still produces a valid video, just less expressive).
-
-        Persists results into `episode_data["_tts_directions"]` keyed by
-        segment_id (e.g. "ayah_1.hook", "intro_text").
-        """
-        import json
         ep_path = (
             self.paths.temp_episodes / f"episode_{episode_number:03d}.json"
         )
@@ -815,10 +748,7 @@ class Orchestrator:
             )
             return
 
-        # ── Path 1: BatchTTSDirector on Key 2 (1 call, schema-validated) ─
         directions_dict = self._try_batch_tts(episode_data)
-
-        # ── Path 2: legacy TTSDirector (also 1 call, but older path) ─────
         if directions_dict is None:
             logger.info(
                 "📉 Phase 2 TTS: batch path unavailable/failed — "
@@ -851,11 +781,6 @@ class Orchestrator:
     def _try_batch_tts(
         self, episode_data: Dict[str, Any],
     ) -> Optional[Dict[str, Dict[str, Any]]]:
-        """v22.6: Try BatchTTSDirector on Key 2.
-
-        Returns _tts_directions-shaped dict, or None on failure (caller
-        falls back to legacy TTSDirector).
-        """
         adapter = self._phase2_tts_gemini_adapter()
         if adapter is None or getattr(adapter, "_client", None) is None:
             return None
@@ -879,18 +804,6 @@ class Orchestrator:
     def _legacy_tts(
         self, episode_data: Dict[str, Any],
     ) -> Optional[Dict[str, Dict[str, Any]]]:
-        """Legacy fallback: TTSDirector with the older un-schema'd path.
-
-        v22.6 BUG FIX: legacy code referenced episode_direction.directions
-        but the dataclass field is `segments` — that meant legacy was
-        always silently failing with AttributeError. Fixed here.
-
-        v22.6.3: Returns None if the legacy path produced a `fallback_used`
-        result (Gemini failed JSON parse → all SegmentDirection.directed_text
-        == original_text, no SSML). Previously this returned the fallback
-        dict and the orchestrator misreported "N segments directed". Now
-        the caller treats this as a true failure → logs honestly.
-        """
         adapter = self._phase2_tts_gemini_adapter()
         if adapter is None:
             return None
@@ -901,16 +814,10 @@ class Orchestrator:
             episode_direction = director.direct_episode(
                 episode_data, max_retries=1,
             )
-            # v22.6 fix: EpisodeDirection has .segments, NOT .directions
             segments = getattr(episode_direction, "segments", {}) or {}
             if not segments:
                 return None
 
-            # v22.6.3: honest reporting. If the legacy LLM call failed parse,
-            # TTSDirector populates segments with fallback entries where
-            # directed_text == original_text. That's not "directed with SSML"
-            # — it's no SSML at all. Treat as failure so the caller logs
-            # truthfully and downstream synthesis uses the original text.
             if getattr(episode_direction, "fallback_used", False):
                 logger.warning(
                     "⚠️ Legacy TTS produced fallback segments only "
@@ -940,12 +847,11 @@ class Orchestrator:
         start: float,
         log: logging.Logger,
         idem_key: Any,
-        phase: Any = None,  # EpisodePhase | None — None means ALL
+        phase: Any = None,
     ) -> EpisodeRunReport:
         strategy = self._current_strategy
         episode_id: Optional[str] = None
 
-        # v22.5: Determine which stage groups run based on phase
         from core.models import EpisodePhase
         if phase is None:
             phase = EpisodePhase.ALL
@@ -956,7 +862,6 @@ class Orchestrator:
             f"🎬 Phase plan: phase1={run_phase1} phase2={run_phase2} phase3={run_phase3}"
         )
 
-        # Phase 0: repo registration
         try:
             record = self.repository.get_or_create(episode_number)
             episode_id = record["id"]
@@ -979,8 +884,6 @@ class Orchestrator:
             # PHASE 1 — Day 1 (key #1): Script + Tafsir validation
             # ════════════════════════════════════════════════════════
             if run_phase1:
-                # ── Stage 1: Script ──────────────────────────────────
-                # v22: Use UnifiedScriptEngine path if available (multi-task)
                 script_call = self._make_script_call(episode_number, strategy)
                 script = self._run_stage(
                     "script",
@@ -990,10 +893,6 @@ class Orchestrator:
                 script.episode_id = episode_id
                 self._check_shutdown()
 
-                # ── Stage 2: Tafsir validation (CRITICAL) ────────────
-                # v22.5: Always validate when validator is wired. The legacy
-                # use_claude_tafsir gate is gone — religious validation is
-                # mandatory whenever a Gemini key is configured.
                 if self.tafsir_validator is not None:
                     tafsir_results = self._run_stage(
                         "tafsir_validation",
@@ -1031,18 +930,10 @@ class Orchestrator:
                         "(GEMINI_API_KEY missing). NOT recommended for production."
                     )
 
-                # ── Phase 1 close: save state + mark script_ready ──
-                # v22.6.3 (corrected): The persistent phase state at
-                # state/phases/episode_NNN.json is populated by the
-                # PhaseStateManager via phase_router._run_phase_1, which
-                # calls _load_script_json to read temp/episodes/episode_NNN.json
-                # and stores it as script_data. We don't need to duplicate
-                # that here.
                 self._save_phase_state(
                     episode_number,
                     phase1_completed_at=time.time(),
                 )
-                # Update repository status if running phase-only
                 if phase == EpisodePhase.PHASE_1:
                     try:
                         self.repository.update_status(
@@ -1055,7 +946,6 @@ class Orchestrator:
                     except Exception as e:
                         log.warning(f"⚠️ Status update failed: {e}")
 
-                    # Build the report and return early
                     report.success = True
                     report.final_status = EpisodeStatus.SCRIPT_READY.value
                     report.next_phase = EpisodePhase.PHASE_2.value
@@ -1069,7 +959,6 @@ class Orchestrator:
             # PHASE 2 — Asset generation (Leonardo + ElevenLabs)
             # ════════════════════════════════════════════════════════
             if run_phase2:
-                # If we skipped phase 1, reload the script from disk
                 if script is None:
                     log.info(
                         f"📖 Phase 2 standalone — reloading episode {episode_number} script"
@@ -1083,31 +972,35 @@ class Orchestrator:
                         )
                     script.episode_id = episode_id
 
-                # ── Stage 2.5a (v22.5): Deep visual prompts (Phase 2 Gemini)
-                # Was in Phase 1, moved here to use a different daily quota.
-                # Reads the saved episode JSON, augments visual fields, saves back.
+                # v22.7.6: deep visuals NOW merge into scene.visual_prompt
                 self._run_phase2_deep_visuals(episode_number, script)
 
-                # v22.6.3: After deep visuals are persisted, rebuild the
-                # in-memory script so its ayah_scenes[i].visual_prompt
-                # reflects the fresh deep_visuals. Without this, downstream
-                # _generate_ai_images sees empty visual_prompt and every
-                # scene falls back to CSS — the v22.6.2 episode 1 incident.
+                # Refresh script from disk so its visual_prompt fields reflect
+                # the just-merged deep visuals. With the v22.7.6 fix, this
+                # reload actually picks up the prompts (previously it was a
+                # no-op because the data was only at top-level _deep_visuals).
                 refreshed = self._reload_episode_script(episode_number)
                 if refreshed is not None:
                     refreshed.episode_id = script.episode_id
                     script = refreshed
+                    # Sanity-check: log how many scenes now have a prompt
+                    populated = sum(
+                        1 for s in script.ayah_scenes
+                        if getattr(s, "visual_prompt", None)
+                    )
+                    log.info(
+                        f"🎨 After deep-visual merge: {populated}/"
+                        f"{len(script.ayah_scenes)} ayah scenes have a "
+                        f"populated visual_prompt"
+                    )
                 else:
                     log.warning(
                         "⚠️ Could not refresh script after deep visuals — "
                         "AI images may use stale (empty) visual_prompt"
                     )
 
-                # ── Stage 2.5b (v22.5): TTS Director (Phase 2 Gemini)
-                # Was in Phase 1, moved here. Adds SSML directions to segments.
                 self._run_phase2_tts_director(episode_number, script)
 
-                # ── Stage 3: AI image generation ─────────────────────
                 if (
                     self.image_engine is not None
                     and strategy.max_ai_images > 0
@@ -1120,7 +1013,6 @@ class Orchestrator:
                         report,
                     )
 
-                # ── Stage 4: Audio ───────────────────────────────────
                 audio_map = self._run_stage(
                     "audio",
                     lambda: self._generate_audio(script, ep_dir, strategy),
@@ -1134,7 +1026,6 @@ class Orchestrator:
                 )
                 self._check_shutdown()
 
-                # ── Phase 2 close: persist asset paths ─────────────
                 self._save_phase_state(
                     episode_number,
                     audio_map=audio_map,
@@ -1166,17 +1057,11 @@ class Orchestrator:
             # PHASE 3 — Render + Publish
             # ════════════════════════════════════════════════════════
             if run_phase3:
-                # If we skipped Phase 1+2, reload script + asset paths
                 if script is None:
                     log.info(
                         f"📖 Phase 3 standalone — reloading episode {episode_number}"
                     )
 
-                    # v22.6.3: Phase 3 may run on a fresh runner where
-                    # temp/episodes/ is empty. Hydrate the temp episode JSON
-                    # from persistent phase state BEFORE _reload_episode_script
-                    # so the rebuilt script has populated visual_prompt and
-                    # SSML directions (otherwise rendering uses bare text).
                     try:
                         from core.phase_state import PhaseStateManager
                         psm = PhaseStateManager(Path("state/phases"))
@@ -1189,9 +1074,6 @@ class Orchestrator:
                             ep_json_path.parent.mkdir(parents=True, exist_ok=True)
                             payload = dict(persistent.script_data)
                             asset_paths = persistent.asset_paths or {}
-                            # Inject Phase 2 outputs back into the JSON so
-                            # script_engine.load_from_disk can re-inflate
-                            # the script with visual_prompts and TTS dirs.
                             if asset_paths.get("_deep_visuals"):
                                 payload["_deep_visuals"] = (
                                     asset_paths["_deep_visuals"]
@@ -1224,9 +1106,6 @@ class Orchestrator:
                         )
                     script.episode_id = episode_id
 
-                    # v22.6.3: load audio paths from PERSISTENT phase state
-                    # (state/phases/ via PhaseStateManager.asset_paths), not
-                    # the orchestrator's ephemeral temp state.
                     try:
                         from core.phase_state import PhaseStateManager
                         psm = PhaseStateManager(Path("state/phases"))
@@ -1235,7 +1114,6 @@ class Orchestrator:
                         audio_map = asset_paths.get("audio_map", {})
                         mastered = asset_paths.get("mastered_map", {})
                     except Exception:
-                        # Fallback to legacy orchestrator state
                         legacy_state = self._load_phase_state(episode_number)
                         audio_map = legacy_state.get("audio_map", {})
                         mastered = legacy_state.get("mastered_map", {})
@@ -1247,7 +1125,6 @@ class Orchestrator:
                             stage="phase3_reload",
                         )
 
-                # ── Stage 5: Render scenes ───────────────────────────
                 scene_segments = self._run_stage(
                     "render_scenes",
                     lambda: self._render_all_scenes(script, mastered, ep_dir),
@@ -1255,7 +1132,6 @@ class Orchestrator:
                 )
                 self._check_shutdown()
 
-                # ── Stage 6: Concat with crossfades (mood-aware in v23) ──
                 raw_video = ep_dir / "raw_episode.mp4"
                 self._run_stage(
                     "concat_raw",
@@ -1263,7 +1139,6 @@ class Orchestrator:
                     report,
                 )
 
-                # ── Stage 7: BGM mixing (v22.2: mood-aware curve if possible) ──
                 bgm_video = ep_dir / "bgm_episode.mp4"
                 self._run_stage(
                     "bgm_mix",
@@ -1276,7 +1151,6 @@ class Orchestrator:
                     str(bgm_video) if bgm_video.exists() else str(raw_video)
                 )
 
-                # ── Stage 8: Subtitles ───────────────────────────────
                 post_subs = bgm_result
                 if strategy.enable_subtitles and self.subtitle_engine is not None:
                     subs_video = ep_dir / "subs_episode.mp4"
@@ -1290,7 +1164,6 @@ class Orchestrator:
                             script, timing_map, ep_dir / "subs",
                         )
 
-                        # v22.2: Validate Arabic typography of generated ASS
                         try:
                             from engines.subtitle_typography import validate_ass_file
                             typo_report = validate_ass_file(ass_path)
@@ -1320,7 +1193,6 @@ class Orchestrator:
                             "subtitles", False, 0.0, str(e)[:100],
                         ))
 
-                # ── Stage 9: Wrap branded ────────────────────────────
                 cta_audio = mastered.get("cta")
                 branded = ep_dir / "branded_episode.mp4"
                 self._run_stage(
@@ -1331,7 +1203,6 @@ class Orchestrator:
                     report,
                 )
 
-                # ── Stage 10: Thumbnail (3 variants for A/B testing) ─
                 thumbs: List[str] = []
                 if hasattr(self.thumbnail_builder, 'create_variants'):
                     thumbs = self._run_stage(
@@ -1352,7 +1223,6 @@ class Orchestrator:
                     )
                     thumbs = [thumb] if thumb else []
 
-                # ── Stage 11: Review gate ────────────────────────────
                 if self.review_gate is not None:
                     validation_summary = {
                         "quality_score": report.quality_score,
@@ -1392,7 +1262,6 @@ class Orchestrator:
                         self._write_dashboards(report)
                         return report
 
-                # ── Stage 12: Upload ─────────────────────────────────
                 if self.dry_run:
                     log.info("🧪 DRY RUN: skipping upload")
                     report.video_url = "dry-run-no-upload"
@@ -1417,7 +1286,6 @@ class Orchestrator:
                     )
                     report.video_url = upload_result["video_url"]
 
-                    # Upload thumbnail variants for YouTube Test & Compare
                     if (
                         len(thumbs) > 1
                         and hasattr(self.uploader, "upload_thumbnail_variant")
@@ -1436,22 +1304,24 @@ class Orchestrator:
                                     f"upload failed: {e}"
                                 )
 
-                # ── Stage 13: Mark complete ──────────────────────────
                 self.repository.update_status(
                     episode_id, EpisodeStatus.COMPLETED.value,
                     youtube_url=report.video_url,
                 )
 
-                # ── Stage 14: Mark episode in quota manager ──────────
                 if self.quota_manager is not None:
                     try:
                         self.quota_manager.episode_started()
                     except Exception as e:
                         log.warning(f"⚠️ Quota update failed: {e}")
 
-                # ── Stage 15: Cleanup ────────────────────────────────
+                # v22.7.6: pass episode_number so cleanup uses correct
+                # filename. Also note: cleanup now COPIES branded to the
+                # archive (instead of moving) so the workflow artifact
+                # upload step can still find it in temp/episodes/.
                 self._safe_cleanup(
                     ep_dir, branded, Path(bgm_result), scene_segments,
+                    episode_number=episode_number,
                 )
                 report.success = True
                 report.final_status = EpisodeStatus.COMPLETED.value
@@ -1481,18 +1351,12 @@ class Orchestrator:
             traceback_str = self._get_traceback()
             log.error(f"❌ Unexpected error:\n{traceback_str}")
 
-        # Always write dashboards (even on failure for debugging)
         report.total_duration_sec = time.monotonic() - start
         self._write_dashboards(report)
         log.info("\n" + report.summary())
         return report
 
-    # ─── v22: Strategy-aware script call ─────────────────────────
     def _make_script_call(self, episode_number: int, strategy: Any) -> Any:
-        """Build the appropriate script.generate() callable.
-
-        v22.2: Passes HookOptimizer to UnifiedScriptEngine for Thompson Sampling.
-        """
         try:
             from engines.script_engine_unified import UnifiedScriptEngine
             unified = UnifiedScriptEngine(
@@ -1504,15 +1368,9 @@ class Orchestrator:
             pass
         return lambda: self.script_engine.generate(episode_number)
 
-    # ─── Tafsir validation (v22.6: batch-first, per-ayah fallback) ─
     def _validate_tafsir(
         self, script: EpisodeScript, strategy: Any,
     ) -> List[Dict[str, Any]]:
-        """v22.6: Try BatchTafsirReviewer (1 call), fall back to per-ayah.
-
-        Batch path uses Pydantic response_schema for guaranteed valid JSON.
-        Per-ayah fallback is the proven legacy path.
-        """
         if self.tafsir_validator is None:
             return []
 
@@ -1527,7 +1385,6 @@ class Orchestrator:
                     f"سورة {surah_num}"
                 )
 
-        # v22.6: Try batch tafsir review first
         try:
             batch_results = self._try_batch_tafsir(script, surah_name, surah_num)
             if batch_results is not None:
@@ -1538,7 +1395,6 @@ class Orchestrator:
                 f"falling back to per-ayah"
             )
 
-        # Fallback: per-ayah review
         logger.info("🔍 Tafsir validation (per-ayah fallback, multi-key rotation)")
         return self._validate_tafsir_per_ayah(script, surah_name)
 
@@ -1548,16 +1404,10 @@ class Orchestrator:
         surah_name: str,
         surah_num: int,
     ) -> Optional[List[Dict[str, Any]]]:
-        """Try batch tafsir review on Key 1.
-
-        Returns None on any failure (caller falls back to per-ayah).
-        """
-        # Get Key 1's Gemini client (via tafsir_validator's reviewer)
         reviewer = getattr(self.tafsir_validator, "_gemini_reviewer", None)
         if reviewer is None or reviewer._client is None:
             return None
 
-        # Fetch tafsirs for all ayahs
         tafsirs: Dict[int, str] = {}
         fetcher = getattr(self.tafsir_validator, "_fetcher", None)
         if fetcher is None:
@@ -1581,9 +1431,6 @@ class Orchestrator:
                 "story": getattr(scene, 'story_text', '') or '',
             })
 
-        # v22.6: Pre-compute deterministic forbidden-analogy hits per ayah.
-        # Done BEFORE the Gemini batch — costs nothing (string matching) and
-        # provides defense-in-depth against the four canonical doctrinal errors.
         from engines.tafsir_validator import ForbiddenAnalogyDetector
         deterministic_hits: Dict[int, List[str]] = {}
         for s in ayah_scripts:
@@ -1601,7 +1448,6 @@ class Orchestrator:
                 for h in hits:
                     logger.warning(f"   └─ {h}")
 
-        # Run batch review
         from engines.batch_engines import BatchTafsirReviewer
         engine = BatchTafsirReviewer(reviewer._client)
 
@@ -1612,7 +1458,6 @@ class Orchestrator:
         if result is None:
             return None
 
-        # Convert BatchReviewOut → orchestrator's expected list shape
         results: List[Dict[str, Any]] = []
         threshold = getattr(
             self.tafsir_validator, "_confidence_threshold", 0.65
@@ -1623,7 +1468,7 @@ class Orchestrator:
             effectively_passed = (
                 review.passed
                 and review.confidence >= threshold
-                and not forbidden_hits  # v22.6: a deterministic hit forces failure
+                and not forbidden_hits
             )
             merged_concerns = list(review.concerns) + forbidden_hits
 
@@ -1660,9 +1505,13 @@ class Orchestrator:
     def _validate_tafsir_per_ayah(
         self, script: EpisodeScript, surah_name: str,
     ) -> List[Dict[str, Any]]:
-        """Fallback: validate ayahs one by one using validate_explanation."""
+        """Fallback: validate ayahs one by one (serially, no thread pool).
+
+        v22.7.6: removed the ThreadPoolExecutor(max_workers=1) wrapper —
+        it added overhead without parallelism. Same behaviour, simpler code.
+        Gemini's 5 RPM ceiling forces serial calls anyway.
+        """
         results: List[Dict[str, Any]] = []
-        import concurrent.futures
 
         def _validate_one(scene: Any) -> Dict[str, Any]:
             try:
@@ -1705,39 +1554,18 @@ class Orchestrator:
                     "method": "error",
                 }
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="tafsir",
-        ) as executor:
-            # v22.5: max_workers=1 (was 3). Gemini's 5 RPM ceiling cannot
-            # tolerate parallel calls — even with the rate limiter, parallel
-            # acquire() calls would each immediately block all other threads.
-            # Serial execution + the rate limiter inside GeminiReviewer is the
-            # correct shape: ~15s per ayah × 7 ayahs = ~105s total in steady state.
-            futures = [
-                executor.submit(_validate_one, s)
-                for s in script.ayah_scenes
-            ]
-            for fut in concurrent.futures.as_completed(futures):
-                results.append(fut.result())
+        for scene in script.ayah_scenes:
+            results.append(_validate_one(scene))
 
         results.sort(key=lambda r: r.get("ayah", 0))
         return results
 
-    # ─── AI image generation (strategy-aware) ────────────────────
     def _generate_ai_images(
         self,
         script: EpisodeScript,
         ep_dir: Path,
         strategy: Any,
     ) -> Dict[str, str]:
-        """v21: Generate AI images respecting strategy.max_ai_images budget.
-
-        Image strategy:
-          - "unique":  every scene gets a unique image (HIGH mode)
-          - "reuse":   intro/outro share, similar emotion ayahs share (BAL)
-          - "minimal": 3 hero images only, others use CSS (ECON)
-          - "css_only": no AI images at all (engine missing/disabled)
-        """
         if self.image_engine is None or strategy.max_ai_images == 0:
             return {}
 
@@ -1745,7 +1573,6 @@ class Orchestrator:
         images_dir.mkdir(parents=True, exist_ok=True)
         result: Dict[str, str] = {}
 
-        # Determine which scenes get unique images based on strategy
         scenes_to_generate = self._select_scenes_for_images(script, strategy)
         logger.info(
             f"🎨 Image strategy: {strategy.image_reuse_strategy} → "
@@ -1753,7 +1580,6 @@ class Orchestrator:
             f"(budget: {strategy.max_ai_images})"
         )
 
-        # Submit jobs in parallel
         import concurrent.futures
         max_workers = 3
 
@@ -1798,7 +1624,6 @@ class Orchestrator:
                         f"⚠️ AI image failed for {key}: {e}"
                     )
 
-        # Apply reuse strategy: copy hero image to scenes without unique image
         if strategy.image_reuse_strategy in ("reuse", "minimal"):
             self._apply_image_reuse(script, result, strategy)
 
@@ -1808,16 +1633,9 @@ class Orchestrator:
     def _select_scenes_for_images(
         self, script: EpisodeScript, strategy: Any,
     ) -> Dict[str, Any]:
-        """Pick which scenes get unique AI images based on strategy.
-
-        For HIGH (7 images): intro + 5 ayahs + outro = 7
-        For BALANCED (5):    intro + 3 ayahs + outro = 5
-        For ECONOMY (3):     intro + 1 hero ayah + outro = 3
-        """
         budget = strategy.max_ai_images
         selected: Dict[str, Any] = {}
 
-        # Always include intro + outro if budget allows
         if budget >= 1:
             selected["intro"] = script.intro_scene
         if budget >= 2:
@@ -1827,11 +1645,9 @@ class Orchestrator:
         ayahs = list(script.ayah_scenes)
 
         if remaining >= len(ayahs):
-            # All ayahs get unique
             for s in ayahs:
                 selected[f"ayah_{s.scene_id}"] = s
         else:
-            # Pick evenly-distributed ayahs
             if remaining > 0 and ayahs:
                 stride = max(1, len(ayahs) // remaining)
                 picked = ayahs[::stride][:remaining]
@@ -1845,44 +1661,26 @@ class Orchestrator:
         generated: Dict[str, str],
         strategy: Any,
     ) -> None:
-        """Apply intro→outro and similar-emotion ayah reuse."""
-        # Ayahs without their own image get the intro image as background
         intro_path = generated.get("intro")
         if intro_path:
             for scene in script.ayah_scenes:
                 if not getattr(scene, 'image_path', None):
                     scene.image_path = intro_path
 
-    # ─── Audio generation (strategy-aware) ───────────────────────
     def _generate_audio(
         self,
         script: EpisodeScript,
         ep_dir: Path,
         strategy: Any,
     ) -> Dict[str, str]:
-        """v22.1: Generate audio with per-segment emotion-mapped voice settings.
-
-        For each segment (hook/story/explain/moral), look up the right
-        VoiceSettings via voice_emotion_mapper, and apply them per call.
-
-        Falls back to static config defaults if:
-          - strategy.use_adaptive_voice is False (ECONOMY mode)
-          - voice_emotion_mapper module unavailable
-          - VoiceEngine doesn't expose per-call settings injection
-        """
-        # Use the standard voice engine entry (handles intro/explain/outro)
         audio_map = self.voice_engine.generate_episode_audio(script, ep_dir)
 
-        # Synthesize per-scene segments with adaptive settings
         try:
             from engines.voice_emotion_mapper import get_voice_settings
             _adaptive_available = True
         except ImportError:
             _adaptive_available = False
 
-        # v22.5: Pull TTS Director directions if available
-        # The episode JSON has _tts_directions[segment_id] = {directed_text, ...}
-        # which contains the SSML-augmented text. Use it instead of plain text.
         tts_directions: Dict[str, Dict[str, Any]] = {}
         try:
             ep_json_path = (
@@ -1906,8 +1704,6 @@ class Orchestrator:
                 else str(scene.scene_emotion)
             )
 
-            # v22.5: Per-segment emotion mapping with compound segment:emotion strings
-            # so _settings_for_emotion in TTS provider can use voice_emotion_mapper
             segments_with_types = [
                 ("hook", scene.hook_text, "playful" if emotion == "warm" else "excited"),
                 ("story", scene.story_text, emotion),
@@ -1917,14 +1713,11 @@ class Orchestrator:
                 if not text:
                     continue
 
-                # v22.5: Use SSML-augmented text from TTS Director if present
                 tts_dir = tts_directions.get(f"{sid}.{seg_type}", {})
                 directed_text = tts_dir.get("directed_text", "").strip()
                 final_text = directed_text if directed_text else text
 
                 output_path = str(ep_dir / f"{sid}_{seg_type}.mp3")
-                # v22.5: compound "segment:emotion" lets the provider lookup
-                # voice_emotion_mapper presets (e.g., "hook:playful")
                 compound_emotion = f"{seg_type}:{seg_emotion}"
                 extra_items.append((final_text, output_path, compound_emotion))
 
@@ -1934,18 +1727,15 @@ class Orchestrator:
                 f"with per-segment emotions "
                 f"(adaptive_voice={strategy.use_adaptive_voice})"
             )
-            # v23: Use emotion-aware batch if strategy says + method available
             if (
                 strategy.use_adaptive_voice
                 and hasattr(self.voice_engine, 'synthesize_batch_with_emotions')
             ):
                 self.voice_engine.synthesize_batch_with_emotions(extra_items)
             else:
-                # Fallback to old method (drops emotion)
                 legacy_items = [(t, p) for t, p, _ in extra_items]
                 self.voice_engine.synthesize_batch(legacy_items)
 
-            # Map back to scene attributes
             for scene in script.ayah_scenes:
                 sid = f"ayah_{scene.scene_id}"
                 for kind in ("hook", "story", "moral"):
@@ -1956,9 +1746,7 @@ class Orchestrator:
 
         return audio_map
 
-    # ─── Color grade resolver ────────────────────────────────────
     def _color_grade_for(self, emotion: str) -> Optional[str]:
-        """Per-emotion color grade lookup."""
         if not self.enable_color_grade:
             return None
         return self.color_grades_by_emotion.get(
@@ -1969,19 +1757,16 @@ class Orchestrator:
             ),
         )
 
-    # ─── Scene rendering ─────────────────────────────────────────
     def _render_all_scenes(
         self,
         script: EpisodeScript,
         audio_map: Dict[str, str],
         ep_dir: Path,
     ) -> List[str]:
-        """Render all scenes — 6-segment cinematic structure per ayah."""
         scenes_dir = ep_dir / "scenes"
         scenes_dir.mkdir(parents=True, exist_ok=True)
         outputs: List[str] = []
 
-        # ── Intro narrator
         if "intro" in audio_map:
             out = str(scenes_dir / "00_intro.mp4")
             intro_bg = getattr(script.intro_scene, 'image_path', None)
@@ -2001,7 +1786,6 @@ class Orchestrator:
             ), audio_map["intro"])
             outputs.append(out)
 
-        # ── Per-ayah: 6-segment structure
         for i, scene in enumerate(script.ayah_scenes):
             sid = f"ayah_{scene.scene_id}"
             pfx = f"{i + 1:02d}"
@@ -2015,7 +1799,6 @@ class Orchestrator:
             kw = scene.keywords
             ayah_bg = getattr(scene, 'image_path', None)
 
-            # 1. Hook
             if f"{sid}_hook" in audio_map and scene.hook_text:
                 out = str(scenes_dir / f"{pfx}a_{sid}_hook.mp4")
                 self.visual_renderer.render(SceneRenderRequest(
@@ -2031,8 +1814,10 @@ class Orchestrator:
                 ), audio_map[f"{sid}_hook"])
                 outputs.append(out)
 
-            # 2. Intro text
-            if f"{sid}_intro" in audio_map and scene.intro_text:
+            # Note: `{sid}_intro` audio is never produced by _generate_audio
+            # (it only emits hook/story/moral per ayah). The block below
+            # remains a no-op safety net for future expansion.
+            if f"{sid}_intro" in audio_map and getattr(scene, "intro_text", None):
                 out = str(scenes_dir / f"{pfx}b_{sid}_intro.mp4")
                 self.visual_renderer.render(SceneRenderRequest(
                     scene_type=scene_type, palette=palette,
@@ -2047,7 +1832,6 @@ class Orchestrator:
                 ), audio_map[f"{sid}_intro"])
                 outputs.append(out)
 
-            # 3. Analogy
             if f"{sid}_story" in audio_map and scene.story_text:
                 out = str(scenes_dir / f"{pfx}c_{sid}_analogy.mp4")
                 self.visual_renderer.render(SceneRenderRequest(
@@ -2063,7 +1847,6 @@ class Orchestrator:
                 ), audio_map[f"{sid}_story"])
                 outputs.append(out)
 
-            # 4. Quran recitation
             if f"{sid}_ayah" in audio_map:
                 out = str(scenes_dir / f"{pfx}d_{sid}_ayah.mp4")
                 self.visual_renderer.render(SceneRenderRequest(
@@ -2083,7 +1866,6 @@ class Orchestrator:
                 ), audio_map[f"{sid}_ayah"])
                 outputs.append(out)
 
-            # 5. Explain
             if f"{sid}_explain" in audio_map and scene.explain_text:
                 out = str(scenes_dir / f"{pfx}e_{sid}_explain.mp4")
                 self.visual_renderer.render(SceneRenderRequest(
@@ -2099,7 +1881,6 @@ class Orchestrator:
                 ), audio_map[f"{sid}_explain"])
                 outputs.append(out)
 
-            # 6. Moral / Takeaway
             if f"{sid}_moral" in audio_map and scene.moral_text:
                 out = str(scenes_dir / f"{pfx}f_{sid}_moral.mp4")
                 self.visual_renderer.render(SceneRenderRequest(
@@ -2115,7 +1896,6 @@ class Orchestrator:
                 ), audio_map[f"{sid}_moral"])
                 outputs.append(out)
 
-        # ── Mid scenes
         for sc in script.mid_scenes:
             key = f"mid_{sc.scene_id}"
             if key in audio_map:
@@ -2128,7 +1908,6 @@ class Orchestrator:
                 ), audio_map[key])
                 outputs.append(out)
 
-        # ── Outro
         if "outro" in audio_map:
             out = str(scenes_dir / "99_outro.mp4")
             outro_bg = getattr(script.outro_scene, 'image_path', None)
@@ -2154,7 +1933,6 @@ class Orchestrator:
         logger.info(f"✅ Rendered {len(outputs)} cinematic segments")
         return outputs
 
-    # ─── v22.2: Smart BGM application with per-scene volume curve ──
     def _apply_bgm_smart(
         self,
         raw_video: str,
@@ -2162,9 +1940,6 @@ class Orchestrator:
         script: Any,
         scene_segments: List[str],
     ) -> str:
-        """Apply BGM. Uses volume curve (per-scene) if BGMDirector available,
-        else falls back to fixed-volume apply_bgm.
-        """
         try:
             from infrastructure.bgm_director import BGMDirector
             from infrastructure.audio_utils import get_audio_duration
@@ -2172,10 +1947,8 @@ class Orchestrator:
             logger.info("ℹ️ BGMDirector unavailable — using fixed BGM volume")
             return self.bgm_mixer.apply_bgm(raw_video, bgm_video)
 
-        # Build per-scene metadata aligned with scene_segments order
         scenes_meta: List[dict] = []
         for path_str in scene_segments:
-            from pathlib import Path
             name = Path(path_str).stem
             duration = get_audio_duration(path_str) or 5.0
 
@@ -2231,17 +2004,14 @@ class Orchestrator:
 
         return self.bgm_mixer.apply_bgm(raw_video, bgm_video)
 
-    # ─── Concat scenes (v23: mood-aware transitions) ────────────
     def _concat_scenes(
         self, segments: List[str], output_path: str,
         *,
         script: Any = None,
     ) -> str:
-        """Concat scenes. v23 picks per-pair transitions based on emotions."""
         if not (self.enable_crossfades and len(segments) <= 20):
             return self.assembler.concat(segments, output_path, re_encode=False)
 
-        # v23: Try mood-aware transitions if module + script available
         if script is not None:
             try:
                 from infrastructure.mood_transitions import (
@@ -2257,9 +2027,8 @@ class Orchestrator:
                         assembler=self.assembler,
                     )
             except ImportError:
-                pass  # Module not available, fall back
+                pass
 
-        # Fallback: single-duration crossfade
         return self.bgm_mixer.concat_with_crossfades(
             segments, output_path,
             transition_duration=0.4,
@@ -2270,21 +2039,6 @@ class Orchestrator:
     def _build_segment_emotions(
         self, script: Any, segments: List[str],
     ) -> List[Optional[str]]:
-        """Build a per-segment emotion list matching `segments` order.
-
-        Heuristic mapping based on filename patterns from _render_all_scenes:
-          00_intro.mp4         → "excited" (intro narrator)
-          *_hook.mp4           → "playful"
-          *_intro.mp4 (ayah)   → scene's emotion
-          *_analogy.mp4        → "warm"
-          *_ayah.mp4           → "reverent" (Quran)
-          *_explain.mp4        → scene's emotion
-          *_moral.mp4          → "peaceful"
-          99_outro.mp4         → "peaceful"
-        """
-        from pathlib import Path
-
-        # Build a map: scene_id → emotion
         emotion_by_id: Dict[str, str] = {}
         for s in script.ayah_scenes:
             emo = (
@@ -2310,7 +2064,6 @@ class Orchestrator:
             elif "_moral" in name:
                 emotions.append("peaceful")
             elif "_explain" in name or "_intro" in name:
-                # Find ayah scene emotion
                 for sid, emo in emotion_by_id.items():
                     if sid in name:
                         emotions.append(emo)
@@ -2321,14 +2074,12 @@ class Orchestrator:
                 emotions.append(None)
         return emotions
 
-    # ─── Stage runner with idempotency + retry ──────────────────
     def _run_stage(
         self, name: str, fn: Any, report: EpisodeRunReport, *,
         idem_key: Any = None,
     ) -> Any:
         registry = get_registry()
 
-        # Check checkpoint replay
         if idem_key is not None and self._checkpoints.is_completed(
             idem_key, name,
         ):
@@ -2342,7 +2093,6 @@ class Orchestrator:
             )
             return cached
 
-        # v22: Wrap the stage function with retry logic
         try:
             from core.stage_retry import run_with_retry, get_policy
             policy = get_policy(name)
@@ -2350,7 +2100,7 @@ class Orchestrator:
                 fn, stage_name=name, policy=policy,
             )
         except ImportError:
-            wrapped_fn = fn  # No retry if module missing
+            wrapped_fn = fn
 
         with self._emitter.span(f"stage.{name}", stage=name) as span:
             t = time.monotonic()
@@ -2397,7 +2147,6 @@ class Orchestrator:
                 )
                 raise
 
-    # ─── Helpers ─────────────────────────────────────────────────
     def _check_shutdown(self) -> None:
         if self._shutdown_requested:
             raise RuntimeError("Shutdown requested mid-pipeline")
@@ -2421,9 +2170,22 @@ class Orchestrator:
 
     def _safe_cleanup(
         self, ep_dir: Path, branded: Path, raw_video: Path,
-        scene_segments: List[str],
+        scene_segments: List[str], *, episode_number: Optional[int] = None,
     ) -> None:
-        """Remove temp files after upload confirmed."""
+        """Remove temp scratch files after upload confirmed.
+
+        v22.7.6 changes:
+          * filename: episode_NNN.mp4 (not episode_branded_episode.mp4 —
+            that name was constant across all episodes, overwriting the
+            previous backup every run)
+          * copy not move: leave branded_episode.mp4 inside
+            temp/episodes/episode_NNN/ so the GitHub Actions artifact
+            upload step (which runs AFTER this cleanup) can find it.
+            The local archive at videos/episode_NNN.mp4 is a separate
+            copy meant for the operator's local filesystem.
+          * episode_number now a kwarg so the filename is correct even
+            when branded.parent happens not to be ep_dir.
+        """
         try:
             raw_video.unlink(missing_ok=True)
             for s in scene_segments:
@@ -2432,17 +2194,25 @@ class Orchestrator:
                 d = ep_dir / sub
                 if d.exists():
                     shutil.rmtree(d, ignore_errors=True)
-            final = self.paths.videos / f"episode_{branded.stem}.mp4"
+
+            # Decide on a stable, per-episode archive filename
+            if episode_number is not None:
+                archive_name = f"episode_{episode_number:03d}.mp4"
+            else:
+                # Fallback: derive from parent dir name (e.g. episode_002)
+                archive_name = f"{branded.parent.name}.mp4"
+
+            final = self.paths.videos / archive_name
             try:
-                shutil.move(str(branded), str(final))
-                logger.info(f"📦 Final video: {final}")
+                self.paths.videos.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(branded), str(final))
+                logger.info(f"📦 Final video archived: {final}")
             except OSError as e:
-                logger.warning(f"⚠️ Final move failed: {e}")
+                logger.warning(f"⚠️ Final archive failed: {e}")
         except Exception as e:
             logger.warning(f"⚠️ Cleanup partial failure: {e}")
 
     def _write_dashboards(self, report: EpisodeRunReport) -> None:
-        """v20: Write per-episode + monthly dashboards."""
         if self.cost_dashboard is None:
             return
         try:
