@@ -102,64 +102,60 @@ class VoiceSettings:
 # Falls back to bare "<emotion>" if combo not found.
 
 PRESETS: Dict[str, VoiceSettings] = {
-    # ── Hook segments — grab attention, short bursts ───────────
-    # Lower stability = more variation, higher style = more dramatic
-    "hook_warm":     VoiceSettings(stability=0.40, similarity=0.85, style=0.65, speed=1.05),
-    "hook_playful":  VoiceSettings(stability=0.35, similarity=0.85, style=0.70, speed=1.10),
-    "hook_excited":  VoiceSettings(stability=0.30, similarity=0.85, style=0.75, speed=1.10),
-    "hook_reverent": VoiceSettings(stability=0.55, similarity=0.85, style=0.50, speed=0.95),
-    "hook_peaceful": VoiceSettings(stability=0.50, similarity=0.85, style=0.55, speed=1.00),
+    # Target presets from the QEEMA handoff.
+    # Hook → Excited
+    "hook_warm":     VoiceSettings(stability=0.25, similarity=0.88, style=0.85, speed=1.00),
+    "hook_playful":  VoiceSettings(stability=0.25, similarity=0.88, style=0.85, speed=1.00),
+    "hook_excited":  VoiceSettings(stability=0.25, similarity=0.88, style=0.85, speed=1.00),
+    "hook_reverent": VoiceSettings(stability=0.25, similarity=0.88, style=0.85, speed=1.00),
+    "hook_peaceful": VoiceSettings(stability=0.25, similarity=0.88, style=0.85, speed=1.00),
 
-    # ── Story/analogy segments — warm storytelling ─────────────
-    # Medium stability and style = engaging but consistent
-    "story_warm":     VoiceSettings(stability=0.50, similarity=0.88, style=0.55, speed=1.00),
-    "story_playful":  VoiceSettings(stability=0.45, similarity=0.88, style=0.60, speed=1.05),
-    "story_excited":  VoiceSettings(stability=0.40, similarity=0.88, style=0.65, speed=1.05),
-    "story_reverent": VoiceSettings(stability=0.65, similarity=0.88, style=0.40, speed=0.95),
-    "story_peaceful": VoiceSettings(stability=0.60, similarity=0.88, style=0.45, speed=0.95),
+    # Story / Explain / Outro → Warm Storyteller
+    "story_warm":     VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
+    "story_playful":  VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
+    "story_excited":  VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
+    "story_reverent": VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
+    "story_peaceful": VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
 
-    # ── Explain segments — clear, educational ──────────────────
-    # Higher stability = easier to follow, slower = more comprehensible
-    "explain_warm":     VoiceSettings(stability=0.65, similarity=0.88, style=0.40, speed=0.95),
-    "explain_playful":  VoiceSettings(stability=0.60, similarity=0.88, style=0.45, speed=1.00),
-    "explain_excited":  VoiceSettings(stability=0.55, similarity=0.88, style=0.50, speed=1.00),
-    "explain_reverent": VoiceSettings(stability=0.75, similarity=0.88, style=0.30, speed=0.90),
-    "explain_peaceful": VoiceSettings(stability=0.70, similarity=0.88, style=0.35, speed=0.92),
+    "explain_warm":     VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
+    "explain_playful":  VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
+    "explain_excited":  VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
+    "explain_reverent": VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
+    "explain_peaceful": VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
 
-    # ── Moral/takeaway segments — contemplative, memorable ─────
-    # Highest stability + slowest = lasting impression
-    "moral_warm":     VoiceSettings(stability=0.75, similarity=0.88, style=0.30, speed=0.90),
-    "moral_playful":  VoiceSettings(stability=0.65, similarity=0.88, style=0.40, speed=0.95),
-    "moral_excited":  VoiceSettings(stability=0.65, similarity=0.88, style=0.40, speed=0.95),
-    "moral_reverent": VoiceSettings(stability=0.85, similarity=0.88, style=0.20, speed=0.85),
-    "moral_peaceful": VoiceSettings(stability=0.80, similarity=0.88, style=0.25, speed=0.88),
+    # Ayah-context / Moral → Reverent
+    "ayah_reverent":  VoiceSettings(stability=0.50, similarity=0.88, style=0.40, speed=0.90),
+    "moral_warm":     VoiceSettings(stability=0.50, similarity=0.88, style=0.40, speed=0.90),
+    "moral_playful":  VoiceSettings(stability=0.50, similarity=0.88, style=0.40, speed=0.90),
+    "moral_excited":  VoiceSettings(stability=0.50, similarity=0.88, style=0.40, speed=0.90),
+    "moral_reverent": VoiceSettings(stability=0.50, similarity=0.88, style=0.40, speed=0.90),
+    "moral_peaceful": VoiceSettings(stability=0.50, similarity=0.88, style=0.40, speed=0.90),
 
-    # ── Intro narrator (warm establishing tone) ────────────────
-    "intro_warm":    VoiceSettings(stability=0.55, similarity=0.88, style=0.55, speed=1.00),
-    "intro_playful": VoiceSettings(stability=0.50, similarity=0.88, style=0.60, speed=1.05),
-    "intro_excited": VoiceSettings(stability=0.45, similarity=0.88, style=0.65, speed=1.05),
+    # Intro → Excited, Outro → Warm Storyteller
+    "intro_warm":    VoiceSettings(stability=0.25, similarity=0.88, style=0.85, speed=1.00),
+    "intro_playful": VoiceSettings(stability=0.25, similarity=0.88, style=0.85, speed=1.00),
+    "intro_excited": VoiceSettings(stability=0.25, similarity=0.88, style=0.85, speed=1.00),
 
-    # ── Outro narrator (peaceful, contemplative) ───────────────
-    "outro_peaceful": VoiceSettings(stability=0.70, similarity=0.88, style=0.35, speed=0.92),
-    "outro_warm":     VoiceSettings(stability=0.60, similarity=0.88, style=0.45, speed=0.95),
+    "outro_peaceful": VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
+    "outro_warm":     VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
 
-    # ── CTA (subscribe reminder — friendly, inviting) ──────────
-    "cta_warm":    VoiceSettings(stability=0.50, similarity=0.88, style=0.55, speed=1.05),
-    "cta_playful": VoiceSettings(stability=0.45, similarity=0.88, style=0.60, speed=1.10),
+    # CTA — friendly warm storyteller
+    "cta_warm":    VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
+    "cta_playful": VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
 }
 
 # Generic emotion fallbacks (when segment type unknown)
 EMOTION_FALLBACKS: Dict[str, VoiceSettings] = {
-    "warm":     VoiceSettings(stability=0.55, similarity=0.88, style=0.50, speed=1.00),
-    "reverent": VoiceSettings(stability=0.80, similarity=0.88, style=0.25, speed=0.88),
-    "playful":  VoiceSettings(stability=0.45, similarity=0.88, style=0.60, speed=1.05),
-    "peaceful": VoiceSettings(stability=0.70, similarity=0.88, style=0.35, speed=0.92),
-    "excited":  VoiceSettings(stability=0.40, similarity=0.88, style=0.65, speed=1.05),
+    "warm":     VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
+    "reverent": VoiceSettings(stability=0.50, similarity=0.88, style=0.40, speed=0.90),
+    "playful":  VoiceSettings(stability=0.35, similarity=0.88, style=0.65, speed=0.95),
+    "peaceful": VoiceSettings(stability=0.50, similarity=0.88, style=0.40, speed=0.90),
+    "excited":  VoiceSettings(stability=0.25, similarity=0.88, style=0.85, speed=1.00),
 }
 
 # Default fallback when nothing matches
 DEFAULT_FALLBACK = VoiceSettings(
-    stability=0.55, similarity=0.88, style=0.50, speed=1.00,
+    stability=0.35, similarity=0.88, style=0.65, speed=0.95,
 )
 
 

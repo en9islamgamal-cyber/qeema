@@ -44,10 +44,10 @@ WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Amiri,68,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,1,0,1,3,2,2,40,40,50,1
-Style: Ayah,Amiri,82,&H00FFD700,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,3,2,40,40,60,1
-Style: Moral,Amiri,64,&H00D4EDDA,&H000000FF,&H00000000,&H90000000,-1,1,0,0,100,100,0,0,1,2,2,2,40,40,50,1
-Style: Hook,Amiri,78,&H00FFE566,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,2,2,40,40,50,1
+Style: Default,Amiri,66,&H00FFFFFF,&H000000FF,&H30000000,&H70000000,-1,0,0,0,100,100,0,0,3,2,0,2,80,80,70,1
+Style: Ayah,Amiri,82,&H00FFD700,&H000000FF,&H20000000,&H65000000,-1,0,0,0,100,100,0,0,3,2,0,2,90,90,78,1
+Style: Moral,Amiri,64,&H00D4EDDA,&H000000FF,&H30000000,&H75000000,-1,1,0,0,100,100,0,0,3,2,0,2,80,80,70,1
+Style: Hook,Amiri,76,&H00FFE566,&H000000FF,&H30000000,&H70000000,-1,0,0,0,100,100,0,0,3,2,0,2,80,80,70,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -100,6 +100,12 @@ def _split_long_line(text: str, max_chars: int = 40) -> str:
     return "\\N".join(lines)
 
 
+def _rtl_ass_text(text: str) -> str:
+    """Wrap ASS text in RTL embedding marks to prevent reversed Arabic."""
+    clean = text.replace("\u202a", "").replace("\u202b", "").replace("\u202c", "")
+    return f"\u202b{clean}\u202c"
+
+
 class SubtitleEngine:
     """
     Generates ASS subtitle files from episode scripts + audio timing.
@@ -149,9 +155,10 @@ class SubtitleEngine:
                 ))
                 cursor += dur + 0.2
 
-            # Intro text
-            if scene.intro_text:
-                dur = timing_map.get(f"{sid}_intro", _estimate_duration(scene.intro_text))
+            # Intro text is only subtitled when matching audio exists. This avoids
+            # shifting every later subtitle based on estimated audio that was not rendered.
+            if scene.intro_text and f"{sid}_intro" in timing_map:
+                dur = timing_map[f"{sid}_intro"]
                 entries.append(SubtitleEntry(
                     start_sec=cursor, end_sec=cursor + dur,
                     text=_split_long_line(scene.intro_text), style="Default",
@@ -215,7 +222,7 @@ class SubtitleEngine:
             end = _sec_to_ass(e.end_sec)
             # ASS dialogue line
             lines.append(
-                f"Dialogue: 0,{start},{end},{e.style},,0,0,0,,{{\\an2}}{e.text}"
+                f"Dialogue: 0,{start},{end},{e.style},,0,0,0,,{{\\an2}}{_rtl_ass_text(e.text)}"
             )
 
         ass_content = "\n".join(lines)

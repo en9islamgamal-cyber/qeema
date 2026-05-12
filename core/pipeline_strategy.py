@@ -257,19 +257,16 @@ class StrategyFactory:
         use_combined_tts = True  # always — pure efficiency win
         use_adaptive_voice = mode != QualityMode.ECONOMY
 
-        # Images
+        # Images are mandatory for the NotebookLM-quality target.
+        # We generate one Leonardo hero illustration per ayah (7 for short
+        # Juz Amma episodes). Intro/outro reuse the first/last ayah artwork,
+        # so they do not consume extra Leonardo tokens.
         if not has_leonardo_engine:
             max_images = 0
-            image_strategy = "css_only"
-        elif mode == QualityMode.HIGH:
+            image_strategy = "missing_leonardo"
+        else:
             max_images = 7
             image_strategy = "unique"
-        elif mode == QualityMode.BALANCED:
-            max_images = 5
-            image_strategy = "reuse"
-        else:  # ECONOMY
-            max_images = 3
-            image_strategy = "minimal"
 
         # Subtitles always on (cheap value-add for accessibility)
         enable_subtitles = True

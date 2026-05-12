@@ -29,6 +29,7 @@ from core.exceptions import (
     AuthenticationError,
     NetworkError,
     PermanentError,
+    PipelineError,
     RateLimitError,
     TransientError,
 )
@@ -94,7 +95,7 @@ class LeonardoImageEngine:
             output_path="/path/to/scene.png",
             is_hero=False,  # True for intro/outro
         )
-        # Returns path on success, None on failure
+        # Returns path on success; raises on failure.
     """
 
     BASE_URL = "https://cloud.leonardo.ai/api/rest/v1"
@@ -124,18 +125,17 @@ class LeonardoImageEngine:
         is_hero: bool = False,
         episode_number: Optional[int] = None,
         emotion: str = "warm",  # v18: drives lighting selection
-    ) -> Optional[str]:
+    ) -> str:
         """
         Generate an image and save to output_path.
-        Returns path on success, None on failure (caller falls back to CSS).
+        Returns path on success. Fails loudly on any generation problem.
 
         [v18] Uses VisualPromptEngineer for locked style.
         The 'prompt' parameter is treated as the 'subject' field;
         lighting/composition/style are added by the engineer.
         """
         if not prompt or not prompt.strip():
-            logger.warning("⚠️ Empty prompt — skipping image generation")
-            return None
+            raise PipelineError("Leonardo image generation requires a non-empty visual_prompt")
 
         # v19: Quota check BEFORE expensive Leonardo API call
         # Lightning XL = 3 tokens, Phoenix = 10 tokens (estimate)
@@ -150,11 +150,10 @@ class LeonardoImageEngine:
         if self._quota_manager is not None:
             if not self._quota_manager.can_consume_leonardo(token_estimate):
                 remaining = self._quota_manager.leonardo_remaining()
-                logger.warning(
-                    f"⚠️ Leonardo quota too low ({remaining} < {token_estimate}) — "
-                    f"skipping image gen, will fall back to CSS gradient"
+                raise PipelineError(
+                    f"Leonardo quota too low ({remaining} < {token_estimate}); "
+                    f"AI images are mandatory, so CSS fallback is disabled"
                 )
-                return None
 
         # v18: Build locked prompt via engineer (consistent style)
         full_prompt, negative_prompt = VisualPromptEngineer.build_legacy(
@@ -206,7 +205,7 @@ class LeonardoImageEngine:
                     return output_path
             except PermanentError as e:
                 logger.error(f"❌ Leonardo permanent error: {e}")
-                return None
+                raise PipelineError(f"Leonardo permanent error: {e}") from e
             except (NetworkError, TransientError, RateLimitError) as e:
                 logger.warning(f"⚠️ Leonardo attempt {attempt}/3 failed: {e}")
                 if attempt < 3:
@@ -216,8 +215,7 @@ class LeonardoImageEngine:
                 if attempt < 3:
                     time.sleep(2.0 * attempt)
 
-        logger.warning(f"⚠️ Leonardo failed after 3 attempts — falling back to CSS")
-        return None
+        raise PipelineError("Leonardo failed after 3 attempts; CSS fallback is disabled")
 
     # ─── Internal ────────────────────────────────────────────────
     def _cache_key(self, prompt: str, is_hero: bool) -> str:

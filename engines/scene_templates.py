@@ -121,19 +121,48 @@ canvas {{
     width: 100% !important; height: 100% !important;
     display: block;
 }}
-/* CSS-only scene backgrounds */
+/* Cinematic full-frame backgrounds */
 .bg-layer {{
-    position: absolute; inset: 0;
+    position: absolute; inset: -3%;
     will-change: transform;
-    animation: kenBurns 25s ease-in-out infinite alternate;
     background-size: cover !important;
     background-position: center !important;
+    transform-origin: center center;
 }}
-@keyframes kenBurns {{
-    0%   {{ transform: scale(1.0) translate(0%, 0%); }}
-    33%  {{ transform: scale(1.08) translate(-1.5%, 1%); }}
-    66%  {{ transform: scale(1.05) translate(1.5%, -0.8%); }}
-    100% {{ transform: scale(1.1) translate(-1%, 1.5%); }}
+.bg-layer.ai-bg {{
+    animation-duration: var(--kb-duration, 14s);
+    animation-timing-function: cubic-bezier(0.22, 0.61, 0.36, 1);
+    animation-fill-mode: both;
+}}
+.kb-hook {{ animation-name: kenBurnsHook; }}
+.kb-story-left {{ animation-name: kenBurnsStoryLeft; }}
+.kb-story-right {{ animation-name: kenBurnsStoryRight; }}
+.kb-explain {{ animation-name: kenBurnsExplain; }}
+.kb-moral {{ animation-name: kenBurnsMoral; }}
+.kb-diagonal {{ animation-name: kenBurnsDiagonal; }}
+@keyframes kenBurnsHook {{
+    0%   {{ transform: scale(1.03) translate(0%, 0%); }}
+    100% {{ transform: scale(1.18) translate(-1.2%, 0.8%); }}
+}}
+@keyframes kenBurnsStoryLeft {{
+    0%   {{ transform: scale(1.10) translate(2.2%, 0%); }}
+    100% {{ transform: scale(1.12) translate(-2.2%, -0.4%); }}
+}}
+@keyframes kenBurnsStoryRight {{
+    0%   {{ transform: scale(1.10) translate(-2.2%, 0%); }}
+    100% {{ transform: scale(1.12) translate(2.2%, 0.4%); }}
+}}
+@keyframes kenBurnsExplain {{
+    0%   {{ transform: scale(1.06) translate(0%, 0%); }}
+    100% {{ transform: scale(1.09) translate(-0.8%, 0.5%); }}
+}}
+@keyframes kenBurnsMoral {{
+    0%   {{ transform: scale(1.04) translate(0%, 0%); opacity: 0.96; }}
+    100% {{ transform: scale(1.13) translate(0.4%, -0.4%); opacity: 1; }}
+}}
+@keyframes kenBurnsDiagonal {{
+    0%   {{ transform: scale(1.08) translate(2.0%, -1.4%); }}
+    100% {{ transform: scale(1.16) translate(-2.0%, 1.4%); }}
 }}
 .gradient-overlay {{
     position: absolute; inset: 0;
@@ -191,21 +220,26 @@ canvas {{
     50%      {{ transform: scale(1.035); opacity: 1.0; }}
 }}
 
-/* ── Text container ── */
+/* ── Subtitle / narration container (bottom 20-25%) ── */
 .text-container {{
     position: absolute;
-    bottom: 90px; left: 50%;
+    bottom: 54px; left: 50%;
     transform: translateX(-50%);
-    width: 88%; max-width: 1600px;
-    padding: 44px 64px;
-    background: rgba(0, 0, 0, 0.58);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
+    width: 90%; max-width: 1640px;
+    min-height: 210px;
+    max-height: 270px;
+    padding: 34px 58px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.66);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
     border: 2px solid {glow};
-    border-radius: 28px;
+    border-radius: 30px;
     box-shadow:
-        0 16px 48px rgba(0, 0, 0, 0.55),
-        0 0 60px {glow},
+        0 18px 54px rgba(0, 0, 0, 0.62),
+        0 0 48px {glow},
         inset 0 1px 0 rgba(255, 255, 255, 0.12);
     z-index: 8;
 }}
@@ -217,6 +251,8 @@ canvas {{
     font-weight: 700;
     line-height: 1.65;
     text-align: center;
+    direction: rtl;
+    unicode-bidi: plaintext;
     text-shadow: 0 2px 14px rgba(0,0,0,0.95);
 }}
 
@@ -227,6 +263,8 @@ canvas {{
     font-weight: 900;
     line-height: 1.6;
     text-align: center;
+    direction: rtl;
+    unicode-bidi: plaintext;
     text-shadow:
         0 0 24px rgba(255, 229, 102, 0.6),
         0 3px 14px rgba(0,0,0,0.95);
@@ -239,6 +277,8 @@ canvas {{
     font-weight: 700;
     line-height: 1.7;
     text-align: right;
+    direction: rtl;
+    unicode-bidi: plaintext;
     text-shadow: 0 2px 10px rgba(0,0,0,0.9);
     border-right: 5px solid #FFD700;
     padding-right: 24px;
@@ -252,6 +292,8 @@ canvas {{
     font-style: italic;
     line-height: 1.65;
     text-align: center;
+    direction: rtl;
+    unicode-bidi: plaintext;
     text-shadow: 0 2px 12px rgba(0,0,0,0.9);
 }}
 
@@ -262,6 +304,8 @@ canvas {{
     font-weight: 900;
     line-height: 1.75;
     text-align: center;
+    direction: rtl;
+    unicode-bidi: plaintext;
     text-shadow:
         0 0 30px rgba(255, 215, 0, 0.6),
         0 0 60px rgba(255, 165, 0, 0.25),
@@ -278,28 +322,43 @@ canvas {{
     letter-spacing: 4px;
 }}
 
-/* Word-reveal animation */
-.word {{
-    display: inline-block;
-    margin: 0 5px;
+/* Sentence-by-sentence reveal (not word-by-word) */
+.sentence-reveal, .word, .ayah-word {{
+    display: inline;
     opacity: 0;
-    transform: translateY(18px) scale(0.96);
-    animation: wordReveal 0.55s cubic-bezier(0.23, 1, 0.32, 1) forwards;
+    direction: rtl;
+    unicode-bidi: plaintext;
+    animation: sentenceReveal 0.75s cubic-bezier(0.23, 1, 0.32, 1) forwards;
 }}
-@keyframes wordReveal {{
-    to {{ opacity: 1; transform: translateY(0) scale(1); }}
+.ayah-word {{
+    animation-duration: 1.05s;
+}}
+@keyframes sentenceReveal {{
+    0%   {{ opacity: 0; filter: blur(4px); }}
+    100% {{ opacity: 1; filter: blur(0); }}
 }}
 
-/* Ayah word — slower, more reverential reveal */
-.ayah-word {{
-    display: inline-block;
-    margin: 0 7px;
-    opacity: 0;
-    transform: translateY(14px);
-    animation: ayahWordReveal 0.8s ease-out forwards;
+/* Ayah recitation special layout — no Leonardo image, centered focus */
+.ayah-scene .bg-layer {{
+    inset: 0;
+    animation: none;
+    background:
+        radial-gradient(circle at 50% 42%, rgba(255, 215, 0, 0.18), transparent 30%),
+        radial-gradient(circle at 18% 18%, rgba(255, 255, 255, 0.12), transparent 22%),
+        linear-gradient(145deg, #090C18 0%, #102A34 48%, #3B2608 100%) !important;
 }}
-@keyframes ayahWordReveal {{
-    to {{ opacity: 1; transform: translateY(0); }}
+.ayah-scene .text-container {{
+    top: 50%; bottom: auto; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 82%;
+    min-height: 420px;
+    max-height: 640px;
+    padding: 64px 86px;
+    background: rgba(4, 8, 18, 0.72);
+    border-color: rgba(255, 215, 0, 0.58);
+}}
+.ayah-scene .gradient-overlay {{
+    background: radial-gradient(ellipse at center, transparent 18%, rgba(0,0,0,0.50) 100%);
 }}
 
 /* Progress bar */
@@ -324,21 +383,18 @@ canvas {{
 # Word-wrap helpers (v14: separate classes for different text types)
 # ════════════════════════════════════════════════════════════════
 def _wrap_words_html(text: str, css_class: str = "word", stagger_ms: int = 260) -> str:
+    """Reveal the whole sentence as one readable Arabic subtitle block."""
     if not text:
         return ""
-    words = text.split()
-    spans = []
-    for i, w in enumerate(words):
-        delay = i * stagger_ms
-        safe = html_lib.escape(w)
-        spans.append(
-            f'<span class="{css_class}" style="animation-delay:{delay}ms">{safe}</span>'
-        )
-    return " ".join(spans)
+    safe = html_lib.escape(" ".join(text.split()))
+    return (
+        f'<span class="sentence-reveal {css_class}" '
+        f'style="animation-delay:120ms">{safe}</span>'
+    )
 
 
 def _ayah_word_html(text: str, stagger_ms: int = 400) -> str:
-    """Slower reveal for Quran text."""
+    """Slower sentence reveal for Quran text."""
     return _wrap_words_html(text, css_class="ayah-word", stagger_ms=stagger_ms)
 
 
@@ -985,6 +1041,7 @@ def build_scene_html(
     logo_path: Optional[str] = None,    # v15: PNG logo overlay
     font_path: Optional[str] = None,    # v15: local font embedding
     background_image: Optional[str] = None,  # v16: AI-generated bg image (Leonardo)
+    background_motion: str = "explain",
 ) -> str:
     """
     Build full HTML for one scene.
@@ -1025,13 +1082,38 @@ def build_scene_html(
         text_class = "narrator-text"
         word_html = _wrap_words_html(text, "word", stagger_ms=260)
 
+    motion_class = {
+        "hook": "kb-hook",
+        "story_left": "kb-story-left",
+        "story_right": "kb-story-right",
+        "explain": "kb-explain",
+        "moral": "kb-moral",
+        "diagonal": "kb-diagonal",
+    }.get(background_motion, "kb-explain")
+    motion_duration = {
+        "hook": "7s",
+        "story_left": "18s",
+        "story_right": "18s",
+        "explain": "16s",
+        "moral": "20s",
+        "diagonal": "13s",
+    }.get(background_motion, "16s")
+
+    # Ayah recitation scene intentionally uses a focused sacred gradient.
+    if is_ayah:
+        ai_vignette_css = ""
+        use_threejs = False
+        scene_bg_html = '<div class="bg-layer"></div>'
+        threejs_include = ""
+        threejs_init = ""
+        js_scene = ""
     # v16: AI-generated background image takes priority over CSS/Three.js
-    if background_image and Path(background_image).exists():
+    elif background_image and Path(background_image).exists():
         # Use AI image as background — disable Three.js, override CSS scene
         use_threejs = False
         scene_bg_html = (
-            f'<div class="bg-layer ai-bg" '
-            f'style="background-image:url(\'file://{Path(background_image).absolute()}\');'
+            f'<div class="bg-layer ai-bg {motion_class}" '
+            f'style="--kb-duration:{motion_duration};background-image:url(\'file://{Path(background_image).absolute()}\');'
             f'background-size:cover;background-position:center;"></div>'
             f'<div class="ai-bg-vignette"></div>'
         )
@@ -1095,10 +1177,10 @@ def build_scene_html(
 .logo-png {
     position: absolute;
     top: 32px; right: 48px;
-    height: 84px;
-    width: auto;
+    width: 150px;
+    height: auto;
     z-index: 10;
-    opacity: 0.92;
+    opacity: 1;
     filter: drop-shadow(0 4px 12px rgba(0,0,0,0.7));
     animation: logoPulse 3.5s ease-in-out infinite;
 }
@@ -1125,7 +1207,7 @@ def build_scene_html(
 <style>{common_css}{logo_extra_css}{ai_vignette_css}</style>
 </head>
 <body>
-<div class="scene-container">
+<div class="scene-container {'ayah-scene' if is_ayah else 'narration-scene'}">
     {scene_bg_html}
     <div class="gradient-overlay"></div>
     {particles_html}
@@ -1147,11 +1229,12 @@ setTimeout(() => {{
     document.getElementById('progress').style.width = '100%';
 }}, 120);
 
-window.__qeema_v15 = {{
+window.__qeema_v24 = {{
     scene_type: {json.dumps(scene_type)},
     palette: {json.dumps(palette_name)},
     emotion: {json.dumps(scene_emotion)},
     text_style: {json.dumps(text_style)},
+    background_motion: {json.dumps(background_motion)},
     duration_sec: {duration_sec},
     is_ayah: {str(is_ayah).lower()},
 }};

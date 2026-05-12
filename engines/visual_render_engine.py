@@ -69,6 +69,8 @@ from infrastructure.browser_pool import BrowserPool
 
 logger = logging.getLogger(__name__)
 
+RENDER_TEMPLATE_VERSION = "v24_cinematic_leonardo_kb"
+
 
 # ════════════════════════════════════════════════════════════════
 # Cache key derivation
@@ -84,9 +86,11 @@ def _scene_cache_key(
     height: int,
     background_image: Optional[str] = None,  # v16
     color_grade_filter: Optional[str] = None,  # v17
+    background_motion: Optional[str] = None,
 ) -> str:
     """SHA-256 cache key combining all render-affecting inputs."""
     h = hashlib.sha256()
+    h.update(RENDER_TEMPLATE_VERSION.encode("utf-8")); h.update(b"\x00")
     h.update(scene_type.encode("utf-8")); h.update(b"\x00")
     h.update(palette.encode("utf-8")); h.update(b"\x00")
     h.update(text.encode("utf-8")); h.update(b"\x00")
@@ -98,6 +102,8 @@ def _scene_cache_key(
     # v17: color grade is baked-in, so it's part of the cache key
     if color_grade_filter:
         h.update(b"cg:"); h.update(color_grade_filter.encode("utf-8")); h.update(b"\x00")
+    if background_motion:
+        h.update(b"motion:"); h.update(background_motion.encode("utf-8")); h.update(b"\x00")
     try:
         st = Path(audio_path).stat()
         h.update(str(st.st_size).encode("utf-8")); h.update(b"\x00")
@@ -303,6 +309,25 @@ class ProceduralRenderer(VisualRenderer):
     # ───────────────────────────────────────────────────────────
     # Public render
     # ───────────────────────────────────────────────────────────
+    def _validate_required_background(self, request: SceneRenderRequest, background_image: Optional[str]) -> None:
+        """Fail loudly when a narration scene is expected to use Leonardo art."""
+        extra = getattr(request, "extra", None) or {}
+        if request.is_ayah:
+            return
+        if not extra.get("require_background_image", False):
+            return
+        if not background_image:
+            raise VisualRenderError(
+                f"Leonardo background is mandatory for {request.scene_type} "
+                f"({extra.get('text_style', 'narrator')}) but request.extra['background_image'] is empty"
+            )
+        bg_path = Path(background_image)
+        if not bg_path.is_file():
+            raise VisualRenderError(
+                f"Leonardo background is mandatory for {request.scene_type} "
+                f"({extra.get('text_style', 'narrator')}) but file was not found: {bg_path}"
+            )
+
     def render(
         self,
         request: SceneRenderRequest,
@@ -318,6 +343,8 @@ class ProceduralRenderer(VisualRenderer):
         # v16: extract background_image from request.extra for cache key
         extra = getattr(request, 'extra', None) or {}
         bg_img = extra.get('background_image')
+        self._validate_required_background(request, bg_img)
+        background_motion = extra.get('background_motion')
         # v18: per-emotion color grade for cache key alignment
         scene_emotion = extra.get('scene_emotion', 'warm')
         effective_cg_for_cache = (
@@ -333,6 +360,7 @@ class ProceduralRenderer(VisualRenderer):
             height=self._video.height,
             background_image=bg_img,
             color_grade_filter=effective_cg_for_cache,
+            background_motion=background_motion,
         )
         cache_file = self._paths.scene_cache / f"{cache_key}.mp4"
 
@@ -387,6 +415,7 @@ class ProceduralRenderer(VisualRenderer):
             logo_path=logo_path,
             font_path=font_path,
             background_image=extra.get('background_image'),  # v16
+            background_motion=extra.get('background_motion', 'explain'),
         )
 
         unique_id = uuid.uuid4().hex[:10]

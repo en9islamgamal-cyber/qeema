@@ -58,7 +58,7 @@ class TestGetVoiceSettings:
         # Excited hooks should have low stability, high style
         assert s.stability < 0.5
         assert s.style > 0.5
-        assert s.speed > 1.0  # faster
+        assert s.speed == 1.0  # target handoff preset
 
     def test_moral_is_calmer_than_hook(self):
         hook = get_voice_settings(segment_type="hook", emotion="warm")

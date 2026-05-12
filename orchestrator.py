@@ -1001,17 +1001,13 @@ class Orchestrator:
 
                 self._run_phase2_tts_director(episode_number, script)
 
-                if (
-                    self.image_engine is not None
-                    and strategy.max_ai_images > 0
-                ):
-                    self._run_stage(
-                        "ai_images",
-                        lambda: self._generate_ai_images(
-                            script, ep_dir, strategy,
-                        ),
-                        report,
-                    )
+                self._run_stage(
+                    "ai_images",
+                    lambda: self._generate_ai_images(
+                        script, ep_dir, strategy,
+                    ),
+                    report,
+                )
 
                 audio_map = self._run_stage(
                     "audio",
@@ -1566,8 +1562,14 @@ class Orchestrator:
         ep_dir: Path,
         strategy: Any,
     ) -> Dict[str, str]:
-        if self.image_engine is None or strategy.max_ai_images == 0:
-            return {}
+        if self.image_engine is None:
+            raise PipelineError(
+                "Leonardo image engine is not configured; AI images are mandatory"
+            )
+        if strategy.max_ai_images == 0:
+            raise PipelineError(
+                "Pipeline strategy disabled AI images, but Leonardo images are mandatory"
+            )
 
         images_dir = ep_dir / "ai_images"
         images_dir.mkdir(parents=True, exist_ok=True)
@@ -1583,20 +1585,21 @@ class Orchestrator:
         import concurrent.futures
         max_workers = 3
 
-        def _gen(scene_key: str, scene_obj: Any) -> Optional[str]:
+        def _gen(scene_key: str, scene_obj: Any) -> str:
             prompt = getattr(scene_obj, 'visual_prompt', None)
             if not prompt:
-                return None
-            try:
-                return self.image_engine.generate(
-                    prompt=prompt,
-                    output_path=str(images_dir / f"{scene_key}.png"),
-                    is_hero=scene_key in ("intro", "outro"),
-                    episode_number=script.episode_number,
+                raise PipelineError(
+                    f"Leonardo image mandatory for {scene_key}, but visual_prompt is empty"
                 )
-            except Exception as e:
-                logger.warning(f"⚠️ AI image gen failed for {scene_key}: {e}")
-                return None
+            emotion_obj = getattr(scene_obj, 'scene_emotion', 'warm')
+            emotion = emotion_obj.value if hasattr(emotion_obj, 'value') else str(emotion_obj)
+            return self.image_engine.generate(
+                prompt=prompt,
+                output_path=str(images_dir / f"{scene_key}.png"),
+                is_hero=False,
+                episode_number=script.episode_number,
+                emotion=emotion,
+            )
 
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="img",
@@ -1609,63 +1612,68 @@ class Orchestrator:
                 key, scene = futures[fut]
                 try:
                     path = fut.result()
-                    if path:
-                        scene.image_path = path
-                        result[key] = path
-                        logger.info(
-                            f"🎨 AI image: {key} → {Path(path).name}"
-                        )
-                    else:
-                        logger.info(
-                            f"⚠️ AI image: {key} → fallback to CSS"
-                        )
-                except Exception as e:
-                    logger.warning(
-                        f"⚠️ AI image failed for {key}: {e}"
+                    scene.image_path = path
+                    result[key] = path
+                    logger.info(
+                        f"🎨 AI image: {key} → {Path(path).name}"
                     )
+                except Exception as e:
+                    raise PipelineError(
+                        f"AI image failed for {key}; Leonardo images are mandatory: {e}"
+                    ) from e
 
-        if strategy.image_reuse_strategy in ("reuse", "minimal"):
-            self._apply_image_reuse(script, result, strategy)
+        self._apply_image_reuse(script, result, strategy)
 
-        logger.info(f"✅ AI images: {len(result)} generated")
+        missing = [
+            f"ayah_{scene.scene_id}"
+            for scene in script.ayah_scenes
+            if not getattr(scene, 'image_path', None)
+        ]
+        if missing:
+            raise PipelineError(
+                "Leonardo image generation incomplete; missing mandatory ayah image(s): "
+                + ", ".join(missing)
+            )
+
+        logger.info(f"✅ AI images: {len(result)} generated (mandatory Leonardo mode)")
         return result
 
     def _select_scenes_for_images(
         self, script: EpisodeScript, strategy: Any,
     ) -> Dict[str, Any]:
-        budget = strategy.max_ai_images
-        selected: Dict[str, Any] = {}
+        """Select ayah scenes for mandatory Leonardo generation.
 
-        if budget >= 1:
-            selected["intro"] = script.intro_scene
-        if budget >= 2:
-            selected["outro"] = script.outro_scene
-
-        remaining = budget - len(selected)
+        The channel quality target is one hero illustration per ayah. Intro and
+        outro reuse ayah art at render time instead of consuming the 7-image
+        Leonardo budget.
+        """
         ayahs = list(script.ayah_scenes)
-
-        if remaining >= len(ayahs):
-            for s in ayahs:
-                selected[f"ayah_{s.scene_id}"] = s
-        else:
-            if remaining > 0 and ayahs:
-                stride = max(1, len(ayahs) // remaining)
-                picked = ayahs[::stride][:remaining]
-                for s in picked:
-                    selected[f"ayah_{s.scene_id}"] = s
-
-        return selected
+        required = len(ayahs)
+        budget = strategy.max_ai_images
+        if budget < required:
+            raise PipelineError(
+                f"Leonardo mandatory mode needs {required} ayah images, "
+                f"but strategy only allows {budget}. Use HIGH mode or raise max_ai_images."
+            )
+        return {f"ayah_{s.scene_id}": s for s in ayahs}
 
     def _apply_image_reuse(
         self, script: EpisodeScript,
         generated: Dict[str, str],
         strategy: Any,
     ) -> None:
-        intro_path = generated.get("intro")
-        if intro_path:
-            for scene in script.ayah_scenes:
-                if not getattr(scene, 'image_path', None):
-                    scene.image_path = intro_path
+        """Keep backward compatibility without allowing CSS fallbacks."""
+        # Mandatory mode generates every ayah image. There should be nothing to
+        # reuse for ayahs, but keep this guard for future strategy changes.
+        last_path: Optional[str] = None
+        for scene in script.ayah_scenes:
+            key = f"ayah_{scene.scene_id}"
+            path = generated.get(key) or getattr(scene, 'image_path', None)
+            if path:
+                scene.image_path = path
+                last_path = path
+            elif last_path:
+                scene.image_path = last_path
 
     def _generate_audio(
         self,
@@ -1705,9 +1713,9 @@ class Orchestrator:
             )
 
             segments_with_types = [
-                ("hook", scene.hook_text, "playful" if emotion == "warm" else "excited"),
-                ("story", scene.story_text, emotion),
-                ("moral", scene.moral_text, "peaceful"),
+                ("hook", scene.hook_text, "excited"),
+                ("story", scene.story_text, "warm"),
+                ("moral", scene.moral_text, "reverent"),
             ]
             for seg_type, text, seg_emotion in segments_with_types:
                 if not text:
@@ -1757,6 +1765,23 @@ class Orchestrator:
             ),
         )
 
+    def _ayah_background_path(self, ep_dir: Path, scene: Any) -> str:
+        """Resolve the mandatory Leonardo image for one ayah scene."""
+        existing = getattr(scene, 'image_path', None)
+        if existing and Path(existing).is_file():
+            return str(existing)
+        candidate = ep_dir / "ai_images" / f"ayah_{scene.scene_id}.png"
+        scene.image_path = str(candidate)
+        return str(candidate)
+
+    def _episode_edge_background(self, ep_dir: Path, script: EpisodeScript, *, last: bool = False) -> Optional[str]:
+        """Use first/last ayah art for intro/outro without spending extra tokens."""
+        scenes = list(script.ayah_scenes)
+        if not scenes:
+            return None
+        scene = scenes[-1] if last else scenes[0]
+        return self._ayah_background_path(ep_dir, scene)
+
     def _render_all_scenes(
         self,
         script: EpisodeScript,
@@ -1769,7 +1794,7 @@ class Orchestrator:
 
         if "intro" in audio_map:
             out = str(scenes_dir / "00_intro.mp4")
-            intro_bg = getattr(script.intro_scene, 'image_path', None)
+            intro_bg = getattr(script.intro_scene, 'image_path', None) or self._episode_edge_background(ep_dir, script)
             self.visual_renderer.render(SceneRenderRequest(
                 scene_type=script.intro_scene.visual_scene.value,
                 palette=script.intro_scene.palette.value,
@@ -1781,6 +1806,8 @@ class Orchestrator:
                     "text_style": "narrator",
                     "scene_emotion": "excited",
                     "background_image": intro_bg,
+                    "require_background_image": True,
+                    "background_motion": "diagonal",
                     "color_grade": self._color_grade_for("excited"),
                 },
             ), audio_map["intro"])
@@ -1797,7 +1824,7 @@ class Orchestrator:
                 else str(scene.scene_emotion)
             )
             kw = scene.keywords
-            ayah_bg = getattr(scene, 'image_path', None)
+            ayah_bg = self._ayah_background_path(ep_dir, scene)
 
             if f"{sid}_hook" in audio_map and scene.hook_text:
                 out = str(scenes_dir / f"{pfx}a_{sid}_hook.mp4")
@@ -1809,6 +1836,8 @@ class Orchestrator:
                         "text_style": "hook",
                         "scene_emotion": "playful",
                         "background_image": ayah_bg,
+                        "require_background_image": True,
+                        "background_motion": "hook",
                         "color_grade": self._color_grade_for("playful"),
                     },
                 ), audio_map[f"{sid}_hook"])
@@ -1827,6 +1856,8 @@ class Orchestrator:
                         "text_style": "narrator",
                         "scene_emotion": emotion,
                         "background_image": ayah_bg,
+                        "require_background_image": True,
+                        "background_motion": "explain",
                         "color_grade": self._color_grade_for(emotion),
                     },
                 ), audio_map[f"{sid}_intro"])
@@ -1842,6 +1873,8 @@ class Orchestrator:
                         "text_style": "story",
                         "scene_emotion": "warm",
                         "background_image": ayah_bg,
+                        "require_background_image": True,
+                        "background_motion": "story_left" if i % 2 == 0 else "story_right",
                         "color_grade": self._color_grade_for("warm"),
                     },
                 ), audio_map[f"{sid}_story"])
@@ -1876,6 +1909,8 @@ class Orchestrator:
                         "text_style": "narrator",
                         "scene_emotion": emotion,
                         "background_image": ayah_bg,
+                        "require_background_image": True,
+                        "background_motion": "explain",
                         "color_grade": self._color_grade_for(emotion),
                     },
                 ), audio_map[f"{sid}_explain"])
@@ -1891,6 +1926,8 @@ class Orchestrator:
                         "text_style": "moral",
                         "scene_emotion": "peaceful",
                         "background_image": ayah_bg,
+                        "require_background_image": True,
+                        "background_motion": "moral",
                         "color_grade": self._color_grade_for("peaceful"),
                     },
                 ), audio_map[f"{sid}_moral"])
@@ -1910,7 +1947,7 @@ class Orchestrator:
 
         if "outro" in audio_map:
             out = str(scenes_dir / "99_outro.mp4")
-            outro_bg = getattr(script.outro_scene, 'image_path', None)
+            outro_bg = getattr(script.outro_scene, 'image_path', None) or self._episode_edge_background(ep_dir, script, last=True)
             self.visual_renderer.render(SceneRenderRequest(
                 scene_type="starry_night",
                 palette="night_stars",
@@ -1922,6 +1959,8 @@ class Orchestrator:
                     "text_style": "narrator",
                     "scene_emotion": "peaceful",
                     "background_image": outro_bg,
+                    "require_background_image": True,
+                    "background_motion": "diagonal",
                     "color_grade": self._color_grade_for("peaceful"),
                 },
             ), audio_map["outro"])

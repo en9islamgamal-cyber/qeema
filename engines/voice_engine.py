@@ -608,44 +608,44 @@ class VoiceEngine:
         ep_dir.mkdir(parents=True, exist_ok=True)
         audio_map: Dict[str, str] = {}
 
-        tts_items: List[Tuple[str, str]] = []
+        tts_items: List[Tuple[str, str, Optional[str]]] = []
 
         # ── Intro narrator
         if script.intro_scene.narrator_text:
             p = str(ep_dir / "intro_narrator.mp3")
-            tts_items.append((script.intro_scene.narrator_text, p))
+            tts_items.append((script.intro_scene.narrator_text, p, "intro:excited"))
 
         # v15 NEW: CTA text (subscribe call-to-action)
         cta = getattr(script, "cta_text", None)
         if cta:
-            tts_items.append((cta, str(ep_dir / "intro_cta.mp3")))
+            tts_items.append((cta, str(ep_dir / "intro_cta.mp3"), "cta:warm"))
 
         # ── Ayah narration segments
         for scene in script.ayah_scenes:
             sid = f"ayah_{scene.scene_id}"
             if scene.intro_text:
                 tts_items.append(
-                    (scene.intro_text, str(ep_dir / f"{sid}_intro.mp3"))
+                    (scene.intro_text, str(ep_dir / f"{sid}_intro.mp3"), "explain:warm")
                 )
             if scene.explain_text:
                 tts_items.append(
-                    (scene.explain_text, str(ep_dir / f"{sid}_explain.mp3"))
+                    (scene.explain_text, str(ep_dir / f"{sid}_explain.mp3"), "explain:warm")
                 )
 
         # ── Mid-scenes
         for sc in script.mid_scenes:
             tts_items.append(
-                (sc.narrator_text, str(ep_dir / f"mid_{sc.scene_id}.mp3"))
+                (sc.narrator_text, str(ep_dir / f"mid_{sc.scene_id}.mp3"), "story:warm")
             )
 
         # ── Outro narrator
         if script.outro_scene.narrator_text:
             tts_items.append(
-                (script.outro_scene.narrator_text, str(ep_dir / "outro_narrator.mp3"))
+                (script.outro_scene.narrator_text, str(ep_dir / "outro_narrator.mp3"), "outro:warm")
             )
 
-        logger.info(f"🎙️ Synthesizing {len(tts_items)} TTS items in parallel")
-        self.synthesize_batch(tts_items)
+        logger.info(f"🎙️ Synthesizing {len(tts_items)} emotion-aware TTS items in parallel")
+        self.synthesize_batch_with_emotions(tts_items)
 
         # ── Map TTS outputs back to keys
         if script.intro_scene.narrator_text:

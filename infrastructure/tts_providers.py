@@ -53,28 +53,22 @@ logger = logging.getLogger(__name__)
 # Slower (0.78) is reserved for Quranic recitation only.
 EMOTION_VOICE_OVERRIDES: Dict[str, Dict[str, float]] = {
     "warm": {
-        # Default for explanations — engaging but not overstimulating
-        "stability": 0.50, "style": 0.55, "speed": 1.00,
+        "stability": 0.35, "style": 0.65, "speed": 0.95,
     },
     "playful": {
-        # For analogies and fun moments — high energy, varied
-        "stability": 0.40, "style": 0.65, "speed": 1.05,
+        "stability": 0.35, "style": 0.65, "speed": 0.95,
     },
     "reverent": {
-        # For Quranic recitation context only — calm, contemplative
-        # Keep slow speed here — recitation should be slow
-        "stability": 0.85, "style": 0.10, "speed": 0.80,
+        "stability": 0.50, "style": 0.40, "speed": 0.90,
     },
     "peaceful": {
-        # For takeaways — reflective but not slow
-        "stability": 0.60, "style": 0.30, "speed": 0.95,
+        "stability": 0.50, "style": 0.40, "speed": 0.90,
     },
     "excited": {
-        # For hooks — MUST grab attention in first 3 seconds
-        # Lowest stability + highest style + slight speed boost
-        "stability": 0.35, "style": 0.70, "speed": 1.05,
+        "stability": 0.25, "style": 0.85, "speed": 1.00,
     },
 }
+
 
 
 # Strip <speak> and <prosody> wrappers; keep <break> tags.

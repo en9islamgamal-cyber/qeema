@@ -78,7 +78,9 @@ class TestAutoSelection:
             has_multi_task_engine=True,
         )
         assert s.mode == QualityMode.BALANCED
-        assert s.max_ai_images == 5
+        # Leonardo is now mandatory: every quality mode keeps one image per ayah.
+        assert s.max_ai_images == 7
+        assert s.image_reuse_strategy == "unique"
         assert "auto-selected BALANCED" in s.reasoning
 
     def test_economy_when_quota_critical(self):
@@ -91,7 +93,9 @@ class TestAutoSelection:
             has_multi_task_engine=True,
         )
         assert s.mode == QualityMode.ECONOMY
-        assert s.max_ai_images == 3
+        # Even economy mode must not fall back to CSS gradients.
+        assert s.max_ai_images == 7
+        assert s.image_reuse_strategy == "unique"
         assert s.use_adaptive_voice is False
         assert "auto-selected ECONOMY" in s.reasoning
 
@@ -196,7 +200,7 @@ class TestEngineAvailability:
             has_multi_task_engine=True,
         )
         assert s.max_ai_images == 0
-        assert s.image_reuse_strategy == "css_only"
+        assert s.image_reuse_strategy == "missing_leonardo"
 
     def test_no_multi_task_engine(self):
         s = StrategyFactory.build(

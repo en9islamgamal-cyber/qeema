@@ -282,11 +282,16 @@ class BGMMixer:
 
         # Escape path for FFmpeg filter (Windows/Linux compat)
         safe_ass = str(Path(ass_path).absolute()).replace("\\", "/").replace(":", "\\:")
+        fonts_dir = Path("assets").absolute()
+        safe_fonts = str(fonts_dir).replace("\\", "/").replace(":", "\\:")
+        ass_filter = f"ass={safe_ass}"
+        if fonts_dir.is_dir():
+            ass_filter += f":fontsdir={safe_fonts}"
 
         cmd = [
             "ffmpeg", "-y",
             "-i", video_path,
-            "-vf", f"ass={safe_ass}",
+            "-vf", ass_filter,
             "-c:v", "libx264",
             "-preset", "fast",
             "-crf", "18",
