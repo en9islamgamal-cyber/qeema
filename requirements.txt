@@ -1,0 +1,12 @@
+# ─── QEEMA v2 Python dependencies ────────────────────────────────
+# Pin versions for reproducibility across local dev and CI.
+
+# Core
+pydantic>=2.10,<3.0
+requests>=2.32,<3.0
+
+# Gemini SDK (Google's official)
+google-genai>=1.17.0,<2.0
+
+# (Optional but useful for diagnostics)
+# python-dotenv>=1.0,<2.0       # local .env support; not strictly required in CI
