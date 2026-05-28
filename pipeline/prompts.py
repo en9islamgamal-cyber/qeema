@@ -17,7 +17,7 @@ Prompt 2: HOOK_AND_VISUALS_PROMPT
 
 Why only two prompts?
 ---------------------
-Earlier versions of QEEMA had 7-14 Gemini calls per episode and complex
+Earlier versions of QEEMA had 7–14 Gemini calls per episode and complex
 multi-agent flows. Doctrinal violations still happened ~40% of the time
 because the LLM was guessing meanings from short verses without context.
 
@@ -69,31 +69,68 @@ EGYPTIAN_MARKERS = [
     "بقى", "لسه", "جامد", "طب", "ماشي", "يلا", "أهو",
 ]
 
-# The unified Leonardo style template. Appended programmatically to
-# every `full_prompt`. Defined here so all visual prompts stay
-# stylistically consistent.
-UNIFIED_VISUAL_STYLE = (
-    "soft watercolor and ink illustration on textured paper, "
-    "warm earthy tones with golden hour highlights, "
-    "dreamy peaceful atmosphere, child-friendly, "
-    "atmospheric depth with shallow depth of field, "
-    "no human faces visible, no text in image, no letters, "
-    "16:9 cinematic composition, "
-    "suitable for Islamic children's educational content, "
-    "NotebookLM aesthetic"
+# --------------------------------------------------------------------
+# VISUAL STYLE LAYER
+# --------------------------------------------------------------------
+# We move to a clean sketch-and-wash board style that:
+# - Feels hand-drawn and premium (like the reference packaging).
+# - Uses a pure white background with generous breathing space.
+# - Places 3–5 symbolic idea clusters across the wide frame
+#   so the camera can zoom between them (zoom in / zoom out).
+# - Stays textless and child-friendly.
+
+STYLE_PREFIX = (
+    "clean child-friendly hand-drawn illustration in a refined sketch-and-wash style, "
+    "thin confident ink outlines with very light pastel watercolor touches, "
+    "pure white background with generous empty space, "
+    "minimal, neat, premium feel, "
+    "3 to 5 clearly separated idea clusters distributed across a wide 16:9 frame, "
+    "each cluster simple enough for a child to understand at a glance, "
+    "soft peach, dusty pink, pale lavender, warm beige, and light warm gray accents only, "
+    "no hard black fills, no heavy shading, "
+    "gentle calm atmosphere, suitable for Islamic children's educational content. "
 )
 
-# What Leonardo should AVOID (negative prompt).
-UNIFIED_VISUAL_NEGATIVE = (
-    "human faces, text, letters, words, watermarks, signatures, "
-    "famous characters, low quality, blurry, distorted, "
-    "cartoon style, anime, photorealistic, harsh shadows, "
-    "scary imagery, weapons, modern technology, screens, phones"
+STYLE_SUFFIX = (
+    "The scene must be composed as a single wide board that can be explored with camera moves: "
+    "start from one idea cluster, zoom into its details, then drift or zoom across to the next, "
+    "and finally zoom out to reveal the whole board again. "
+    "Keep plenty of clean white background between clusters so zooming feels natural. "
+    "Do not draw any text, letters, numbers, logos, or handwriting anywhere in the image. "
+    "No photorealism, no 3D, no anime, no harsh digital effects. "
+    "16:9 horizontal cinematic composition on a pure white background."
 )
+
+# Backwards-compatible single-string view — older modules may import STYLE_BIBLE.
+STYLE_BIBLE = STYLE_PREFIX + STYLE_SUFFIX
+
+# What the image model should AVOID (negative prompt).
+UNIFIED_VISUAL_NEGATIVE = (
+    # Pseudo-text & logos
+    "text, writing, letters, words, Arabic text, pseudo-Arabic, fake calligraphy, "
+    "handwriting, labels, captions, watermarks, signatures, logos, brand marks, "
+    # Wrong styles
+    "photorealistic, photograph, hyper-realistic, 3d render, cgi, anime, manga, "
+    "vector flat icon, corporate clipart, glossy digital painting, "
+    # Composition failures
+    "cluttered layout, overcrowded scene, messy background, tiny unreadable details, "
+    "cropped elements, random shapes with no relation, "
+    # Color / mood failures
+    "neon colors, oversaturated, cyberpunk palette, harsh contrast, dark horror mood, "
+    # Inappropriate content
+    "scary faces, monsters, gore, weapons, blood, violence, "
+    "modern screens, phones, tablets, computers, cars, noisy city streets, "
+    # Theologically sensitive
+    "realistic depiction of prophets, angels, or the divine being"
+)
+
+# Backwards-compatible alias
+UNIFIED_STYLE_TEMPLATE = STYLE_BIBLE
 
 
 # ════════════════════════════════════════════════════════════════════
 # PROMPT 1 — Sheikh Tafsir + Child Psychologist
+# (unchanged logically from your version)
 # ════════════════════════════════════════════════════════════════════
 
 SHEIKH_SYSTEM_PROMPT = """\
@@ -247,10 +284,9 @@ def build_sheikh_user_prompt(
     """
     ayah_block_lines = []
     for ay in ayahs:
-        ayah_block_lines.append(
-            f"  آية {ay['number']}: {ay['text']}"
-        )
-    ayah_block = "\n".join(ayah_block_lines)
+        ayah_block_lines.append(f"  آية {ay['number']}: {ay['text']}")
+    ayah_block = "
+".join(ayah_block_lines)
 
     n_ayahs = len(ayahs)
     start = ayahs[0]["number"]
@@ -307,6 +343,7 @@ def build_sheikh_user_prompt(
 
 # ════════════════════════════════════════════════════════════════════
 # PROMPT 2 — Hook Generator + All Visual Prompts
+# (rewritten so style is fixed in Python, content is variable)
 # ════════════════════════════════════════════════════════════════════
 
 VISUALS_SYSTEM_PROMPT = """\
@@ -317,14 +354,15 @@ VISUALS_SYSTEM_PROMPT = """\
    - تعرف الفرق بين الفضول الحقيقي والكليشيه التافه
 
 2. **Visual director متخصص في illustration للأطفال**
-   - تتقن بناء scenes ملموسة بتفاصيل بصرية محددة
-   - تعرف الـ atmospheric storytelling بدون كلام
-   - تعرف الفرق بين prompt قوي يطلع صورة سينمائية،
-     و prompt ضعيف يطلع صورة generic
+   - تتقن بناء مشاهد ملموسة بتفاصيل بصرية محددة
+   - تعرف تعمل لوحة واحدة فيها كذا فكرة منفصلة،
+     بحيث الكاميرا تقدر تزور كل جزء بالـ zoom in والـ zoom out
+   - تفهم إن style القناة ثابت من Python، وانت مسؤول فقط عن
+     وصف "ما الذي نراه" وليس "كيف يُرسم"
 
 مهمتك في هذا الـ call:
   1. تكتب الـ Hook بناءً على فهمك لشرح الآيات
-  2. تولّد visual prompts لكل صور الفيديو بـ style موحّد
+  2. تولّد visual scene descriptions (بدون كلام عن style) لكل الصور
 
 ═══════════════════════════════════════════════════════════════
 🎯 الـ Hook
@@ -343,38 +381,40 @@ VISUALS_SYSTEM_PROMPT = """\
   ❌ تلخيص مباشر للموضوع (يقتل الفضول)
 
 ═══════════════════════════════════════════════════════════════
-🎨 Visual Style (موحّد لكل الصور — لا يتغير)
+🎨 القواعد البصرية (style ثابت يضيفه Python)
 ═══════════════════════════════════════════════════════════════
 
-**Soft watercolor and ink illustration on textured paper,
-warm earthy tones with golden hour highlights,
-dreamy peaceful atmosphere, child-friendly,
-atmospheric depth with shallow depth of field,
-no human faces visible, no text in image, no letters,
-16:9 cinematic composition,
-suitable for Islamic children's educational content,
-NotebookLM aesthetic.**
+Python هيضيف تلقائياً style ثابت لكل صورة:
 
-كل `full_prompt` لازم يحتوي كل العناصر دي + تفاصيلك الخاصة بالـ scene.
+- clean child-friendly hand-drawn illustration in a refined sketch-and-wash style
+- thin confident ink outlines with very light pastel watercolor touches
+- pure white background with generous empty space
+- 3–5 clearly separated idea clusters across a wide 16:9 frame
+- no text, no letters, no numbers, no logos anywhere in the image
+- no photorealism, no 3D, no anime, no harsh digital effects
 
-[القواعد البصرية الإلزامية]:
-  ❌ ممنوع وجوه بشرية واضحة
-  ❌ ممنوع نص أو حروف داخل الصورة
-  ❌ ممنوع شخصيات مشهورة
-  ❌ ممنوع رموز دينية حساسة (وجه نبي، الكعبة بتفصيل عبادي)
-  ❌ ممنوع تكنولوجيا حديثة (موبايل، كمبيوتر، تلفزيون)
-  ❌ ممنوع صور مخيفة (ظلام شديد، أسلحة، عذاب)
-  ✅ symbolic imagery: طبيعة، أنوار، ظلال، عناصر بسيطة جميلة
+❗ مهم جداً:
+أنت في حقل `full_prompt` لا تذكر أبداً كلمات مثل:
+"watercolor", "ink illustration", "white background", "16:9",
+ولا تذكر "no text" أو "no letters". كل ده مضاف من Python.
+
+مهمتك أن تصف:
+  - العناصر (subjects)
+  - الأفعال (actions)
+  - البيئة (environment)
+  - إحساس اللون (mood / palette)
+  - وكيف تتوزع العناصر في أماكن مختلفة من اللوحة
+    بحيث الكاميرا تقدر تزور كل جزء لوحده بالـ zoom.
 
 ═══════════════════════════════════════════════════════════════
 📐 العدد المطلوب من الصور
 ═══════════════════════════════════════════════════════════════
 
-  - 1 hook_visual (مع الـ hook في بداية الفيديو)
-  - 1 intro_visual (مع المقدمة والتلاوة الأولى)
-  - N ayah_visuals (واحدة لكل آية)
-  - 1 outro_visual (مع الخاتمة والتلاوة الثانية)
-  - 3 thumbnail_visuals (variants للـ A/B testing على YouTube)
+  - 1 hook_visual      (صورة الهوك)
+  - 1 intro_visual     (صورة المقدمة + التلاوة الأولى)
+  - N ayah_visuals     (واحدة لكل آية)
+  - 1 outro_visual     (صورة الخاتمة + التلاوة الثانية)
+  - 3 thumbnail_visuals (نسخ للـ thumbnail A/B testing)
 
 ═══════════════════════════════════════════════════════════════
 📤 التنسيق
@@ -382,6 +422,17 @@ NotebookLM aesthetic.**
 
 ستُجيب بـ JSON صالح فقط يطابق الـ schema حرفياً.
 لا markdown. لا شرح خارجي.
+
+لكل visual object:
+
+- purpose: "hook" / "intro" / "ayah" / "outro" / "thumbnail"
+- ayah_number: رقم الآية أو null
+- subject: 15-25 كلمة تصف العناصر الأساسية
+- action: 10-20 كلمة تصف ماذا يحدث
+- environment: 10-20 كلمة تصف الخلفية والجو العام
+- color_palette: 4-6 كلمات لألوان بسيطة دافئة (pastel)
+- full_prompt: 80-150 كلمة تصف المشهد بالكامل (SCENE ONLY)
+  بدون أي كلام عن watercolor أو white background أو 16:9 أو no text.
 """
 
 
@@ -398,20 +449,21 @@ def build_visuals_user_prompt(
     Takes the OUTPUT of Prompt 1 (the narration) as INPUT so the
     hook and visuals are grounded in the actual content.
     """
-    # Build a compact summary of each ayah for the visual prompt
-    ayah_summary_lines = []
+    ayah_summary_lines: List[str] = []
     for ay in ayah_explanations:
-        # Truncate narration to ~120 chars for context (the visual model
-        # doesn't need the full 250-word narration)
-        narr_preview = ay["narration"][:300].strip()
-        if len(ay["narration"]) > 300:
-            narr_preview += "..."
+        narr_preview = (ay["narration"] or "").strip()
+        if len(narr_preview) > 320:
+            narr_preview = narr_preview[:320].rstrip() + "..."
         ayah_summary_lines.append(
-            f"\n  ━━━ آية {ay['ayah_number']} ━━━\n"
-            f"  النص: {ay['ayah_text']}\n"
+            f"
+  ━━━ آية {ay['ayah_number']} ━━━
+"
+            f"  النص: {ay['ayah_text']}
+"
             f"  مضمون الشرح: {narr_preview}"
         )
-    ayah_summary = "\n".join(ayah_summary_lines)
+    ayah_summary = "
+".join(ayah_summary_lines)
 
     n_ayahs = len(ayah_explanations)
 
@@ -439,55 +491,46 @@ def build_visuals_user_prompt(
    - يطرح سؤال أو حقيقة مدهشة
    - ممنوع كل العبارات الممنوعة (يا أحبائي، هل تعلم، إلخ)
 
-2. **hook_visual**: visual prompt للصورة المرافقة للهوك
-   - purpose: "hook"
-   - ayah_number: null
-   - subject, action, environment, color_palette: تفاصيل محددة
-   - full_prompt: المزج الكامل مع style template
+2. **hook_visual**:
+   - purpose = "hook"
+   - ayah_number = null
+   - صِف مشهداً رمزيّاً بسيطاً يشدّ الطفل لمعنى الحلقة.
 
-3. **intro_visual**: visual للمقدمة والتلاوة الأولى
-   - purpose: "intro"
-   - مزاج هادئ تأملي، يدع الطفل يتركز على التلاوة
+3. **intro_visual**:
+   - purpose = "intro"
+   - ayah_number = null
+   - صِف لوحة هادئة تمهّد للاستماع للتلاوة الأولى.
 
-4. **ayah_visuals**: قائمة فيها {n_ayahs} عناصر، صورة لكل آية
-   - كل عنصر: purpose="ayah", ayah_number=<رقم الآية>
-   - يعبّر بصرياً عن معنى الآية
-   - متناسق مع باقي الصور (نفس الـ style، نفس الـ palette family)
+4. **ayah_visuals**: قائمة بها بالضبط {n_ayahs} عناصر، صورة لكل آية:
+   - لكل عنصر:
+     - purpose = "ayah"
+     - ayah_number = رقم الآية
+     - صِف 3 إلى 5 عناصر رمزية تعبر عن معنى الآية،
+       موزعة في مناطق مختلفة من اللوحة
+       بحيث يمكن للكاميرا أن:
+         • تبدأ من عنصر واحد (zoom in)
+         • تنتقل لعنصر ثانٍ ثم ثالث
+         • تنهي المشهد بـ zoom out تظهر فيه اللوحة كلها.
 
-5. **outro_visual**: visual للخاتمة والتلاوة الثانية
-   - purpose: "outro"
-   - مزاج هادئ دافئ، إحساس بالاكتمال
+5. **outro_visual**:
+   - purpose = "outro"
+   - ayah_number = null
+   - صِف مشهداً يعطي إحساس نهاية دافئ ومطمئن.
 
-6. **thumbnail_visuals**: 3 variants للـ A/B testing
-   - كل واحد: purpose="thumbnail", ayah_number=null
-   - أعلى contrast من الصور الداخلية
-   - composition درامية تخلي طفل 7 سنين يحب يدوس click
-   - بدون وجوه، بدون نص، نفس الـ watercolor style
-
-═══════════════════════════════════════════════════════════════
-[Style Template — لازم يتدمج في كل full_prompt]
-═══════════════════════════════════════════════════════════════
-
-"soft watercolor and ink illustration on textured paper,
-warm earthy tones with golden hour highlights,
-dreamy peaceful atmosphere, child-friendly,
-atmospheric depth with shallow depth of field,
-no human faces visible, no text in image, no letters,
-16:9 cinematic composition,
-suitable for Islamic children's educational content,
-NotebookLM aesthetic"
+6. **thumbnail_visuals**: بالضبط 3 عناصر:
+   - purpose = "thumbnail"
+   - ayah_number = null
+   - نفس رموز الحلقة لكن بتكوين أبسط وتركيز على عنصر مركزي واحد واضح،
+     بدون نص، بدون وجوه حقيقية، مع contrast أعلى قليلاً للـ thumbnail.
 
 ═══════════════════════════════════════════════════════════════
-[تذكير حاسم]
+[تذكير حاسم بخصوص full_prompt]
 ═══════════════════════════════════════════════════════════════
 
-  - ممنوع وجوه بشرية واضحة في أي صورة
-  - ممنوع نص أو حروف داخل الصور (الـ thumbnails كمان)
-  - ممنوع تكنولوجيا حديثة
-  - ممنوع رسم وجه نبي أو الذات الإلهية
-  - الـ ayah_visuals عددها بالظبط {n_ayahs}
-  - الـ thumbnail_visuals عددها بالظبط 3
-  - كل full_prompt على الأقل 40 حرف
+- full_prompt = وصف المشهد فقط (subjects + actions + environment + mood).
+- لا تذكر فيه أي كلمات style (watercolor, sketch, white background, 16:9, no text).
+- لا تذكر أي شيء عن "خيط" أو "لوغو" أو "زوم"؛
+  Python سيضيف style الثابت بنفسه ويراعي الحركة بالكاميرا في مرحلة الفيديو.
 
 ابدأ بـ JSON مباشرة. لا markdown. لا تعليق.
 """
@@ -495,18 +538,43 @@ NotebookLM aesthetic"
 
 # ════════════════════════════════════════════════════════════════════
 # Helper: enrich a visual prompt's full_prompt with the style template
-# (in case the LLM forgot to include it)
 # ════════════════════════════════════════════════════════════════════
 
 def ensure_style_in_full_prompt(full_prompt: str) -> str:
     """
-    Defensive enhancement: if Gemini's full_prompt is missing the style
-    markers, append them. Keeps Leonardo output consistent.
-    """
-    fp_lower = full_prompt.lower()
-    style_markers = ["watercolor", "ink illustration", "notebooklm aesthetic"]
-    needs_style = not any(m in fp_lower for m in style_markers)
+    Defensive enhancement: if Gemini's full_prompt is missing the core
+    style markers, wrap it with STYLE_PREFIX / STYLE_SUFFIX so all
+    Leonardo outputs share a unified channel identity.
 
-    if needs_style:
-        return f"{full_prompt.rstrip('. ,')}, {UNIFIED_VISUAL_STYLE}"
-    return full_prompt
+    IMPORTANT:
+    - `full_prompt` coming from Gemini should describe only the scene.
+    - We do NOT expect it to contain style words.
+    """
+    scene = (full_prompt or "").strip().rstrip(".,;")
+    if not scene:
+        scene = (
+            "a simple symbolic board with a few gentle elements that "
+            "express the idea in a way a child can easily read"
+        )
+    return f"{STYLE_PREFIX}{scene}. {STYLE_SUFFIX}"
+
+
+__all__ = [
+    # Linguistic guards
+    "BANNED_PHRASES_AR",
+    "NON_EGYPTIAN_MARKERS",
+    "EGYPTIAN_MARKERS",
+    # Style layer
+    "STYLE_BIBLE",
+    "STYLE_PREFIX",
+    "STYLE_SUFFIX",
+    "UNIFIED_STYLE_TEMPLATE",
+    "UNIFIED_VISUAL_NEGATIVE",
+    # Prompts
+    "SHEIKH_SYSTEM_PROMPT",
+    "VISUALS_SYSTEM_PROMPT",
+    "build_sheikh_user_prompt",
+    "build_visuals_user_prompt",
+    # Helpers
+    "ensure_style_in_full_prompt",
+]
