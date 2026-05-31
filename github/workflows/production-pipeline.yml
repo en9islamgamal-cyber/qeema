@@ -1,0 +1,67 @@
+name: YouTube Automation Pipeline Scheduler
+
+on:
+  schedule:
+    # Run twice a week to maintain a comfortable pace of 7 videos per month (approx. every 4 days)
+    - cron: '0 8 */4 * *'
+  workflow_dispatch:
+    # Allows manual runs from the GitHub UI
+    inputs:
+      episode_id:
+        description: 'Optional Episode ID to force execute. Leave blank to process the next scheduled item.'
+        required: false
+        type: string
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-size: '20.x'
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Setup Headless Environment Directories
+        run: |
+          mkdir -p data/renders
+          mkdir -p assets
+
+      - name: Run Pipeline Runner Command
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          NODE_ENV: production
+        run: |
+          if [ -n "${{ github.event.inputs.episode_id }}" ]; then
+            echo "Forcing execution for Episode ID: ${{ github.event.inputs.episode_id }}"
+            npx tsx -e "
+              import { PipelineOrchestrator } from './server/orchestrator.ts';
+              PipelineOrchestrator.runEpisode('${{ github.event.inputs.episode_id }}')
+                .then(() => process.exit(0))
+                .catch(err => { console.error(err); process.exit(1); });
+            "
+          else
+            echo "Executing periodic schedule batch checking..."
+            npx tsx -e "
+              import { PipelineOrchestrator } from './server/orchestrator.ts';
+              PipelineOrchestrator.triggerPeriodicBatchCron()
+                .then(() => process.exit(0))
+                .catch(err => { console.error(err); process.exit(1); });
+            "
+          fi
