@@ -53,33 +53,83 @@ export default function App() {
   const [playbackTime, setPlaybackTime] = useState(0);
   const playbackIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Fetch all initial metadata
+  // Fetch all initial metadata with precise error handling for each endpoint
   const reloadAll = async () => {
+    // 1. Fetch Episodes
     try {
       const epRes = await fetch('/api/episodes');
-      const epData = await epRes.json();
-      if (Array.isArray(epData)) {
-        setEpisodes(epData);
-        // Sync currently viewed item if updating
-        if (selectedEpisode) {
-          const fresh = epData.find(e => e.id === selectedEpisode.id);
-          if (fresh) setSelectedEpisode(fresh);
+      const contentType = epRes.headers.get('content-type') || '';
+      if (!epRes.ok) {
+        console.warn(`[FRONTEND] /api/episodes returned status ${epRes.status}`);
+      } else if (!contentType.includes('application/json')) {
+        const text = await epRes.text();
+        console.error(`[FRONTEND] Expected JSON from /api/episodes but received: "${contentType}". Body preview: ${text.slice(0, 100)}`);
+      } else {
+        const epData = await epRes.json();
+        if (Array.isArray(epData)) {
+          setEpisodes(epData);
+          // Sync currently viewed item if updating
+          if (selectedEpisode) {
+            const fresh = epData.find(e => e.id === selectedEpisode.id);
+            if (fresh) setSelectedEpisode(fresh);
+          }
         }
       }
-
-      const logRes = await fetch('/api/logs');
-      const logData = await logRes.json();
-      if (Array.isArray(logData)) setLogs(logData);
-
-      const keyRes = await fetch('/api/keys');
-      const keyData = await keyRes.json();
-      if (Array.isArray(keyData)) setKeys(keyData);
-
-      const statusRes = await fetch('/api/status');
-      const statusData = await statusRes.json();
-      setStatus(statusData);
     } catch (err) {
-      console.error('[FRONTEND-DEV] Failed to synchronize operational logs.', err);
+      console.error('[FRONTEND] Failed to sync episodes:', err);
+    }
+
+    // 2. Fetch Logs
+    try {
+      const logRes = await fetch('/api/logs');
+      const contentType = logRes.headers.get('content-type') || '';
+      if (!logRes.ok) {
+        console.warn(`[FRONTEND] /api/logs returned status ${logRes.status}`);
+      } else if (!contentType.includes('application/json')) {
+        const text = await logRes.text();
+        console.error(`[FRONTEND] Expected JSON from /api/logs but received: "${contentType}". Body preview: ${text.slice(0, 100)}`);
+      } else {
+        const logData = await logRes.json();
+        if (Array.isArray(logData)) setLogs(logData);
+      }
+    } catch (err) {
+      console.error('[FRONTEND] Failed to sync logs:', err);
+    }
+
+    // 3. Fetch Keys
+    try {
+      const keyRes = await fetch('/api/keys');
+      const contentType = keyRes.headers.get('content-type') || '';
+      if (!keyRes.ok) {
+        console.warn(`[FRONTEND] /api/keys returned status ${keyRes.status}`);
+      } else if (!contentType.includes('application/json')) {
+        const text = await keyRes.text();
+        console.error(`[FRONTEND] Expected JSON from /api/keys but received: "${contentType}". Body preview: ${text.slice(0, 100)}`);
+      } else {
+        const keyData = await keyRes.json();
+        if (Array.isArray(keyData)) setKeys(keyData);
+      }
+    } catch (err) {
+      console.error('[FRONTEND] Failed to sync API keys:', err);
+    }
+
+    // 4. Fetch Status
+    try {
+      const statusRes = await fetch('/api/status');
+      const contentType = statusRes.headers.get('content-type') || '';
+      if (!statusRes.ok) {
+        console.warn(`[FRONTEND] /api/status returned status ${statusRes.status}`);
+      } else if (!contentType.includes('application/json')) {
+        const text = await statusRes.text();
+        console.error(`[FRONTEND] Expected JSON from /api/status but received: "${contentType}". Body preview: ${text.slice(0, 100)}`);
+      } else {
+        const statusData = await statusRes.json();
+        if (statusData && typeof statusData === 'object') {
+          setStatus(statusData);
+        }
+      }
+    } catch (err) {
+      console.error('[FRONTEND] Failed to sync pipeline status:', err);
     }
   };
 
