@@ -77,6 +77,34 @@ function writeLocalDb(data: LocalDbSchema): void {
   }
 }
 
+function mapDbStatusToAppStatus(status: string | null): Episode['status'] {
+  if (!status || status === 'pending') return 'planned';
+  return status as Episode['status'];
+}
+
+function mapDbRowToEpisode(epRow: any, psRow?: any): Episode {
+  const merged = { ...epRow, ...psRow };
+  return {
+    id: merged.id,
+    title: merged.title || (merged.surah_name ? `سورة ${merged.surah_name}` : 'Untitled Episode'),
+    topic: merged.surah_name ? `سورة ${merged.surah_name}` : (merged.topic || merged.title || 'Islamic Topic'),
+    targetDate: merged.published_at || merged.targetDate || new Date().toISOString(),
+    status: mapDbStatusToAppStatus(merged.status),
+    script: merged.script || null,
+    voiceName: merged.voice_name || merged.voiceName || 'Kore',
+    visualBriefs: Array.isArray(merged.visual_briefs) ? merged.visual_briefs : (Array.isArray(merged.visualBriefs) ? merged.visualBriefs : []),
+    narrationAudioUrl: merged.narration_audio_url || merged.narrationAudioUrl || null,
+    finalVideoUrl: merged.video_path || merged.finalVideoUrl || null,
+    youtubeId: merged.youtube_video_id || merged.youtubeId || null,
+    youtubeStatus: merged.youtube_video_id ? 'uploaded' : 'none',
+    youtubePublishDate: merged.published_at || merged.youtubePublishDate || null,
+    retryCount: typeof merged.retry_count === 'number' ? merged.retry_count : (typeof merged.retryCount === 'number' ? merged.retryCount : 0),
+    errorLog: merged.error_message || merged.errorLog || null,
+    createdAt: merged.created_at || merged.createdAt || new Date().toISOString(),
+    updatedAt: merged.updated_at || merged.updatedAt || new Date().toISOString(),
+  };
+}
+
 export class DB {
   // EPISODES ACTIONS
   static async getEpisodes(): Promise<Episode[]> {
@@ -84,8 +112,34 @@ export class DB {
       const { data, error } = await supabase
         .from('episodes')
         .select('*')
-        .order('targetDate', { ascending: true });
-      if (!error && data) return data as Episode[];
+        .order('episode_number', { ascending: true });
+      if (!error && data) {
+        const hydrated: Episode[] = [];
+        for (const row of data) {
+          let psRow: any = null;
+          try {
+            const { data: qPs } = await supabase
+              .from('pipeline_state')
+              .select('*')
+              .eq('episode_id', row.id)
+              .maybeSingle();
+            psRow = qPs;
+          } catch (e) {
+            // ignore table/column mismatches defensively
+          }
+
+          if (!psRow) {
+            const cachePath = path.join(DB_DIR, `state_${row.id}.json`);
+            if (fs.existsSync(cachePath)) {
+              try {
+                psRow = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+              } catch (err) {}
+            }
+          }
+          hydrated.push(mapDbRowToEpisode(row, psRow));
+        }
+        return hydrated;
+      }
       console.error('[DB] Supabase episodes fetch error, reading local file-safe fallback:', error);
     }
     const db = ensureLocalDbExists();
@@ -93,21 +147,92 @@ export class DB {
   }
 
   static async getEpisodeById(id: string): Promise<Episode | null> {
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    const parsedInt = parseInt(id, 10);
+    const isNumeric = !isNaN(parsedInt) && String(parsedInt) === String(id).trim();
+    
+    const fieldQueried = isUuid ? 'id' : (isNumeric ? 'episode_number' : 'id');
+    const valueQueried = isUuid ? id : (isNumeric ? parsedInt : id);
+
+    console.log(`[DB DEBUG] getEpisodeById received input: "${id}"`);
+    console.log(`[DB DEBUG] Treated as: ${isUuid ? 'UUID' : (isNumeric ? 'Numeric Episode Number' : 'Fallback/ID/UUID')}`);
+    console.log(`[DB DEBUG] Querying table: episodes, field: "${fieldQueried}", value: ${JSON.stringify(valueQueried)}`);
+
     if (supabase) {
-      const { data, error } = await supabase
-        .from('episodes')
-        .select('*')
-        .eq('id', id)
-        .maybeSingle();
-      if (!error && data) return data as Episode;
+      let query = supabase.from('episodes').select('*');
+      if (isUuid) {
+        query = query.eq('id', id);
+      } else if (isNumeric) {
+        query = query.eq('episode_number', valueQueried);
+      } else {
+        query = query.eq('id', id);
+      }
+
+      const { data: row, error: epErr } = await query.maybeSingle();
+      if (epErr) {
+        console.error(`[DB DEBUG] Supabase query error:`, epErr);
+      }
+      
+      console.log(`[DB DEBUG] Rows returned from Supabase:`, row ? 1 : 0);
+
+      if (!epErr && row) {
+        let psRow: any = null;
+        try {
+          const { data: qPs } = await supabase
+            .from('pipeline_state')
+            .select('*')
+            .eq('episode_id', row.id)
+            .maybeSingle();
+          psRow = qPs;
+        } catch (e) {}
+
+        if (!psRow) {
+          const cachePath = path.join(DB_DIR, `state_${row.id}.json`);
+          if (fs.existsSync(cachePath)) {
+            try {
+              psRow = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+            } catch (err) {}
+          }
+        }
+        return mapDbRowToEpisode(row, psRow);
+      }
+    } else {
+      console.log(`[DB DEBUG] Supabase client is not initialized, querying local DB file.`);
     }
+
     const db = ensureLocalDbExists();
-    return db.episodes.find((e) => e.id === id) || null;
+    let found = db.episodes.find((e) => e.id === id);
+    if (!found && isNumeric) {
+      found = db.episodes.find((e) => (e as any).episode_number === parsedInt) || db.episodes[parsedInt - 1] || null;
+    }
+    
+    console.log(`[DB DEBUG] Rows returned from local DB fallback:`, found ? 1 : 0);
+    return found || null;
   }
 
   static async createEpisode(episode: Omit<Episode, 'id' | 'createdAt' | 'updatedAt' | 'retryCount'>): Promise<Episode> {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
+    
+    let nextNum = 1;
+    if (supabase) {
+      try {
+        const { data } = await supabase
+          .from('episodes')
+          .select('episode_number')
+          .order('episode_number', { ascending: false })
+          .limit(1);
+        if (data && data[0] && typeof data[0].episode_number === 'number') {
+          nextNum = data[0].episode_number + 1;
+        }
+      } catch (e) {}
+    } else {
+      const db = ensureLocalDbExists();
+      if (db.episodes.length > 0) {
+        nextNum = db.episodes.length + 1;
+      }
+    }
+
     const newEpisode: Episode = {
       ...episode,
       id,
@@ -117,13 +242,40 @@ export class DB {
     };
 
     if (supabase) {
-      const { data, error } = await supabase
-        .from('episodes')
-        .insert([newEpisode])
-        .select()
-        .single();
-      if (!error && data) return data as Episode;
-      console.error('[DB] Supabase insert failed, logging locally as primary runtime state:', error);
+      try {
+        const epData = {
+          id,
+          episode_number: nextNum,
+          status: 'pending',
+          title: episode.title,
+          video_path: episode.finalVideoUrl || null,
+          youtube_video_id: episode.youtubeId || null,
+          published_at: episode.targetDate || now,
+        };
+
+        const { data, error } = await supabase
+          .from('episodes')
+          .insert([epData])
+          .select()
+          .single();
+
+        if (!error && data) {
+          try {
+            await supabase.from('pipeline_state').insert([{
+              episode_id: id,
+              script: episode.script,
+              voice_name: episode.voiceName || 'Kore',
+              visual_briefs: episode.visualBriefs || [],
+              narration_audio_url: episode.narrationAudioUrl || null,
+              final_video_url: episode.finalVideoUrl || null,
+            }]);
+          } catch (psErr) {}
+          return mapDbRowToEpisode(data);
+        }
+        console.error('[DB] Supabase insert failed, logging locally:', error);
+      } catch (e) {
+        console.error('[DB] Supabase insert error:', e);
+      }
     }
 
     const db = ensureLocalDbExists();
@@ -135,23 +287,111 @@ export class DB {
   static async updateEpisode(id: string, updates: Partial<Episode>): Promise<Episode> {
     const now = new Date().toISOString();
     
+    let realUuid = id;
+    let originalEpisode: Episode | null = null;
+    
     if (supabase) {
-      const { data, error } = await supabase
+      originalEpisode = await this.getEpisodeById(id);
+      if (originalEpisode) {
+        realUuid = originalEpisode.id;
+      }
+    }
+
+    if (supabase && originalEpisode) {
+      const epUpdates: any = {
+        updated_at: now,
+      };
+
+      if (updates.status !== undefined) epUpdates.status = updates.status;
+      if (updates.title !== undefined) epUpdates.title = updates.title;
+      if (updates.finalVideoUrl !== undefined) epUpdates.video_path = updates.finalVideoUrl;
+      if (updates.visualBriefs && updates.visualBriefs.length > 0) {
+        epUpdates.thumbnail_path = updates.visualBriefs[0].assetUrl || null;
+      }
+      if (updates.youtubeId !== undefined) {
+        epUpdates.youtube_video_id = updates.youtubeId;
+        epUpdates.youtube_url = `https://youtube.com/watch?v=${updates.youtubeId}`;
+      }
+      if (updates.youtubePublishDate !== undefined) epUpdates.published_at = updates.youtubePublishDate;
+      if (updates.errorLog !== undefined) {
+        epUpdates.error_message = updates.errorLog;
+        epUpdates.error_tracker = updates.errorLog?.slice(0, 200) || null;
+      }
+
+      const { data: epData, error: epErr } = await supabase
         .from('episodes')
-        .update({ ...updates, updatedAt: now })
-        .eq('id', id)
+        .update(epUpdates)
+        .eq('id', realUuid)
         .select()
         .single();
-      if (!error && data) return data as Episode;
-      console.error('[DB] Supabase update failed, tracking state changes in local file-store.', error);
+      
+      if (epErr) {
+        console.error('[DB] Supabase primary episodes table update failed:', epErr);
+      }
+
+      const psUpdates: any = {};
+      if (updates.script !== undefined) psUpdates.script = updates.script;
+      if (updates.voiceName !== undefined) psUpdates.voice_name = updates.voiceName;
+      if (updates.visualBriefs !== undefined) psUpdates.visual_briefs = updates.visualBriefs;
+      if (updates.narrationAudioUrl !== undefined) psUpdates.narration_audio_url = updates.narrationAudioUrl;
+      if (updates.finalVideoUrl !== undefined) psUpdates.final_video_url = updates.finalVideoUrl;
+
+      let psRow: any = null;
+      if (Object.keys(psUpdates).length > 0) {
+        try {
+          const { data: existingPs } = await supabase
+            .from('pipeline_state')
+            .select('*')
+            .eq('episode_id', realUuid)
+            .maybeSingle();
+
+          if (existingPs) {
+            const { data: updatedPs } = await supabase
+              .from('pipeline_state')
+              .update(psUpdates)
+              .eq('episode_id', realUuid)
+              .select()
+              .single();
+            psRow = updatedPs;
+          } else {
+            const { data: insertedPs } = await supabase
+              .from('pipeline_state')
+              .insert([{ episode_id: realUuid, ...psUpdates }])
+              .select()
+              .single();
+            psRow = insertedPs;
+          }
+        } catch (e: any) {
+          console.warn('[DB] Supabase pipeline_state write failed, relying on local cache:', e?.message);
+        }
+
+        try {
+          const localCachePath = path.join(DB_DIR, `state_${realUuid}.json`);
+          let cachedState: any = {};
+          if (fs.existsSync(localCachePath)) {
+            try { cachedState = JSON.parse(fs.readFileSync(localCachePath, 'utf8')); } catch (e) {}
+          }
+          const finalCachedState = { ...cachedState, ...psUpdates };
+          fs.writeFileSync(localCachePath, JSON.stringify(finalCachedState, null, 2), 'utf8');
+          if (!psRow) {
+            psRow = finalCachedState;
+          }
+        } catch (err) {
+          console.error('[DB] Failed saving local cache file:', err);
+        }
+      }
+
+      if (epData) {
+        return mapDbRowToEpisode(epData, psRow);
+      }
     }
 
     const db = ensureLocalDbExists();
-    const index = db.episodes.findIndex((e) => e.id === id);
+    const index = db.episodes.findIndex((e) => e.id === realUuid);
     if (index === -1) {
-      throw new Error(`Episode with id ${id} not found to perform state transition.`);
+      throw new Error(`Episode with target ID/number "${id}" not found.`);
     }
-    
+
     db.episodes[index] = {
       ...db.episodes[index],
       ...updates,
@@ -164,6 +404,9 @@ export class DB {
   static async deleteEpisode(id: string): Promise<boolean> {
     if (supabase) {
       const { error } = await supabase.from('episodes').delete().eq('id', id);
+      try {
+        await supabase.from('pipeline_state').delete().eq('episode_id', id);
+      } catch (e) {}
       if (!error) return true;
     }
     const db = ensureLocalDbExists();
@@ -203,8 +446,8 @@ export class DB {
     console.log(`[PIPELINE][${stage?.toUpperCase()}][${type.toUpperCase()}] ${message}`);
 
     if (supabase) {
-      const { data, error } = await supabase.from('pipeline_logs').insert([newLog]).select().single();
-      if (!error && data) return data as PipelineLog;
+      const { error } = await supabase.from('pipeline_logs').insert([newLog]);
+      if (!error) return newLog;
     }
 
     const db = ensureLocalDbExists();
