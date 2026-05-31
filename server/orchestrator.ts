@@ -26,31 +26,44 @@ export class PipelineOrchestrator {
   }
 
   /**
-   * Triggers the continuous pipeline run for a specific episode.
+   * Main entrypoint triggered by either human dispatcher or autonomous schedule event loops.
    * Leverages checkpoint metadata to resume directly from the failed or initial state.
    */
-  static async runEpisode(episodeId: string): Promise<void> {
+  static async runEpisode(inputEpisodeId: string): Promise<void> {
     if (this.isProcessingActive) {
       throw new Error(`Pipeline active: Episode ${this.activeProcessingId} is currently holding the render thread.`);
     }
 
-    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(episodeId);
-    const parsedInt = parseInt(episodeId, 10);
-    const isNumeric = !isNaN(parsedInt) && String(parsedInt) === String(episodeId).trim();
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(inputEpisodeId);
+    const parsedInt = parseInt(inputEpisodeId, 10);
+    const isNumeric = !isNaN(parsedInt) && String(parsedInt) === String(inputEpisodeId).trim();
     const fieldQueried = isUuid ? 'id' : (isNumeric ? 'episode_number' : 'id');
-    const valueQueried = isUuid ? episodeId : (isNumeric ? parsedInt : episodeId);
+    const valueQueried = isUuid ? inputEpisodeId : (isNumeric ? parsedInt : inputEpisodeId);
 
-    const episode = await DB.getEpisodeById(episodeId);
+    const episode = await DB.getEpisodeById(inputEpisodeId);
     if (!episode) {
       throw new Error(`Episode not found. Queried table=episodes, field=${fieldQueried}, value=${valueQueried}`);
     }
 
+    const episodeId = episode.id;
     this.activeProcessingId = episodeId;
     this.isProcessingActive = true;
     this.progressAmount = 10;
 
     try {
       await DB.log(episodeId, 'scheduler', 'info', `Acquired active processor lock. Status: ${episode.status}`);
+
+      // 0. SELF-HEALING ASSET VERIFICATION (For fresh container instances / CI runners)
+      // Check if we are in a late rendering/publishing state but previous assets are missing locally.
+      if (episode.status === 'rendering' || episode.status === 'publishing') {
+        const expectedVideoFile = path.join(process.cwd(), 'data', 'renders', `${episodeId}_final.mp4`);
+        const fs = await import('fs');
+        if (!fs.existsSync(expectedVideoFile)) {
+          await DB.log(episodeId, 'scheduler', 'warn', `Expected local video file missing at ${expectedVideoFile}. Forcing pipeline state reset to "planned" for fresh regeneration.`);
+          episode.status = 'planned'; // This mutates the local memory copy so current run executes correctly!
+          await DB.updateEpisode(episodeId, { status: 'planned' });
+        }
+      }
 
       // 1. STAGE: scripting
       if (episode.status === 'planned' || episode.status === 'scripting') {
@@ -84,96 +97,87 @@ export class PipelineOrchestrator {
           items: {
             type: Type.OBJECT,
             properties: {
-              timestamp: { type: Type.STRING, description: 'Format 0:00' },
-              duration: { type: Type.NUMBER, description: 'Seconds to show this slide frame' },
-              prompt: { type: Type.STRING, description: 'Highly descriptive prompt to generate custom beautiful illustrations for the narrator slide.' },
-              caption: { type: Type.STRING, description: 'Title or textual caption overlays' },
+              prompt: { type: Type.STRING, description: 'Descriptive, visual illustration prompt suited for image generation pipelines' },
+              narrativeChunk: { type: Type.STRING, description: 'Subsegment sentence verbatim matching narration script.' },
+              duration: { type: Type.INTEGER, description: 'Duration of the visual frame clip segment in seconds.' },
             },
-            required: ['timestamp', 'duration', 'prompt', 'caption'],
+            required: ['prompt', 'narrativeChunk', 'duration'],
           },
         };
 
-        const listPrompt = `Review this video script: "${episode.script || ''}". Segment this script into a logical timeline sequence composed of 2 to 4 visual frames. For every frame, write a distinct timestamp, duration in seconds, descriptive prompt to generate custom beautiful illustration frames, and an elegant caption overlay.`;
-        const visualBriefsRaw = await GeminiService.generateJSON<VisualSegment[]>(
-          listPrompt,
+        const plannerSystemInstruction = 'You are an experienced YouTube storyboarding and director interface that formats outputs strictly matching JSON schema.';
+        const plannerPrompt = `Given this script narrative: "${episode.script}". Analyze the contents and break them down into 3-5 visual sequential storyboard segments. Formulate descriptive image prompts for each.`;
+
+        const storyboardResponse = await GeminiService.generateStructuredJson(
+          plannerPrompt,
           storyboardSchema,
-          'You are a senior Hollywood digital visual effects and storyboard director.',
+          plannerSystemInstruction,
           episodeId
         );
 
-        // Populate and save visual frames array to segment
-        await DB.updateEpisode(episodeId, { visualBriefs: visualBriefsRaw });
+        const visualBriefsWithoutUrls = Array.isArray(storyboardResponse) ? storyboardResponse : [];
+        await DB.log(episodeId, 'asset_generation', 'info', 'Compiled storyboard schema structure. Querying Gemini Image models for illustrating actual production assets...');
         
-        this.currentStepLabel = 'Synthesizing original frame slides...';
-        this.progressAmount = 50;
+        const visualBriefs = await VideoAssemblyEngine.generateVisualAssets(episodeId, visualBriefsWithoutUrls);
         
-        // Generate real visual images using Gemini Image generator
-        const readyVisualSegments = await VideoAssemblyEngine.generateVisualAssets(episodeId, visualBriefsRaw);
+        await DB.updateEpisode(episodeId, { visualBriefs, status: 'rendering' });
+        await DB.log(episodeId, 'asset_generation', 'success', 'All visual frames and asset files have been illustrated and cached locally.');
         
-        await DB.updateEpisode(episodeId, { 
-          visualBriefs: readyVisualSegments,
-          status: 'rendering'
-        });
-        await DB.log(episodeId, 'asset_generation', 'success', `Storyboard mapping completed. Compiling ${readyVisualSegments.length} slides.`);
-        
-        episode.visualBriefs = readyVisualSegments;
+        // Reload episode variables for consistent checkpoints
+        episode.visualBriefs = visualBriefs;
         episode.status = 'rendering';
       }
 
       // 3. STAGE: rendering
       if (episode.status === 'rendering') {
-        this.currentStepLabel = 'Assembling multimedia audio narration...';
-        this.progressAmount = 70;
-        await DB.log(episodeId, 'rendering', 'info', 'Commencing final render assembly processing.');
+        this.currentStepLabel = 'Assembling and synthesizing video output...';
+        this.progressAmount = 60;
+        await DB.log(episodeId, 'rendering', 'info', `Executing text-to-speech audio loop for voice config: ${episode.voiceName || 'Kore'}`);
 
-        // Synthesize high-quality vocal audio file
-        const audioUrl = await VideoAssemblyEngine.synthesizeNarration(episodeId, episode.script || '', episode.voiceName);
-        
-        this.currentStepLabel = 'Enforcing brand overlays and outro concats...';
-        this.progressAmount = 85;
+        const narrationUrl = await VideoAssemblyEngine.synthesizeNarration(episodeId, episode.script || '', episode.voiceName);
+        episode.narrationAudioUrl = narrationUrl;
 
-        const updatedEpisode = await DB.getEpisodeById(episodeId);
-        const videoUrl = await VideoAssemblyEngine.compileFinalVideo(updatedEpisode || episode);
+        await DB.log(episodeId, 'rendering', 'info', 'Finished compiling vocals. Blending branding watermarks and creating final mp4 wrappers...');
+        const finalVideoUrl = await VideoAssemblyEngine.compileFinalVideo(episode);
 
         await DB.updateEpisode(episodeId, {
-          narrationAudioUrl: audioUrl,
-          finalVideoUrl: videoUrl,
-          status: 'publishing'
+          narrationAudioUrl: narrationUrl,
+          finalVideoUrl: finalVideoUrl,
+          status: 'publishing',
         });
-        await DB.log(episodeId, 'rendering', 'success', 'Final publication-ready presentation compilation successfully complete.');
-        
-        episode.narrationAudioUrl = audioUrl;
-        episode.finalVideoUrl = videoUrl;
+        await DB.log(episodeId, 'rendering', 'success', `Video render pipeline completed successfully! Saved to playable path: ${finalVideoUrl}`);
+
+        episode.finalVideoUrl = finalVideoUrl;
         episode.status = 'publishing';
       }
 
       // 4. STAGE: publishing
       if (episode.status === 'publishing') {
-        this.currentStepLabel = 'Publishing video stream to YouTube...';
-        this.progressAmount = 95;
+        this.currentStepLabel = 'Pushing final video to official unlisted YouTube channel...';
+        this.progressAmount = 85;
         await DB.log(episodeId, 'publishing', 'info', 'Pushing final video to official unlisted YouTube channel queue.');
 
         const filePath = path.join(process.cwd(), 'data', 'renders', `${episodeId}_final.mp4`);
-        const result = await YouTubeService.uploadVideo({
+        const responseYt = await YouTubeService.uploadVideo({
           episodeId,
           filePath,
-          title: episode.title,
-          description: `Automatically compiled episode of ${episode.title}\nTopic: ${episode.topic}\n\nProduced with state-of-the-art YouTube Automation Pipelines.`,
-          tags: ['automated', 'ai-generated', episode.topic.toLowerCase().replace(/\s+/g, '-')],
-          privacyStatus: 'unlisted', // default unlisted for checking pipeline outputs
+          title: episode.title || 'Qeema YouTube Platform Output',
+          description: `Educational production about: ${episode.topic}.\n\nAutomatically designed and engineered by Qeema Autonomous Agent pipelines.`,
+          tags: ['Islamic', 'Qeema', 'AI', 'Automation', 'Islamic Video Generator'],
+          privacyStatus: 'unlisted', // default to unlisted queue for safety reviews
         });
 
         await DB.updateEpisode(episodeId, {
-          status: 'completed',
-          youtubeId: result.videoId,
-          youtubeStatus: 'uploaded',
+          youtubeId: responseYt.videoId,
           youtubePublishDate: new Date().toISOString(),
+          status: 'completed',
         });
-        await DB.log(episodeId, 'publishing', 'success', `Automation run fully successful. Private Video URL: https://youtube.com/watch?v=${result.videoId}`);
+
+        this.progressAmount = 100;
+        this.currentStepLabel = 'completed';
+        await DB.log(episodeId, 'publishing', 'success', `Fully finalized YouTube Automation Pipeline run for target ID ${episodeId}! Finished Stage.`);
       }
 
-      this.progressAmount = 100;
-      this.currentStepLabel = 'Episode published!';
     } catch (error: any) {
       const errMsg = error?.message || String(error);
       console.error(`[PIPELINE][CRITICAL-FAILURE] Episode ${episodeId} crashed:`, error);
@@ -187,43 +191,48 @@ export class PipelineOrchestrator {
         retryCount: newRetries,
       });
 
-      await DB.log(episodeId, 'scheduler', 'error', `Pipeline execution critically aborted: ${errMsg}. Execution metric updated. Retry count: ${newRetries}.`);
-      this.currentStepLabel = `Aborted: ${errMsg}`;
+      this.currentStepLabel = 'failed';
     } finally {
-      this.activeProcessingId = null;
       this.isProcessingActive = false;
+      this.activeProcessingId = null;
     }
   }
 
   /**
-   * Safe automation scheduler that acts to sustain 7 videos per month.
-   * Auto-selects planned/running episodes, recovering robustly.
+   * Batch execution checker periodically polled on schedule triggers.
    */
   static async triggerPeriodicBatchCron(): Promise<void> {
-    console.log('[PIPELINE-METRICS] Weekly operational schedule check triggered.');
+    console.log('[PIPELINE][CRON] Triggered periodic batch cron checking for pending/failed schedules.');
     const episodes = await DB.getEpisodes();
+    const activeRunning = episodes.find((e) => e.status !== 'completed' && e.status !== 'failed' && e.status !== 'planned');
     
-    // Look for any active 'failed' or state-locked pipeline items to resume on, safely.
-    const resumable = episodes.find(e => e.status === 'failed' && e.retryCount < 3);
-    if (resumable) {
-      console.log(`[PIPELINE-METRICS] Found rescuable episode: "${resumable.title}" (Retry ${resumable.retryCount}). Auto-resuming execution...`);
-      // Run async
-      this.runEpisode(resumable.id).catch(err => {
-        console.error('[CRON] Automated rescue runner crashed:', err);
-      });
+    if (activeRunning) {
+      console.log(`[PIPELINE][CRON] Scheduled runner bypassed. Active job ID ${activeRunning.id} is currently running at status: "${activeRunning.status}".`);
       return;
     }
 
-    // Otherwise, discover next planned episode and process it.
-    const nextPlanned = episodes.find(e => e.status === 'planned');
-    if (nextPlanned) {
-      console.log(`[PIPELINE-METRICS] Processing scheduled release: "${nextPlanned.title}"`);
-      this.runEpisode(nextPlanned.id).catch(err => {
-        console.error('[CRON] Automated releasing runner crashed:', err);
-      });
+    // Process the highest priority failed episode (with under 3 retries) or next pending planned episode
+    const candidates = episodes.filter((e) => {
+      if (e.status === 'planned') return true;
+      if (e.status === 'failed' && (e.retryCount || 0) < 3) return true;
+      return false;
+    });
+
+    if (candidates.length === 0) {
+      console.log('[PIPELINE][CRON] No executable episodes require scheduling at this interval.');
       return;
     }
 
-    console.log('[PIPELINE-METRICS] All video channels currently up-to-date. Idling safely.');
+    // Sort by status failed (retry first) then planned
+    candidates.sort((a, b) => {
+      if (a.status === 'failed' && b.status !== 'failed') return -1;
+      if (a.status !== 'failed' && b.status === 'failed') return 1;
+      return 0;
+    });
+
+    const targetJob = candidates[0];
+    console.log(`[PIPELINE][CRON] Selected target Job ID ${targetJob.id} (Status: ${targetJob.status}, Retries: ${targetJob.retryCount || 0}) for immediate pipeline batch run.`);
+    
+    await this.runEpisode(targetJob.id);
   }
 }
