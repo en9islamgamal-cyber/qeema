@@ -34,9 +34,15 @@ export class PipelineOrchestrator {
       throw new Error(`Pipeline active: Episode ${this.activeProcessingId} is currently holding the render thread.`);
     }
 
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(episodeId);
+    const parsedInt = parseInt(episodeId, 10);
+    const isNumeric = !isNaN(parsedInt) && String(parsedInt) === String(episodeId).trim();
+    const fieldQueried = isUuid ? 'id' : (isNumeric ? 'episode_number' : 'id');
+    const valueQueried = isUuid ? episodeId : (isNumeric ? parsedInt : episodeId);
+
     const episode = await DB.getEpisodeById(episodeId);
     if (!episode) {
-      throw new Error(`Target automation episode ${episodeId} not found in the manifest db.`);
+      throw new Error(`Episode not found. Queried table=episodes, field=${fieldQueried}, value=${valueQueried}`);
     }
 
     this.activeProcessingId = episodeId;
