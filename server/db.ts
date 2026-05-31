@@ -11,6 +11,20 @@ import { Episode, PipelineLog, EpisodeStatus } from '../src/types.ts';
 const DB_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DB_DIR, 'db.json');
 
+// Polyfill WebSocket for Node.js < 22 where globalThis.WebSocket is not defined,
+// to prevent Supabase Realtime client instantiation from throwing an error.
+if (typeof globalThis.WebSocket === 'undefined') {
+  (globalThis as any).WebSocket = class MockWebSocket {
+    static CLOSED = 3;
+    static CLOSING = 2;
+    static CONNECTING = 0;
+    static OPEN = 1;
+    constructor() {
+      throw new Error('Supabase Realtime WebSockets are not initialized in this environment.');
+    }
+  };
+}
+
 // Initialize Supabase if variables are configured
 let supabase: SupabaseClient | null = null;
 const supabaseUrl = process.env.SUPABASE_URL || '';
