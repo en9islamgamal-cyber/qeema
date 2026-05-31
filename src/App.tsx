@@ -98,13 +98,13 @@ export default function App() {
 
     // 3. Fetch Keys
     try {
-      const keyRes = await fetch('/api/keys');
+      const keyRes = await fetch('/api/keymetrics');
       const contentType = keyRes.headers.get('content-type') || '';
       if (!keyRes.ok) {
-        console.warn(`[FRONTEND] /api/keys returned status ${keyRes.status}`);
+        console.warn(`[FRONTEND] /api/keymetrics returned status ${keyRes.status}`);
       } else if (!contentType.includes('application/json')) {
         const text = await keyRes.text();
-        console.error(`[FRONTEND] Expected JSON from /api/keys but received: "${contentType}". Body preview: ${text.slice(0, 100)}`);
+        console.error(`[FRONTEND] Expected JSON from /api/keymetrics but received: "${contentType}". Body preview: ${text.slice(0, 100)}`);
       } else {
         const keyData = await keyRes.json();
         if (Array.isArray(keyData)) setKeys(keyData);
@@ -216,7 +216,7 @@ export default function App() {
   // Recover rotation keys
   const triggerResetKeysPool = async () => {
     try {
-      const res = await fetch('/api/keys/reset', { method: 'POST' });
+      const res = await fetch('/api/keymetrics/reset', { method: 'POST' });
       if (res.ok) {
         await reloadAll();
         alert('All Gemini quota flags successfully reset and re-synchronized.');
@@ -319,14 +319,14 @@ export default function App() {
       {/* DASHBOARD STATISTICS HERO */}
       <section className="px-6 pt-6 grid grid-cols-2 md:grid-cols-5 gap-4">
         <div className="bg-slate-900/40 border border-slate-900 rounded-xl p-4 flex flex-col justify-between hover:border-slate-800 transition">
-          <span className="text-xs text-slate-400 font-medium">Monthly Releases Target</span>
+          <span className="text-xs text-slate-400 font-medium font-mono">Monthly Releases Target</span>
           <div className="mt-2 flex items-baseline gap-2">
             <span className="text-2xl font-bold font-mono text-purple-400">7</span>
             <span className="text-xs text-slate-500 font-mono">slots slated</span>
           </div>
         </div>
         <div className="bg-slate-900/40 border border-slate-900 rounded-xl p-4 flex flex-col justify-between hover:border-slate-800 transition">
-          <span className="text-xs text-slate-400 font-medium">Total Campaign Episodes</span>
+          <span className="text-xs text-slate-400 font-medium font-mono font-mono">Total Campaign Episodes</span>
           <div className="mt-2 flex items-baseline gap-2">
             <span className="text-2xl font-bold font-mono text-white">{totalEpisodesSeeded}</span>
             <span className="text-xs text-slate-500">managed</span>
@@ -346,11 +346,11 @@ export default function App() {
             <span className="text-xs text-slate-500">active thread</span>
           </div>
         </div>
-        <div className="col-span-2 md:col-span-1 bg-gradient-to-br from-purple-950/20 to-slate-900 border border-purple-900/20 rounded-xl p-4 flex flex-col justify-between">
-          <span className="text-xs text-purple-300 font-medium">Quick Seed Campaign</span>
+        <div className="col-span-2 md:col-span-1 bg-gradient-to-br from-purple-950/20 to-slate-900 border border-purple-900/20 rounded-xl p-4 flex flex-col justify-between font-mono">
+          <span className="text-xs text-purple-300 font-medium font-mono">Quick Seed Campaign</span>
           <button
             onClick={triggerCampaignSeed}
-            className="mt-2 py-1.5 px-3 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center justify-center gap-1.5 transition active:scale-95"
+            className="mt-2 py-1.5 px-3 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center justify-center gap-1.5 transition active:scale-95 font-mono"
           >
             <Sparkles className="w-4 h-4" />
             Seed 7 Releases
@@ -491,7 +491,7 @@ export default function App() {
                           }}
                           className="py-1 px-2.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-[10px] font-semibold flex items-center gap-1 active:scale-95"
                         >
-                          <Play className="w-3 h-3 fill-current" />
+                          <Play className="w-3 h-3 fill-current animate-pulse ml-0.5" />
                           Launch
                         </button>
                       )}
@@ -629,7 +629,7 @@ export default function App() {
                       className="w-8 h-8 rounded-full bg-purple-600 flex items-center justify-center text-white font-bold hover:bg-purple-500 active:scale-95 disabled:bg-slate-800 disabled:text-slate-500"
                     >
                       {isPlaying ? (
-                        <span className="w-2.5 h-2.5 bg-white rounded-sm block"></span>
+                        <span className="w-2.5 h-2.5 bg-white rounded-sm block font-mono"></span>
                       ) : (
                         <Play className="w-3.5 h-3.5 fill-current ml-0.5" />
                       )}
@@ -758,7 +758,7 @@ export default function App() {
             </h3>
             <button
               onClick={triggerResetKeysPool}
-              className="text-[10px] text-purple-400 hover:text-purple-300 font-medium flex items-center gap-1"
+              className="text-[10px] text-purple-400 hover:text-purple-300 font-medium flex items-center gap-1 font-mono"
             >
               <ListRestart className="w-3.5 h-3.5" />
               Reset Pool Statuses
@@ -768,8 +768,8 @@ export default function App() {
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             {keys.map((k) => (
               <div key={k.id} className="bg-slate-900/40 border border-slate-900 rounded-lg p-2.5 flex flex-col justify-between gap-1.5">
-                <div className="flex justify-between items-start">
-                  <span className="font-semibold text-slate-200">{k.id === 'KeyA' ? 'Primary Key' : k.id === 'KeyB' ? 'Backup Key B' : 'Sandbox Key C'}</span>
+                <div className="flex justify-between items-start font-mono">
+                  <span className="font-semibold text-slate-200 font-mono">{k.id === 'KeyA' ? 'Primary Key' : k.id === 'KeyB' ? 'Backup Key B' : 'Sandbox Key C'}</span>
                   <span
                     className={`text-[9px] font-mono px-1.5 py-0.2 rounded font-bold ${
                       k.status === 'active'
