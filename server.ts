@@ -124,7 +124,7 @@ app.post('/api/pipeline/run', async (req, res) => {
 });
 
 // Key Pool diagnostics
-app.get('/api/keys', async (req, res) => {
+app.get('/api/keymetrics', async (req, res) => {
   try {
     const keys = ['KeyA', 'KeyB', 'KeyC'];
     const results = [];
@@ -148,7 +148,7 @@ app.get('/api/keys', async (req, res) => {
 });
 
 // Re-evaluate key pools
-app.post('/api/keys/reset', async (req, res) => {
+app.post('/api/keymetrics/reset', async (req, res) => {
   try {
     await DB.makeKeyActive('KeyA');
     await DB.makeKeyActive('KeyB');
