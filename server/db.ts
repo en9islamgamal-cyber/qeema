@@ -305,9 +305,13 @@ export class DB {
     let originalEpisode: Episode | null = null;
     
     if (supabase) {
-      originalEpisode = await this.getEpisodeById(id);
-      if (originalEpisode) {
-        realUuid = originalEpisode.id;
+      try {
+        originalEpisode = await this.getEpisodeById(id);
+        if (originalEpisode) {
+          realUuid = originalEpisode.id;
+        }
+      } catch (e) {
+        console.warn('[DB] Failed to pre-fetch original episode:', e);
       }
     }
 
@@ -329,81 +333,93 @@ export class DB {
       if (updates.youtubePublishDate !== undefined) epUpdates.published_at = updates.youtubePublishDate;
       if (updates.errorLog !== undefined) {
         epUpdates.error_message = updates.errorLog;
-        epUpdates.error_tracker = updates.errorLog?.slice(0, 200) || null;
+      }
+      if (updates.retryCount !== undefined) {
+        epUpdates.retry_count = updates.retryCount;
       }
 
-      const { data: epData, error: epErr } = await supabase
-        .from('episodes')
-        .update(epUpdates)
-        .eq('id', realUuid)
-        .select()
-        .single();
-      
-      if (epErr) {
-        console.error('[DB] Supabase primary episodes table update failed:', epErr);
-      }
+      try {
+        const { data: epData, error: epErr } = await supabase
+          .from('episodes')
+          .update(epUpdates)
+          .eq('id', realUuid)
+          .select()
+          .maybeSingle();
+        
+        if (epErr) {
+          console.error('[DB] Supabase primary episodes table update failed, falling back gracefully:', epErr);
+        } else if (epData) {
+          const psUpdates: any = {};
+          if (updates.script !== undefined) psUpdates.script = updates.script;
+          if (updates.voiceName !== undefined) psUpdates.voice_name = updates.voiceName;
+          if (updates.visualBriefs !== undefined) psUpdates.visual_briefs = updates.visualBriefs;
+          if (updates.narrationAudioUrl !== undefined) psUpdates.narration_audio_url = updates.narrationAudioUrl;
+          if (updates.finalVideoUrl !== undefined) psUpdates.final_video_url = updates.finalVideoUrl;
 
-      const psUpdates: any = {};
-      if (updates.script !== undefined) psUpdates.script = updates.script;
-      if (updates.voiceName !== undefined) psUpdates.voice_name = updates.voiceName;
-      if (updates.visualBriefs !== undefined) psUpdates.visual_briefs = updates.visualBriefs;
-      if (updates.narrationAudioUrl !== undefined) psUpdates.narration_audio_url = updates.narrationAudioUrl;
-      if (updates.finalVideoUrl !== undefined) psUpdates.final_video_url = updates.finalVideoUrl;
+          let psRow: any = null;
+          if (Object.keys(psUpdates).length > 0) {
+            try {
+              const { data: existingPs } = await supabase
+                .from('pipeline_state')
+                .select('*')
+                .eq('episode_id', realUuid)
+                .maybeSingle();
 
-      let psRow: any = null;
-      if (Object.keys(psUpdates).length > 0) {
-        try {
-          const { data: existingPs } = await supabase
-            .from('pipeline_state')
-            .select('*')
-            .eq('episode_id', realUuid)
-            .maybeSingle();
+              if (existingPs) {
+                const { data: updatedPs } = await supabase
+                  .from('pipeline_state')
+                  .update(psUpdates)
+                  .eq('episode_id', realUuid)
+                  .select()
+                  .single();
+                psRow = updatedPs;
+              } else {
+                const { data: insertedPs } = await supabase
+                  .from('pipeline_state')
+                  .insert([{ episode_id: realUuid, ...psUpdates }])
+                  .select()
+                  .single();
+                psRow = insertedPs;
+              }
+            } catch (e: any) {
+              console.warn('[DB] Supabase pipeline_state write failed, relying on local cache:', e?.message);
+            }
 
-          if (existingPs) {
-            const { data: updatedPs } = await supabase
-              .from('pipeline_state')
-              .update(psUpdates)
-              .eq('episode_id', realUuid)
-              .select()
-              .single();
-            psRow = updatedPs;
-          } else {
-            const { data: insertedPs } = await supabase
-              .from('pipeline_state')
-              .insert([{ episode_id: realUuid, ...psUpdates }])
-              .select()
-              .single();
-            psRow = insertedPs;
+            try {
+              const localCachePath = path.join(DB_DIR, `state_${realUuid}.json`);
+              let cachedState: any = {};
+              if (fs.existsSync(localCachePath)) {
+                try { cachedState = JSON.parse(fs.readFileSync(localCachePath, 'utf8')); } catch (e) {}
+              }
+              const finalCachedState = { ...cachedState, ...psUpdates };
+              fs.writeFileSync(localCachePath, JSON.stringify(finalCachedState, null, 2), 'utf8');
+              if (!psRow) {
+                psRow = finalCachedState;
+              }
+            } catch (err) {
+              console.error('[DB] Failed saving local cache file:', err);
+            }
           }
-        } catch (e: any) {
-          console.warn('[DB] Supabase pipeline_state write failed, relying on local cache:', e?.message);
+
+          return mapDbRowToEpisode(epData, psRow);
         }
-
-        try {
-          const localCachePath = path.join(DB_DIR, `state_${realUuid}.json`);
-          let cachedState: any = {};
-          if (fs.existsSync(localCachePath)) {
-            try { cachedState = JSON.parse(fs.readFileSync(localCachePath, 'utf8')); } catch (e) {}
-          }
-          const finalCachedState = { ...cachedState, ...psUpdates };
-          fs.writeFileSync(localCachePath, JSON.stringify(finalCachedState, null, 2), 'utf8');
-          if (!psRow) {
-            psRow = finalCachedState;
-          }
-        } catch (err) {
-          console.error('[DB] Failed saving local cache file:', err);
-        }
-      }
-
-      if (epData) {
-        return mapDbRowToEpisode(epData, psRow);
+      } catch (err) {
+        console.error('[DB] Supabase primary episodes update exception encountered:', err);
       }
     }
 
+    // LOCAL PERSISTENCE AUTOSYNC FALLBACK
     const db = ensureLocalDbExists();
-    const index = db.episodes.findIndex((e) => e.id === realUuid);
+    let index = db.episodes.findIndex((e) => e.id === realUuid);
+    
     if (index === -1) {
-      throw new Error(`Episode with target ID/number "${id}" not found.`);
+      if (originalEpisode) {
+        console.log(`[DB] Seeding original episode ${realUuid} to offline local fallback DB.`);
+        db.episodes.push(originalEpisode);
+        index = db.episodes.length - 1;
+      } else {
+        throw new Error(`Episode with target ID/number "${id}" not found.`);
+      }
     }
 
     db.episodes[index] = {
