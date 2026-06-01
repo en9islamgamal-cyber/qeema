@@ -142,14 +142,15 @@ export class DB {
             // ignore table/column mismatches defensively
           }
 
-          if (!psRow) {
-            const cachePath = path.join(DB_DIR, `state_${row.id}.json`);
-            if (fs.existsSync(cachePath)) {
-              try {
-                psRow = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
-              } catch (err) {}
-            }
+          // ALWAYS merge with local cache if it exists, to preserve local-only fields (e.g. retryCount, or temporary paths)
+          const cachePath = path.join(DB_DIR, `state_${row.id}.json`);
+          let localCache: any = {};
+          if (fs.existsSync(cachePath)) {
+            try {
+              localCache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+            } catch (err) {}
           }
+          psRow = { ...localCache, ...psRow };
           hydrated.push(mapDbRowToEpisode(row, psRow));
         }
         return hydrated;
@@ -200,14 +201,15 @@ export class DB {
           psRow = qPs;
         } catch (e) {}
 
-        if (!psRow) {
-          const cachePath = path.join(DB_DIR, `state_${row.id}.json`);
-          if (fs.existsSync(cachePath)) {
-            try {
-              psRow = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
-            } catch (err) {}
-          }
+        // ALWAYS merge with local cache if it exists, to preserve local-only fields (e.g. retryCount, or temporary paths)
+        const cachePath = path.join(DB_DIR, `state_${row.id}.json`);
+        let localCache: any = {};
+        if (fs.existsSync(cachePath)) {
+          try {
+            localCache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+          } catch (err) {}
         }
+        psRow = { ...localCache, ...psRow };
         return mapDbRowToEpisode(row, psRow);
       }
     } else {
@@ -267,13 +269,11 @@ export class DB {
           published_at: episode.targetDate || now,
         };
 
-        const { data, error } = await supabase
+        const { error } = await supabase
           .from('episodes')
-          .insert([epData])
-          .select()
-          .single();
+          .insert([epData]);
 
-        if (!error && data) {
+        if (!error) {
           try {
             await supabase.from('pipeline_state').insert([{
               episode_id: id,
@@ -284,7 +284,8 @@ export class DB {
               final_video_url: episode.finalVideoUrl || null,
             }]);
           } catch (psErr) {}
-          return mapDbRowToEpisode(data);
+          const created = await this.getEpisodeById(id);
+          if (created) return created;
         }
         console.error('[DB] Supabase insert failed, logging locally:', error);
       } catch (e) {
@@ -334,21 +335,16 @@ export class DB {
       if (updates.errorLog !== undefined) {
         epUpdates.error_message = updates.errorLog;
       }
-      if (updates.retryCount !== undefined) {
-        epUpdates.retry_count = updates.retryCount;
-      }
 
       try {
-        const { data: epData, error: epErr } = await supabase
+        const { error: epErr } = await supabase
           .from('episodes')
           .update(epUpdates)
-          .eq('id', realUuid)
-          .select()
-          .maybeSingle();
+          .eq('id', realUuid);
         
         if (epErr) {
           console.error('[DB] Supabase primary episodes table update failed, falling back gracefully:', epErr);
-        } else if (epData) {
+        } else {
           const psUpdates: any = {};
           if (updates.script !== undefined) psUpdates.script = updates.script;
           if (updates.voiceName !== undefined) psUpdates.voice_name = updates.voiceName;
@@ -384,7 +380,10 @@ export class DB {
             } catch (e: any) {
               console.warn('[DB] Supabase pipeline_state write failed, relying on local cache:', e?.message);
             }
+          }
 
+          // ALWAYS save to local cache file if psUpdates or retryCount is modified
+          if (Object.keys(psUpdates).length > 0 || updates.retryCount !== undefined) {
             try {
               const localCachePath = path.join(DB_DIR, `state_${realUuid}.json`);
               let cachedState: any = {};
@@ -392,16 +391,20 @@ export class DB {
                 try { cachedState = JSON.parse(fs.readFileSync(localCachePath, 'utf8')); } catch (e) {}
               }
               const finalCachedState = { ...cachedState, ...psUpdates };
-              fs.writeFileSync(localCachePath, JSON.stringify(finalCachedState, null, 2), 'utf8');
-              if (!psRow) {
-                psRow = finalCachedState;
+              if (updates.retryCount !== undefined) {
+                finalCachedState.retryCount = updates.retryCount;
               }
+              fs.writeFileSync(localCachePath, JSON.stringify(finalCachedState, null, 2), 'utf8');
+              psRow = { ...finalCachedState, ...psRow };
             } catch (err) {
               console.error('[DB] Failed saving local cache file:', err);
             }
           }
 
-          return mapDbRowToEpisode(epData, psRow);
+          const refreshed = await this.getEpisodeById(realUuid);
+          if (refreshed) {
+            return refreshed;
+          }
         }
       } catch (err) {
         console.error('[DB] Supabase primary episodes update exception encountered:', err);
