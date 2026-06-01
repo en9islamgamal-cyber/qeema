@@ -46,6 +46,7 @@ export default function App() {
   const [newVoice, setNewVoice] = useState('Kore');
   const [isCreating, setIsCreating] = useState(false);
   const [isPolling, setIsPolling] = useState(true);
+  const [syncError, setSyncError] = useState<{ message: string; isHtmlIssue: boolean } | null>(null);
 
   // Player Playback simulator
   const [isPlaying, setIsPlaying] = useState(false);
@@ -55,15 +56,19 @@ export default function App() {
 
   // Fetch all initial metadata with precise error handling for each endpoint
   const reloadAll = async () => {
+    let currentError: { message: string; isHtmlIssue: boolean } | null = null;
+
     // 1. Fetch Episodes
     try {
       const epRes = await fetch('/api/episodes');
       const contentType = epRes.headers.get('content-type') || '';
       if (!epRes.ok) {
         console.warn(`[FRONTEND] /api/episodes returned status ${epRes.status}`);
+        currentError = { message: `Development Server returned status ${epRes.status}.`, isHtmlIssue: false };
       } else if (!contentType.includes('application/json')) {
         const text = await epRes.text();
         console.error(`[FRONTEND] Expected JSON from /api/episodes but received: "${contentType}". Body preview: ${text.slice(0, 100)}`);
+        currentError = { message: `The system was blocked from loading application data because of browser authorization cookie restrictions (Returned HTML inside of the iframe preview).`, isHtmlIssue: true };
       } else {
         const epData = await epRes.json();
         if (Array.isArray(epData)) {
@@ -75,62 +80,56 @@ export default function App() {
           }
         }
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('[FRONTEND] Failed to sync episodes:', err);
+      currentError = { message: `Unable to establish a secure websocket/HTTP fetch connection to the backend container.`, isHtmlIssue: false };
     }
 
     // 2. Fetch Logs
-    try {
-      const logRes = await fetch('/api/logs');
-      const contentType = logRes.headers.get('content-type') || '';
-      if (!logRes.ok) {
-        console.warn(`[FRONTEND] /api/logs returned status ${logRes.status}`);
-      } else if (!contentType.includes('application/json')) {
-        const text = await logRes.text();
-        console.error(`[FRONTEND] Expected JSON from /api/logs but received: "${contentType}". Body preview: ${text.slice(0, 100)}`);
-      } else {
-        const logData = await logRes.json();
-        if (Array.isArray(logData)) setLogs(logData);
+    if (!currentError) {
+      try {
+        const logRes = await fetch('/api/logs');
+        const contentType = logRes.headers.get('content-type') || '';
+        if (logRes.ok && contentType.includes('application/json')) {
+          const logData = await logRes.json();
+          if (Array.isArray(logData)) setLogs(logData);
+        }
+      } catch (err) {
+        console.error('[FRONTEND] Failed to sync logs:', err);
       }
-    } catch (err) {
-      console.error('[FRONTEND] Failed to sync logs:', err);
     }
 
     // 3. Fetch Keys
-    try {
-      const keyRes = await fetch('/api/keymetrics');
-      const contentType = keyRes.headers.get('content-type') || '';
-      if (!keyRes.ok) {
-        console.warn(`[FRONTEND] /api/keymetrics returned status ${keyRes.status}`);
-      } else if (!contentType.includes('application/json')) {
-        const text = await keyRes.text();
-        console.error(`[FRONTEND] Expected JSON from /api/keymetrics but received: "${contentType}". Body preview: ${text.slice(0, 100)}`);
-      } else {
-        const keyData = await keyRes.json();
-        if (Array.isArray(keyData)) setKeys(keyData);
+    if (!currentError) {
+      try {
+        const keyRes = await fetch('/api/keymetrics');
+        const contentType = keyRes.headers.get('content-type') || '';
+        if (keyRes.ok && contentType.includes('application/json')) {
+          const keyData = await keyRes.json();
+          if (Array.isArray(keyData)) setKeys(keyData);
+        }
+      } catch (err) {
+        console.error('[FRONTEND] Failed to sync API keys:', err);
       }
-    } catch (err) {
-      console.error('[FRONTEND] Failed to sync API keys:', err);
     }
 
     // 4. Fetch Status
-    try {
-      const statusRes = await fetch('/api/status');
-      const contentType = statusRes.headers.get('content-type') || '';
-      if (!statusRes.ok) {
-        console.warn(`[FRONTEND] /api/status returned status ${statusRes.status}`);
-      } else if (!contentType.includes('application/json')) {
-        const text = await statusRes.text();
-        console.error(`[FRONTEND] Expected JSON from /api/status but received: "${contentType}". Body preview: ${text.slice(0, 100)}`);
-      } else {
-        const statusData = await statusRes.json();
-        if (statusData && typeof statusData === 'object') {
-          setStatus(statusData);
+    if (!currentError) {
+      try {
+        const statusRes = await fetch('/api/status');
+        const contentType = statusRes.headers.get('content-type') || '';
+        if (statusRes.ok && contentType.includes('application/json')) {
+          const statusData = await statusRes.json();
+          if (statusData && typeof statusData === 'object') {
+            setStatus(statusData);
+          }
         }
+      } catch (err) {
+        console.error('[FRONTEND] Failed to sync pipeline status:', err);
       }
-    } catch (err) {
-      console.error('[FRONTEND] Failed to sync pipeline status:', err);
     }
+
+    setSyncError(currentError);
   };
 
   // Periodic Poller
@@ -316,17 +315,45 @@ export default function App() {
         </div>
       </header>
 
+      {/* TROUBLESHOOTING AUTH SYNC ERROR BANNER */}
+      {syncError && (
+        <div id="auth-sync-error-banner" className="mx-6 mt-6 p-4 rounded-xl border bg-yellow-500/10 border-yellow-500/30 text-yellow-300 text-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-yellow-400 shrink-0 mt-0.5 md:mt-0 animate-pulse" />
+            <div>
+              <p className="font-bold text-white text-sm">Secure Connection Delayed</p>
+              <p className="mt-1 text-slate-300 leading-relaxed">
+                {syncError.message}
+              </p>
+              {syncError.isHtmlIssue && (
+                <div className="mt-2 text-slate-400 pl-4 space-y-1">
+                  <p>• <strong>Required Fix:</strong> Click the <strong className="text-yellow-400">"New Tab" or "Open App" icon</strong> at the top-right corner of the Google AI Studio container panel to serve this app in standalone mode (bypassing the third-party iframe cookie restrictions).</p>
+                  <p>• Alternatively, configure your browser settings to <strong>allow third-party cookies</strong> for this application preview context.</p>
+                </div>
+              )}
+            </div>
+          </div>
+          <button 
+            type="button"
+            onClick={() => reloadAll()} 
+            className="px-3.5 py-1.5 rounded-lg bg-yellow-500/20 border border-yellow-500/30 hover:bg-yellow-500/30 text-yellow-200 hover:text-white font-medium shrink-0 transition"
+          >
+            Re-verify Sync Connection
+          </button>
+        </div>
+      )}
+
       {/* DASHBOARD STATISTICS HERO */}
       <section className="px-6 pt-6 grid grid-cols-2 md:grid-cols-5 gap-4">
         <div className="bg-slate-900/40 border border-slate-900 rounded-xl p-4 flex flex-col justify-between hover:border-slate-800 transition">
-          <span className="text-xs text-slate-400 font-medium font-mono">Monthly Releases Target</span>
+          <span className="text-xs text-slate-400 font-medium">Monthly Releases Target</span>
           <div className="mt-2 flex items-baseline gap-2">
             <span className="text-2xl font-bold font-mono text-purple-400">7</span>
             <span className="text-xs text-slate-500 font-mono">slots slated</span>
           </div>
         </div>
         <div className="bg-slate-900/40 border border-slate-900 rounded-xl p-4 flex flex-col justify-between hover:border-slate-800 transition">
-          <span className="text-xs text-slate-400 font-medium font-mono font-mono">Total Campaign Episodes</span>
+          <span className="text-xs text-slate-400 font-medium">Total Campaign Episodes</span>
           <div className="mt-2 flex items-baseline gap-2">
             <span className="text-2xl font-bold font-mono text-white">{totalEpisodesSeeded}</span>
             <span className="text-xs text-slate-500">managed</span>
@@ -346,11 +373,11 @@ export default function App() {
             <span className="text-xs text-slate-500">active thread</span>
           </div>
         </div>
-        <div className="col-span-2 md:col-span-1 bg-gradient-to-br from-purple-950/20 to-slate-900 border border-purple-900/20 rounded-xl p-4 flex flex-col justify-between font-mono">
-          <span className="text-xs text-purple-300 font-medium font-mono">Quick Seed Campaign</span>
+        <div className="col-span-2 md:col-span-1 bg-gradient-to-br from-purple-950/20 to-slate-900 border border-purple-900/20 rounded-xl p-4 flex flex-col justify-between">
+          <span className="text-xs text-purple-300 font-medium">Quick Seed Campaign</span>
           <button
             onClick={triggerCampaignSeed}
-            className="mt-2 py-1.5 px-3 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center justify-center gap-1.5 transition active:scale-95 font-mono"
+            className="mt-2 py-1.5 px-3 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center justify-center gap-1.5 transition active:scale-95"
           >
             <Sparkles className="w-4 h-4" />
             Seed 7 Releases
@@ -491,7 +518,7 @@ export default function App() {
                           }}
                           className="py-1 px-2.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-[10px] font-semibold flex items-center gap-1 active:scale-95"
                         >
-                          <Play className="w-3 h-3 fill-current animate-pulse ml-0.5" />
+                          <Play className="w-3 h-3 fill-current" />
                           Launch
                         </button>
                       )}
@@ -629,7 +656,7 @@ export default function App() {
                       className="w-8 h-8 rounded-full bg-purple-600 flex items-center justify-center text-white font-bold hover:bg-purple-500 active:scale-95 disabled:bg-slate-800 disabled:text-slate-500"
                     >
                       {isPlaying ? (
-                        <span className="w-2.5 h-2.5 bg-white rounded-sm block font-mono"></span>
+                        <span className="w-2.5 h-2.5 bg-white rounded-sm block"></span>
                       ) : (
                         <Play className="w-3.5 h-3.5 fill-current ml-0.5" />
                       )}
@@ -758,7 +785,7 @@ export default function App() {
             </h3>
             <button
               onClick={triggerResetKeysPool}
-              className="text-[10px] text-purple-400 hover:text-purple-300 font-medium flex items-center gap-1 font-mono"
+              className="text-[10px] text-purple-400 hover:text-purple-300 font-medium flex items-center gap-1"
             >
               <ListRestart className="w-3.5 h-3.5" />
               Reset Pool Statuses
@@ -768,8 +795,8 @@ export default function App() {
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             {keys.map((k) => (
               <div key={k.id} className="bg-slate-900/40 border border-slate-900 rounded-lg p-2.5 flex flex-col justify-between gap-1.5">
-                <div className="flex justify-between items-start font-mono">
-                  <span className="font-semibold text-slate-200 font-mono">{k.id === 'KeyA' ? 'Primary Key' : k.id === 'KeyB' ? 'Backup Key B' : 'Sandbox Key C'}</span>
+                <div className="flex justify-between items-start">
+                  <span className="font-semibold text-slate-200">{k.id === 'KeyA' ? 'Primary Key' : k.id === 'KeyB' ? 'Backup Key B' : 'Sandbox Key C'}</span>
                   <span
                     className={`text-[9px] font-mono px-1.5 py-0.2 rounded font-bold ${
                       k.status === 'active'
