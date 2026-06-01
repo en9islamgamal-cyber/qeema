@@ -26,6 +26,20 @@ import {
 } from 'lucide-react';
 import { Episode, PipelineLog, ApiKeyConfig, SystemStatus } from './types.ts';
 
+// Robust fetch helper with transparent auto-retry for resilient container startup booting
+async function robustFetch(url: string, options?: RequestInit, retries = 4, delayMs = 1500): Promise<Response> {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, options);
+      return res;
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+  return fetch(url, options);
+}
+
 export default function App() {
   // DB States
   const [episodes, setEpisodes] = useState<Episode[]>([]);
@@ -60,14 +74,14 @@ export default function App() {
 
     // 1. Fetch Episodes
     try {
-      const epRes = await fetch('/api/episodes');
+      const epRes = await robustFetch('/api/episodes');
       const contentType = epRes.headers.get('content-type') || '';
       if (!epRes.ok) {
         console.warn(`[FRONTEND] /api/episodes returned status ${epRes.status}`);
         currentError = { message: `Development Server returned status ${epRes.status}.`, isHtmlIssue: false };
       } else if (!contentType.includes('application/json')) {
         const text = await epRes.text();
-        console.error(`[FRONTEND] Expected JSON from /api/episodes but received: "${contentType}". Body preview: ${text.slice(0, 100)}`);
+        console.warn(`[FRONTEND] Expected JSON from /api/episodes but received: "${contentType}". Body preview: ${text.slice(0, 50)}`);
         currentError = { message: `The system was blocked from loading application data because of browser authorization cookie restrictions (Returned HTML inside of the iframe preview).`, isHtmlIssue: true };
       } else {
         const epData = await epRes.json();
@@ -81,42 +95,42 @@ export default function App() {
         }
       }
     } catch (err: any) {
-      console.error('[FRONTEND] Failed to sync episodes:', err);
+      console.warn('[FRONTEND] Failed to sync episodes:', err);
       currentError = { message: `Unable to establish a secure websocket/HTTP fetch connection to the backend container.`, isHtmlIssue: false };
     }
 
     // 2. Fetch Logs
     if (!currentError) {
       try {
-        const logRes = await fetch('/api/logs');
+        const logRes = await robustFetch('/api/logs');
         const contentType = logRes.headers.get('content-type') || '';
         if (logRes.ok && contentType.includes('application/json')) {
           const logData = await logRes.json();
           if (Array.isArray(logData)) setLogs(logData);
         }
       } catch (err) {
-        console.error('[FRONTEND] Failed to sync logs:', err);
+        console.warn('[FRONTEND] Failed to sync logs:', err);
       }
     }
 
     // 3. Fetch Keys
     if (!currentError) {
       try {
-        const keyRes = await fetch('/api/keymetrics');
+        const keyRes = await robustFetch('/api/keymetrics');
         const contentType = keyRes.headers.get('content-type') || '';
         if (keyRes.ok && contentType.includes('application/json')) {
           const keyData = await keyRes.json();
           if (Array.isArray(keyData)) setKeys(keyData);
         }
       } catch (err) {
-        console.error('[FRONTEND] Failed to sync API keys:', err);
+        console.warn('[FRONTEND] Failed to sync API keys:', err);
       }
     }
 
     // 4. Fetch Status
     if (!currentError) {
       try {
-        const statusRes = await fetch('/api/status');
+        const statusRes = await robustFetch('/api/status');
         const contentType = statusRes.headers.get('content-type') || '';
         if (statusRes.ok && contentType.includes('application/json')) {
           const statusData = await statusRes.json();
@@ -125,7 +139,7 @@ export default function App() {
           }
         }
       } catch (err) {
-        console.error('[FRONTEND] Failed to sync pipeline status:', err);
+        console.warn('[FRONTEND] Failed to sync pipeline status:', err);
       }
     }
 
