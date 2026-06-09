@@ -5,7 +5,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { LEONARDO, VIDEO } from './config.ts';
+import { LEONARDO } from './config.ts';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -64,7 +64,9 @@ async function download(url: string, dest: string): Promise<void> {
   fs.writeFileSync(dest, buf);
 }
 
-export async function generateImage(prompt: string, dest: string, w = VIDEO.width, h = VIDEO.height): Promise<string> {
+// Leonardo max = 1536px. نستخدم 1280x720 (16:9) وFFmpeg بيكبّرها لـ 1920x1080 أثناء التجميع.
+const LEO_W = 1280, LEO_H = 720;
+export async function generateImage(prompt: string, dest: string, w = LEO_W, h = LEO_H): Promise<string> {
   console.log(`[images] توليد صورة -> ${path.basename(dest)}`);
   const genId = await createGeneration(prompt, w, h);
   const url = await pollImageUrl(genId);
