@@ -1,0 +1,62 @@
+name: QEEMA Pipeline
+
+on:
+  schedule:
+    - cron: '0 8 */4 * *'   # كل ~4 أيام
+  workflow_dispatch:
+    inputs:
+      episode_id:
+        description: 'رقم الحلقة أو الـ UUID (سيب فاضي لتشغيل التالية المجدولة)'
+        required: false
+        type: string
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Install FFmpeg + Arabic font
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-extra
+          fc-cache -f
+          ffmpeg -version | head -n1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run pipeline
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
+          ELEVENLABS_MODEL_ID: ${{ secrets.ELEVENLABS_MODEL_ID }}
+          LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
+          LEONARDO_MODEL_ID: ${{ secrets.LEONARDO_MODEL_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: npx tsx server/run.ts "${{ github.event.inputs.episode_id }}"
+
+      - name: Upload render artifacts (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renders
+          path: data/renders/**/final.mp4
+          if-no-files-found: ignore
+          retention-days: 7

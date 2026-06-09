@@ -1,0 +1,78 @@
+/**
+ * QEEMA — Voice Service (ElevenLabs)
+ * - يحوّل نص الشرح لصوت بصوتك (Multilingual v2).
+ * - يشيل التشكيل قبل الإرسال (التشكيل بيضرّ النطق).
+ * - يرجّع مسار mp3 ومدته. يفشل بصوت عالٍ.
+ */
+import * as fs from 'fs';
+import * as path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { ELEVENLABS } from './config.ts';
+
+const execFileAsync = promisify(execFile);
+
+/** إزالة التشكيل (الحركات) والتطويل عشان نطق أنضف. */
+export function stripTashkeel(text: string): string {
+  return text
+    .replace(/[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED]/g, '')
+    .replace(/\u0640/g, '') // تطويل
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function ffprobeDuration(file: string): Promise<number> {
+  const { stdout } = await execFileAsync('ffprobe', [
+    '-v', 'error', '-show_entries', 'format=duration',
+    '-of', 'default=noprint_wrappers=1:nokey=1', file,
+  ]);
+  const sec = parseFloat(stdout.trim());
+  if (!isFinite(sec) || sec <= 0) throw new Error(`[voice] مدة غير صالحة لـ ${file}`);
+  return sec;
+}
+
+/**
+ * يولّد مقطع صوت واحد من نص.
+ * @returns { filePath, durationSeconds }
+ */
+export async function synthesize(
+  text: string,
+  outPath: string,
+  retries = 3
+): Promise<{ filePath: string; durationSeconds: number }> {
+  const clean = stripTashkeel(text);
+  if (!clean) throw new Error('[voice] نص فاضي بعد إزالة التشكيل.');
+
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS.voiceId}?output_format=mp3_44100_128`;
+  const body = JSON.stringify({
+    text: clean,
+    model_id: ELEVENLABS.modelId,
+    voice_settings: { stability: ELEVENLABS.stability, similarity_boost: ELEVENLABS.similarityBoost },
+  });
+
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'xi-api-key': ELEVENLABS.apiKey(), 'Content-Type': 'application/json', accept: 'audio/mpeg' },
+        body,
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status}: ${errText.slice(0, 300)}`);
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length < 500) throw new Error(`صوت صغير/فاسد (${buf.length}B)`);
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      fs.writeFileSync(outPath, buf);
+      const durationSeconds = await ffprobeDuration(outPath);
+      return { filePath: outPath, durationSeconds };
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[voice] محاولة ${attempt}/${retries} فشلت: ${String((err as Error)?.message || err)}`);
+      if (attempt < retries) await new Promise((r) => setTimeout(r, 2000 * attempt));
+    }
+  }
+  throw new Error(`[voice] فشل توليد الصوت بعد ${retries} محاولات: ${String((lastErr as Error)?.message || lastErr)}`);
+}
