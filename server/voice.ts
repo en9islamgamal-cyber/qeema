@@ -47,7 +47,12 @@ export async function synthesize(
   const body = JSON.stringify({
     text: clean,
     model_id: ELEVENLABS.modelId,
-    voice_settings: { stability: ELEVENLABS.stability, similarity_boost: ELEVENLABS.similarityBoost },
+    voice_settings: {
+      stability: ELEVENLABS.stability,
+      similarity_boost: ELEVENLABS.similarityBoost,
+      style: ELEVENLABS.style,
+      use_speaker_boost: ELEVENLABS.useSpeakerBoost,
+    },
   });
 
   let lastErr: unknown = null;
