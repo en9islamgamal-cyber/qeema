@@ -36,9 +36,9 @@ export const ELEVENLABS = {
   // ⚠️ تأكّد إن ده الـ voice id بتاعك بالظبط — أو حطّه في secret اسمه ELEVENLABS_VOICE_ID
   voiceId: optional('ELEVENLABS_VOICE_ID', 'vWDp3PLsTWjIhBxxUKh9'),
   modelId: optional('ELEVENLABS_MODEL_ID', 'eleven_multilingual_v2'),
-  stability: 0.3,        // أقل = نبرة أكثر تعبيرًا وحيوية (مش رتيبة)
-  similarityBoost: 0.75,
-  style: 0.45,           // تعبير أعلى
+  stability: 0.4,        // 0.4 = توازن بشري (واطي زيادة بيسبب أخطاء نطق)
+  similarityBoost: 0.8,
+  style: 0.2,            // style واطي = أطبع وأقل روبوتية
   useSpeakerBoost: true,
 };
 
