@@ -21,6 +21,23 @@ export function stripTashkeel(text: string): string {
     .trim();
 }
 
+/**
+ * قاموس نطق مصري: بنصلّح كلمات الموديل بينطقها غلط.
+ * "قيمة" بالفصحى بقاف، إحنا عايزينها مصري (همزة) = "ئيمه".
+ * ضيف أي كلمة تلاقيها متنطقة غلط هنا [الكلمة, النطق الصح].
+ * ملاحظة: مابنعملش استبدال شامل للقاف عشان مانخربش كلمات دينية زي "القرآن".
+ */
+const PRONUNCIATION: [RegExp, string][] = [
+  // فاضي عمدًا: "قيمة" تتنطق بالقاف (qeema) زي اسم القناة.
+  // ضيف هنا أي كلمة تلاقيها متنطقة غلط فقط، بصيغة [الكلمة, النطق الصح].
+];
+
+function applyPronunciation(text: string): string {
+  let t = text;
+  for (const [re, rep] of PRONUNCIATION) t = t.replace(re, rep);
+  return t;
+}
+
 async function ffprobeDuration(file: string): Promise<number> {
   const { stdout } = await execFileAsync('ffprobe', [
     '-v', 'error', '-show_entries', 'format=duration',
@@ -40,7 +57,7 @@ export async function synthesize(
   outPath: string,
   retries = 3
 ): Promise<{ filePath: string; durationSeconds: number }> {
-  const clean = stripTashkeel(text);
+  const clean = applyPronunciation(stripTashkeel(text));
   if (!clean) throw new Error('[voice] نص فاضي بعد إزالة التشكيل.');
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS.voiceId}?output_format=mp3_44100_128`;
