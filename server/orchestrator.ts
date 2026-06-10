@@ -59,7 +59,8 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
     }
     const thumbnailPath = await generateImage(
       buildThumbnailPrompt(surah, titleInfo.theme),
-      path.join(workDir, 'thumbnail.png')
+      path.join(workDir, 'thumbnail.png'),
+      1280, 720
     );
     const gridImage = await buildGrid(sketchPaths, workDir);
 
