@@ -23,6 +23,13 @@ export const GEMINI_KEYS = [
   { name: 'KeyC', value: optional('GEMINI_API_KEY_3') },
 ].filter((k) => k.value);
 
+/* ---------- الصور (Hugging Face — FLUX) ---------- */
+export const HF_KEYS = [
+  { name: 'HF_A', value: optional('HF_API_KEY') },
+  { name: 'HF_B', value: optional('HF_API_KEY_2') },
+  { name: 'HF_C', value: optional('HF_API_KEY_3') },
+].filter((k) => k.value);
+
 /* ---------- الصوت (ElevenLabs) ---------- */
 export const ELEVENLABS = {
   apiKey: () => required('ELEVENLABS_API_KEY'),
