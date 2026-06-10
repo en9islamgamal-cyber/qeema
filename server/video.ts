@@ -37,11 +37,17 @@ async function hasAudio(file: string): Promise<boolean> {
   }
 }
 
-/** يبني شبكة 2×2 من الاسكتشات (الأماكن الفاضية تتملي باللوجو). */
+/** يبني شبكة 2×2 من الاسكتشات (المفروض دايمًا 4؛ أي فراغ يتملّى أبيض مش أسود). */
 export async function buildGrid(sketchPaths: string[], workDir: string): Promise<string> {
   const cell = { w: Math.floor(W / 2), h: Math.floor(H / 2) };
+  // لو (لأي سبب) أقل من 4، جهّز خلية بيضا بدل اللوجو على خلفية سودا
+  let whiteCell = '';
+  if (sketchPaths.length < 4) {
+    whiteCell = path.join(workDir, 'white_cell.png');
+    await ff(['-f', 'lavfi', '-i', `color=white:s=${cell.w}x${cell.h}`, '-frames:v', '1', whiteCell]);
+  }
   const cells = [...sketchPaths];
-  while (cells.length < 4) cells.push(LOGO_PATH); // ملء الفاضي باللوجو
+  while (cells.length < 4) cells.push(whiteCell);
   const inputs: string[] = [];
   cells.slice(0, 4).forEach((p) => inputs.push('-i', p));
   const scaled = cells
@@ -216,6 +222,17 @@ export async function assembleEpisode(input: AssemblyInput): Promise<string> {
   const outro = await normalizeOutro(workDir);
   if (outro) clips.push(outro);
   else console.warn('[video] تحذير: مفيش outro.mp4 — هيتمّ التجميع بدون أوترو.');
+
+  // تشخيص: تأكد إن كل مقطع موجود وله مدة (يكشف لو التلاوة الثانية مثلًا طلعت صفر)
+  const labels = ['intro', 'recite1', ...ideas.map((_, i) => `idea${i}`), 'closing', 'recite2', ...(outro ? ['outro'] : [])];
+  for (let i = 0; i < clips.length; i++) {
+    if (!fs.existsSync(clips[i]) || fs.statSync(clips[i]).size < 1000) {
+      throw new Error(`[video] المقطع "${labels[i]}" مفقود/فاضي: ${clips[i]}`);
+    }
+    const d = await ffprobeDuration(clips[i]);
+    console.log(`[video] مقطع ${labels[i]}: ${d.toFixed(1)}s`);
+    if (d < 0.3) throw new Error(`[video] المقطع "${labels[i]}" مدته شبه صفر (${d}s) — وقفنا عشان مايطلعش فيديو ناقص.`);
+  }
 
   const finalPath = path.join(workDir, 'final.mp4');
   console.log(`[video] دمج ${clips.length} مقطع -> final.mp4`);
