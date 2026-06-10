@@ -101,19 +101,31 @@ async function makeClip(
   const frames = Math.ceil(dur * FPS);
 
   const chain: string[] = [];
-  // 1) القاعدة: ربع مكبّر (مع زوم لطيف) أو الصورة الكاملة
+  // 1) القاعدة:
+  //    - فكرة: زوم إن على الركن (سريع) ← ثبات ← زوم أوت للصورة الكاملة في الآخر.
+  //      كده كل مقطع يبدأ وينتهي على "الصورة الكاملة" فالقطع بين المقاطع غير محسوس.
+  //    - غير كده: الصورة الكاملة ثابتة.
   if (opts.quadrant !== undefined) {
     const col = opts.quadrant % 2, row = Math.floor(opts.quadrant / 2);
     const cw = Math.floor(W / 2), ch = Math.floor(H / 2);
+    const cx = col * cw + cw / 2;   // مركز الركن في الشبكة
+    const cy = row * ch + ch / 2;
+    let inF = Math.round(1.2 * FPS);   // مدة الزوم إن
+    let outF = Math.round(1.0 * FPS);  // مدة الزوم أوت
+    if (frames < inF + outF + FPS) { inF = Math.round(0.8 * FPS); outF = Math.round(0.6 * FPS); }
+    const outStart = Math.max(inF + 1, frames - outF);
+    const z = `if(lt(on,${inF}),1+on/${inF},if(lt(on,${outStart}),2,max(1,2-(on-${outStart})/${outF})))`;
+    const x = `max(0\\,min(${cx}-(iw/zoom/2)\\,iw-iw/zoom))`;
+    const y = `max(0\\,min(${cy}-(ih/zoom/2)\\,ih-ih/zoom))`;
     chain.push(
-      `[0:v]crop=${cw}:${ch}:${col * cw}:${row * ch},scale=${W}:${H},setsar=1,` +
-      `zoompan=z='min(zoom+0.0008,1.10)':d=${frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${W}x${H}:fps=${FPS}[v0]`
+      `[0:v]scale=${W}:${H},setsar=1,` +
+      `zoompan=z='${z}':x='${x}':y='${y}':d=1:s=${W}x${H}:fps=${FPS}[v0]`
     );
   } else {
     chain.push(`[0:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:white,setsar=1,fps=${FPS}[v0]`);
   }
-  // 2) واترمارك اللوجو (input #2)
-  chain.push(`[2:v]scale=170:-1[lg]`);
+  // 2) واترمارك اللوجو (input #2) — أكبر
+  chain.push(`[2:v]scale=300:-1[lg]`);
   chain.push(`[v0][lg]overlay=W-w-40:H-h-40[v1]`);
   // 3) تعليق عربي (libass) لو موجود
   let lastV = '[v1]';
@@ -124,7 +136,7 @@ async function makeClip(
   }
 
   await ff([
-    '-loop', '1', '-t', String(dur), '-i', visual,
+    '-framerate', String(FPS), '-loop', '1', '-t', String(dur), '-i', visual,
     '-i', audio,
     '-loop', '1', '-t', String(dur), '-i', LOGO_PATH,
     '-filter_complex', chain.join(';'),
