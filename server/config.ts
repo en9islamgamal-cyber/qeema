@@ -34,10 +34,12 @@ export const HF_KEYS = [
 export const ELEVENLABS = {
   apiKey: () => required('ELEVENLABS_API_KEY'),
   // ⚠️ تأكّد إن ده الـ voice id بتاعك بالظبط — أو حطّه في secret اسمه ELEVENLABS_VOICE_ID
-  voiceId: optional('ELEVENLABS_VOICE_ID', 'UR972wNGq3zluze0LoIp'),
+  voiceId: optional('ELEVENLABS_VOICE_ID', 'vWDp3PLsTWjIhBxxUKh9'),
   modelId: optional('ELEVENLABS_MODEL_ID', 'eleven_multilingual_v2'),
-  stability: 0.5,
+  stability: 0.3,        // أقل = نبرة أكثر تعبيرًا وحيوية (مش رتيبة)
   similarityBoost: 0.75,
+  style: 0.45,           // تعبير أعلى
+  useSpeakerBoost: true,
 };
 
 /* ---------- الصور (Leonardo) ---------- */
@@ -52,7 +54,7 @@ export const LEONARDO = {
 /* ---------- التلاوة (everyayah) ---------- */
 export const EVERYAYAH_BASE = 'https://everyayah.com/data';
 export const RECITER = optional('RECITER', 'Husary_Muallim_128kbps');
-export const RECITATION_TEMPO = parseFloat(optional('RECITATION_TEMPO', '1.4'));
+export const RECITATION_TEMPO = parseFloat(optional('RECITATION_TEMPO', '2.0'));
 
 /* ---------- قاعدة البيانات (Supabase) ---------- */
 export const SUPABASE = {
