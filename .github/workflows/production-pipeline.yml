@@ -44,6 +44,9 @@ jobs:
           ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
           ELEVENLABS_MODEL_ID: ${{ secrets.ELEVENLABS_MODEL_ID }}
           LEONARDO_API_KEY: ${{ secrets.LEONARDO_API_KEY }}
+          HF_API_KEY: ${{ secrets.HF_API_KEY }}
+          HF_API_KEY_2: ${{ secrets.HF_API_KEY_2 }}
+          HF_API_KEY_3: ${{ secrets.HF_API_KEY_3 }}
           LEONARDO_MODEL_ID: ${{ secrets.LEONARDO_MODEL_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
