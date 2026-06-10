@@ -1,83 +1,87 @@
 /**
- * QEEMA — Image Service (Leonardo.ai)
- * - يولّد اسكتشات (1280x720) + ثمبنايل.
- * - Leonardo max width = 1536px. نستخدم 1280x720 وFFmpeg يكبّرها لـ 1920x1080.
- * - يفشل بصوت عالٍ. مفيش mock أو placeholder.
+ * QEEMA — Image Service (Hugging Face — FLUX.1-schnell)
+ * - تدوير على 3 مفاتيح HF (حسابات مختلفة = أرصدة منفصلة).
+ * - لو مفتاح رجّع خطأ رصيد/حصّة (402/429) -> يجرّب اللي بعده.
+ * - 503 (الموديل بيتحمّل) -> يستنى ويعيد على نفس المفتاح.
+ * - يفشل بصوت عالٍ. مفيش mock.
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { LEONARDO } from './config.ts';
+import { HF_KEYS } from './config.ts';
 
+const HF_MODEL = process.env['HF_IMAGE_MODEL'] || 'black-forest-labs/FLUX.1-schnell';
+const HF_URL = `https://router.huggingface.co/hf-inference/models/${HF_MODEL}`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// Leonardo max = 1536px → نستخدم 1280x720 (16:9)
-const LEO_W = 1280, LEO_H = 720;
+/** خطأ رصيد/حصّة -> المفتاح ده خلص، انتقل للي بعده. */
+function isQuota(status: number, msg: string): boolean {
+  return status === 402 || status === 429 || /quota|credit|limit|exceeded|payment/i.test(msg);
+}
 
-async function createGeneration(prompt: string, width: number, height: number): Promise<string> {
-  const res = await fetch(`${LEONARDO.baseUrl}/generations`, {
+async function tryOneKey(key: string, prompt: string, dest: string): Promise<'ok' | 'quota' | 'retry'> {
+  const res = await fetch(HF_URL, {
     method: 'POST',
     headers: {
-      accept: 'application/json',
+      authorization: `Bearer ${key}`,
       'content-type': 'application/json',
-      authorization: `Bearer ${LEONARDO.apiKey()}`,
+      accept: 'image/png',
     },
     body: JSON.stringify({
-      modelId: LEONARDO.modelId,
-      prompt: prompt.slice(0, 1490),
-      width,
-      height,
-      num_images: 1,
-      public: false,
+      inputs: prompt.slice(0, 1900),
+      parameters: { width: 1024, height: 576 }, // 16:9 تقريبًا
     }),
   });
+
+  if (res.status === 503) {
+    console.warn('[images] الموديل بيتحمّل (503)…');
+    return 'retry';
+  }
   if (!res.ok) {
     const t = await res.text().catch(() => '');
-    throw new Error(`[images] فشل إنشاء generation: HTTP ${res.status} ${t.slice(0, 300)}`);
-  }
-  const data: any = await res.json();
-  const id = data?.sdGenerationJob?.generationId;
-  if (!id) throw new Error(`[images] مفيش generationId في الرد: ${JSON.stringify(data).slice(0, 300)}`);
-  return id;
-}
-
-async function pollImageUrl(generationId: string, maxTries = 40): Promise<string> {
-  for (let i = 0; i < maxTries; i++) {
-    await sleep(3000);
-    const res = await fetch(`${LEONARDO.baseUrl}/generations/${generationId}`, {
-      headers: { accept: 'application/json', authorization: `Bearer ${LEONARDO.apiKey()}` },
-    });
-    if (!res.ok) continue;
-    const data: any = await res.json();
-    const gen = data?.generations_by_pk;
-    if (gen?.status === 'COMPLETE') {
-      const url = gen?.generated_images?.[0]?.url;
-      if (!url) throw new Error('[images] اكتمل التوليد بدون صورة.');
-      return url;
+    if (isQuota(res.status, t)) {
+      console.warn(`[images] المفتاح ده خلص رصيده (HTTP ${res.status}) — تجربة المفتاح اللي بعده.`);
+      return 'quota';
     }
-    if (gen?.status === 'FAILED') throw new Error('[images] فشل التوليد على Leonardo.');
+    throw new Error(`HTTP ${res.status}: ${t.slice(0, 250)}`);
   }
-  throw new Error(`[images] انتهى وقت الانتظار للـ generation ${generationId}`);
-}
 
-async function download(url: string, dest: string): Promise<void> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`[images] فشل تنزيل الصورة: HTTP ${res.status}`);
+  const ct = res.headers.get('content-type') || '';
+  if (!ct.startsWith('image/')) {
+    const t = await res.text().catch(() => '');
+    if (isQuota(200, t)) return 'quota';
+    throw new Error(`رد مش صورة (${ct}): ${t.slice(0, 200)}`);
+  }
+
   const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.length < 1000) throw new Error('[images] صورة صغيرة/فاسدة.');
+  if (buf.length < 1000) throw new Error(`صورة صغيرة/فاسدة (${buf.length}B)`);
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.writeFileSync(dest, buf);
+  console.log(`[images] جاهزة: ${dest} (${(buf.length / 1024).toFixed(0)}KB)`);
+  return 'ok';
 }
 
-export async function generateImage(
-  prompt: string,
-  dest: string,
-  w = LEO_W,
-  h = LEO_H
-): Promise<string> {
-  console.log(`[images] توليد صورة -> ${path.basename(dest)}`);
-  const genId = await createGeneration(prompt, w, h);
-  const url = await pollImageUrl(genId);
-  await download(url, dest);
-  console.log(`[images] جاهزة: ${dest}`);
-  return dest;
+export async function generateImage(prompt: string, dest: string): Promise<string> {
+  if (HF_KEYS.length === 0) throw new Error('[images] مفيش أي HF_API_KEY متظبّط.');
+  let lastErr: unknown = null;
+
+  // جرّب كل مفتاح؛ مع إعادة محاولة للـ 503 (cold start) على كل مفتاح
+  for (let k = 0; k < HF_KEYS.length; k++) {
+    const key = HF_KEYS[k];
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        const result = await tryOneKey(key.value, prompt, dest);
+        if (result === 'ok') return dest;
+        if (result === 'quota') break;           // المفتاح خلص -> المفتاح اللي بعده
+        if (result === 'retry') {                 // 503 -> استنى وأعد على نفس المفتاح
+          await sleep(8000 * attempt);
+          continue;
+        }
+      } catch (err) {
+        lastErr = err;
+        console.warn(`[images] ${key.name} محاولة ${attempt}/4 فشلت: ${String((err as Error)?.message || err).slice(0, 140)}`);
+        await sleep(4000 * attempt);
+      }
+    }
+  }
+  throw new Error(`[images] فشل توليد الصورة على كل مفاتيح HF: ${String((lastErr as Error)?.message || lastErr).slice(0, 200)}`);
 }
