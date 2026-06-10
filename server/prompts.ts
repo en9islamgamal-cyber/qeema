@@ -49,6 +49,11 @@ Crayon and colored-pencil texture, naive simple shapes, visible sketchy pencil
 outlines, flat coloring that goes slightly outside the lines, bright cheerful
 colors, plain white paper background with lots of empty space.
 Innocent, warm, playful, wholesome. One single clear subject only.
+Add a touch of imagination and variety: vary the composition and camera angle
+between scenes (close-up, wide, from above), include small charming details and
+gentle expressions, and you may feature a recurring friendly little child
+character to give the series a familiar feel. Keep it calm — not busy or
+overstimulating.
 `.trim();
 
 /** ما يجب تجنّبه في كل صورة. */
@@ -81,7 +86,7 @@ export const EPISODE_PLAN_SCHEMA = {
     intro: { type: 'string', description: 'مقدمة دافية تذكر اسم السورة وإننا في رحلة' },
     ideas: {
       type: 'array',
-      minItems: 3,
+      minItems: 4,
       maxItems: 4,
       items: {
         type: 'object',
@@ -128,6 +133,10 @@ ${CHANNEL_IDENTITY}
   * استخدم تشبيهات قريبة من عالمه (الشمس، الحضن، المدرسة، الهدية، النجوم).
   * إيقاع قصصي فيه دفء وتشويق بسيط، وتنويع في طول الجُمل عشان النبرة ماتبقاش رتيبة.
   * المسة العاطفية حلوة (فرح، طمأنينة، حب) من غير مبالغة.
+- النطق البشري بييجي من علامات الترقيم — استخدمها بقصد:
+  * نقطة (.) = وقفة. فاصلة (،) = نفس قصير. علامة تعجّب (!) = حماس ودفء.
+  * علامة استفهام (؟) للأسئلة التفاعلية. نقط (...) لوقفة تشويق بسيطة.
+  * نوّع طول الجُمل: جملة قصيرة جدًا بعد جملة أطول بتدّي إيقاع طبيعي.
 - بس من غير إطالة: التزم بحدود الكلمات، الإبداع في الصياغة مش في الكمية.
 
 == شكل المخرجات ==
@@ -141,7 +150,7 @@ ${CHANNEL_IDENTITY}
 ابنِ خطة حلقة "قيمة" عن سورة ${surah.surahName} (${range}).
 
 - intro: سلام دافي + "رحلتنا النهارده مع سورة ${surah.surahName}" + إنها سورة سهلة وحلوة.
-- ideas: قسّم معنى السورة لـ 3 أو 4 أفكار بترتيب الآيات. كل فكرة:
+- ideas: قسّم معنى السورة لـ 4 أفكار بالظبط بترتيب الآيات (لازم 4، لا أقل). كل فكرة:
     * explanation: شرح بسيط جدًا بعامية مصرية + مثال قريب من عالم الطفل + العبرة الصغيرة.
     * sketchPrompt: اسكتش بسيط يعبّر عن الفكرة (يبدأ بالستايل الموحّد).
     * caption: تعليق عربي قصير جدًا.
