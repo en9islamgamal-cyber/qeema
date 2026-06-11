@@ -13,7 +13,7 @@ on:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,6 +30,8 @@ jobs:
           sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-extra
           fc-cache -f
           ffmpeg -version | head -n1
+          # تأكيد إن خط Noto Naskh Arabic متركّب (لازم لنص الشورتس)
+          fc-list | grep -i "naskh" | head -n1 || echo "تحذير: مفيش خط Naskh — هيتأثر نص الشورتس."
 
       - name: Install dependencies
         run: npm ci
@@ -53,6 +55,12 @@ jobs:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          # ---------- إعدادات الشورتس (كلها اختيارية — بتـ default لو الـ secret مش موجود) ----------
+          SHORTS_ENABLED: ${{ secrets.SHORTS_ENABLED }}                    # true/false (افتراضي true)
+          SHORTS_UPLOAD: ${{ secrets.SHORTS_UPLOAD }}                      # true/false (افتراضي true)
+          SHORTS_FIRST_DELAY_DAYS: ${{ secrets.SHORTS_FIRST_DELAY_DAYS }}  # افتراضي 1
+          SHORTS_INTERVAL_DAYS: ${{ secrets.SHORTS_INTERVAL_DAYS }}        # افتراضي 2
+          SHORTS_PUBLISH_HOUR_UTC: ${{ secrets.SHORTS_PUBLISH_HOUR_UTC }}  # افتراضي 15 (≈6م الكويت)
         run: npx tsx server/run.ts "${{ github.event.inputs.episode_id }}"
 
       - name: Upload render artifacts (debug)
@@ -60,6 +68,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: renders
-          path: data/renders/**/final.mp4
+          path: |
+            data/renders/**/final.mp4
+            data/renders/**/short_*.mp4
           if-no-files-found: ignore
           retention-days: 7
