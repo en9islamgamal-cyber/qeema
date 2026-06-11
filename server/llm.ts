@@ -96,11 +96,11 @@ async function generateJSON<T>(
   throw new Error(`[llm] فشل توليد JSON بعد ${maxRounds} لفّات على كل المفاتيح: ${String((lastErr as Error)?.message || lastErr).slice(0, 200)}`);
 }
 
-export async function generateEpisodePlan(surah: SurahInput, episodeId: string): Promise<EpisodePlan> {
-  const p = buildEpisodePlanPrompt(surah);
+export async function generateEpisodePlan(surah: SurahInput, episodeId: string, totalAyat: number): Promise<EpisodePlan> {
+  const p = buildEpisodePlanPrompt(surah, totalAyat);
   const plan = await generateJSON<EpisodePlan>(p, p.schema, episodeId);
   if (!plan?.intro || !Array.isArray(plan.ideas) || plan.ideas.length < 3) {
-    throw new Error('[llm] الخطة المرجّعة ناقصة (intro/ideas).');
+    throw new Error('[llm] الخطة المرجّعة ناقصة (لازم intro + 3 ideas على الأقل).');
   }
   return plan;
 }
