@@ -6,13 +6,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { DB } from './db.ts';
-import { WORK_ROOT, INTRO_AUDIO_PATH } from './config.ts';
+import { WORK_ROOT, INTRO_AUDIO_PATH, SHORTS } from './config.ts';
 import { Episode, episodeToSurah } from './types.ts';
 import { fetchRecitation, getAyahCount } from './reciter.ts';
 import { generateEpisodePlan, generateTitle } from './llm.ts';
 import { synthesize, concatAudio } from './voice.ts';
 import { generateImage } from './images.ts';
 import { buildGrid, assembleEpisode, cellLayout } from './video.ts';
+import { generateShorts } from './shorts.ts';
 import { uploadVideo } from './youtube.ts';
 import { buildThumbnailPrompt } from './prompts.ts';
 import { fetchSurahAyat, ayahRangeForTts } from './quran.ts';
@@ -106,6 +107,24 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
     });
     await DB.saveFinalVideoUrl(ep.id, finalVideo);
 
+    /* 5.5) توليد الشورتس — من نفس الكاش (sketch{i}.png + narr_idea{i}.mp3 + نص الآية)، صفر API */
+    let shorts: string[] = [];
+    if (SHORTS.enabled) {
+      await DB.log(ep.id, 'rendering', 'info', 'توليد الشورتس العمودية من الكاش…');
+      shorts = await generateShorts(
+        plan.ideas.map((idea, i) => ({
+          sketchPath: sketchPaths[i],
+          audioPath: ideaAudios[i],
+          ayahText: ayahRangeForTts(ayatMap, idea.ayahStart, idea.ayahEnd),
+          surahName: surah.surahName,
+          ayahStart: idea.ayahStart,
+          ayahEnd: idea.ayahEnd,
+        })),
+        workDir
+      );
+      await DB.log(ep.id, 'rendering', 'success', `تم توليد ${shorts.length} شورت بصفر credits.`);
+    }
+
     /* 6) الرفع (YouTube) */
     await DB.setStatus(ep.id, 'publishing');
     await DB.log(ep.id, 'publishing', 'info', 'رفع الفيديو على يوتيوب…');
@@ -118,6 +137,44 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
 
     await DB.setPublished(ep.id, videoId);
     await DB.log(ep.id, 'publishing', 'success', `✅ اكتملت الحلقة ${ep.episodeNumber}. https://youtube.com/watch?v=${videoId}`);
+
+    /* 6.5) رفع الشورتس مجدوَلًا (private + publishAt) — تنقيط بدل دفعة واحدة.
+       لا يكسر الحلقة لو فشل شورت (الحلقة اترفعت أصلاً). */
+    if (SHORTS.enabled && SHORTS.upload && shorts.length) {
+      await DB.log(ep.id, 'publishing', 'info', `جدولة رفع ${shorts.length} شورت (كل ${SHORTS.intervalDays} يوم)…`);
+      for (let i = 0; i < shorts.length; i++) {
+        try {
+          const idea = plan.ideas[i];
+          const label =
+            idea.ayahEnd && idea.ayahEnd !== idea.ayahStart
+              ? `الآيات ${idea.ayahStart}-${idea.ayahEnd}`
+              : `الآية ${idea.ayahStart}`;
+          // ميعاد النشر: بعد نشر الحلقة بـ firstDelayDays، وكل شورت بعد اللي قبله بـ intervalDays.
+          const when = new Date();
+          when.setUTCDate(when.getUTCDate() + SHORTS.firstDelayDays + i * SHORTS.intervalDays);
+          when.setUTCHours(SHORTS.publishHourUtc, 0, 0, 0);
+          const publishAt = when.toISOString();
+
+          const sId = await uploadVideo({
+            filePath: shorts[i],
+            title: `سورة ${surah.surahName} — ${label} 🌙 #Shorts`.slice(0, 100),
+            description:
+              `من قناة قيمة — نخلّي الأطفال يفهموا القرآن بحب 🌙\n` +
+              `سورة ${surah.surahName} (${label}).\n\n` +
+              `▶️ الحلقة كاملة: https://youtube.com/watch?v=${videoId}\n\n` +
+              `#قيمة #قرآن_للأطفال #تفسير #Shorts`,
+            tags: [...(titleInfo.tags || []), 'shorts', 'قيمة', 'قرآن للأطفال', 'تفسير للأطفال'].slice(0, 30),
+            publishAt,
+          });
+          await DB.log(ep.id, 'publishing', 'success',
+            `📅 شورت ${i + 1}/${shorts.length} مجدوَل للنشر ${publishAt} — https://youtube.com/watch?v=${sId}`);
+        } catch (err: any) {
+          await DB.log(ep.id, 'publishing', 'warn',
+            `فشل رفع/جدولة الشورت ${i + 1}/${shorts.length}: ${String(err?.message || err)} — بنكمّل.`);
+        }
+      }
+    }
+
     console.log('[orchestrator] PIPELINE COMPLETE');
   } catch (err: any) {
     const msg = String(err?.message || err);
