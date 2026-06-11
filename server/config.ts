@@ -77,5 +77,6 @@ export const WORK_ROOT = optional('WORK_DIR', path.join(process.cwd(), 'data', '
 export const ASSETS_DIR = path.join(process.cwd(), 'assets');
 export const LOGO_PATH = path.join(ASSETS_DIR, 'logo.png');
 export const OUTRO_PATH = path.join(ASSETS_DIR, 'outro.mp4');
+export const INTRO_AUDIO_PATH = path.join(ASSETS_DIR, 'intro.mp3'); // انترو ثابت (يتولّد مرة واحدة)
 // خط عربي للترجمة المحروقة (يُركَّب في الـ workflow عبر apt: fonts-noto)
 export const ARABIC_FONT = optional('ARABIC_FONT', 'Noto Naskh Arabic');
