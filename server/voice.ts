@@ -108,3 +108,13 @@ export async function synthesize(
   }
   throw new Error(`[voice] فشل توليد الصوت بعد ${retries} محاولات: ${String((lastErr as Error)?.message || lastErr)}`);
 }
+
+/** يدمج عدة ملفات صوت في ملف واحد (للانترو الثابت + المتغيّر). */
+export async function concatAudio(parts: string[], outPath: string): Promise<string> {
+  const fs = await import('fs');
+  const path = await import('path');
+  const listPath = path.join(path.dirname(outPath), 'audio_concat.txt');
+  fs.writeFileSync(listPath, parts.map((f) => `file '${path.resolve(f).replace(/'/g, "'\\''")}'`).join('\n'));
+  await execFileAsync('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c:a', 'libmp3lame', '-q:a', '2', outPath]);
+  return outPath;
+}
