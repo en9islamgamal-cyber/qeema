@@ -28,7 +28,7 @@ async function tryOneKey(key: string, prompt: string, dest: string): Promise<'ok
     },
     body: JSON.stringify({
       inputs: prompt.slice(0, 1900),
-      parameters: { width: 1024, height: 576 }, // 16:9 تقريبًا
+      parameters: { width: 1024, height: 576, num_inference_steps: 12 }, // steps أعلى = تشريح أنضف
     }),
   });
 
