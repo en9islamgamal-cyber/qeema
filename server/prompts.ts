@@ -54,6 +54,11 @@ between scenes (close-up, wide, from above), include small charming details and
 gentle expressions, and you may feature a recurring friendly little child
 character to give the series a familiar feel. Keep it calm — not busy or
 overstimulating.
+Anatomy: keep bodies SIMPLE and clearly correct — natural proportions, clear
+hands and feet. Prefer easy poses (standing, walking, sitting normally, hands
+gently raised). AVOID hard-to-draw poses such as prostration (sujood), bowing,
+kneeling tucked under the body, crossed limbs, or complex hand gestures, because
+they often render with distorted limbs.
 `.trim();
 
 /** ما يجب تجنّبه في كل صورة. */
@@ -69,6 +74,8 @@ no smooth digital gradients, no 3D render, no distorted hands, no creepy faces.
  * ========================================================== */
 
 export interface EpisodeIdea {
+  ayahStart: number;     // أول آية تغطّيها الفكرة
+  ayahEnd: number;       // آخر آية (نفس ayahStart لو آية واحدة)
   explanation: string;   // شرح الفكرة (عامية مصرية، بدون تشكيل) — يتحوّل لصوت
   sketchPrompt: string;  // وصف إنجليزي لاسكتش الفكرة (بدون نص داخل الصورة)
   caption: string;       // تعليق عربي قصير جدًا يُركّب فوق الركن
@@ -76,7 +83,7 @@ export interface EpisodeIdea {
 
 export interface EpisodePlan {
   intro: string;         // مقطع المقدمة (يتحوّل لصوت)
-  ideas: EpisodeIdea[];  // 3 أو 4 أفكار
+  ideas: EpisodeIdea[];  // 3 أو 4 أفكار حسب طول السورة
   closing: string;       // جملة الختام/الانتقال للمراجعة
 }
 
@@ -86,16 +93,18 @@ export const EPISODE_PLAN_SCHEMA = {
     intro: { type: 'string', description: 'مقدمة دافية تذكر اسم السورة وإننا في رحلة' },
     ideas: {
       type: 'array',
-      minItems: 4,
+      minItems: 3,
       maxItems: 4,
       items: {
         type: 'object',
         properties: {
-          explanation: { type: 'string', description: 'شرح الفكرة بعامية بسيطة بدون تشكيل وبدون نص قرآني' },
+          ayahStart: { type: 'integer', description: 'رقم أول آية في الفكرة' },
+          ayahEnd: { type: 'integer', description: 'رقم آخر آية في الفكرة (=ayahStart لو آية واحدة)' },
+          explanation: { type: 'string', description: 'شرح الآيات دي بعامية بسيطة بدون تشكيل وبدون كتابة نص قرآني' },
           sketchPrompt: { type: 'string', description: 'وصف إنجليزي لاسكتش الفكرة (يبدأ بالستايل الموحّد، بدون أي نص)' },
           caption: { type: 'string', description: 'تعليق عربي قصير جدًا (كلمتين/ثلاثة)' },
         },
-        required: ['explanation', 'sketchPrompt', 'caption'],
+        required: ['ayahStart', 'ayahEnd', 'explanation', 'sketchPrompt', 'caption'],
       },
     },
     closing: { type: 'string', description: 'جملة ختام تنقل الأطفال للمراجعة' },
@@ -104,7 +113,8 @@ export const EPISODE_PLAN_SCHEMA = {
 };
 
 export function buildEpisodePlanPrompt(
-  surah: SurahInput
+  surah: SurahInput,
+  totalAyat: number
 ): { system: string; user: string; schema: typeof EPISODE_PLAN_SCHEMA } {
   const range =
     surah.ayahEnd && surah.ayahEnd !== surah.ayahStart
@@ -148,11 +158,17 @@ ${CHANNEL_IDENTITY}
 
   const user = `
 ابنِ خطة حلقة "قيمة" عن سورة ${surah.surahName} (${range}).
+السورة فيها ${totalAyat} آية.
 
 - intro: سلام دافي + "رحلتنا النهارده مع سورة ${surah.surahName}" + إنها سورة سهلة وحلوة.
-- ideas: قسّم معنى السورة لـ 4 أفكار بالظبط بترتيب الآيات (لازم 4، لا أقل). كل فكرة:
-    * explanation: شرح بسيط جدًا بعامية مصرية + مثال قريب من عالم الطفل + العبرة الصغيرة.
-    * sketchPrompt: اسكتش بسيط يعبّر عن الفكرة (يبدأ بالستايل الموحّد).
+- ideas: قسّم السورة لـ 3 أو 4 أفكار بترتيب الآيات، وكل فكرة تغطّي نطاق آيات:
+    * لو الآيات طويلة: ممكن الفكرة = آية واحدة.
+    * لو الآيات قصيرة جدًا (كلمة أو كلمتين زي القسم): اجمع 3 أو 4 آيات قصيرة مترابطة في فكرة واحدة.
+    * النطاقات لازم تغطّي كل السورة من الآية 1 إلى الآية ${totalAyat} من غير فجوات ولا تداخل.
+    * لكل فكرة: ayahStart و ayahEnd (أرقام الآيات فقط — مش نص الآيات).
+    * explanation: شرح بسيط جدًا بعامية مصرية للآيات دي + مثال قريب من عالم الطفل + العبرة الصغيرة.
+      (مهم: ماتكتبش نص الآية نفسه — إحنا بنجيبه من مصدر موثوق. اكتب الشرح بس.)
+    * sketchPrompt: اسكتش بسيط يعبّر عن معنى الآيات دي (يبدأ بالستايل الموحّد).
     * caption: تعليق عربي قصير جدًا.
 - closing: بالظبط بهذه الروح: "كده خلصت رحلتنا النهارده يا أصدقائي، وخلّونا نفكّركم
   بالآيات عشان حفظها يبقى سهل عليكم، ونراجعها سوا."
