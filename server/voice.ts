@@ -60,15 +60,20 @@ async function ffprobeDuration(file: string): Promise<number> {
 
 /**
  * يولّد مقطع صوت واحد من نص.
+ * @param opts.raw   لو true: نص قرآني — يُحافَظ على التشكيل ومفيش قاموس نطق (يتقال زي ما هو).
+ * @param opts.tempo سرعة (atempo): 0.95 = أبطأ شوية، 1.05 = أسرع شوية. الافتراضي 1.0.
  * @returns { filePath, durationSeconds }
  */
 export async function synthesize(
   text: string,
   outPath: string,
-  retries = 3
+  opts: { raw?: boolean; tempo?: number; retries?: number } = {}
 ): Promise<{ filePath: string; durationSeconds: number }> {
-  const clean = applyPronunciation(stripTashkeel(text));
-  if (!clean) throw new Error('[voice] نص فاضي بعد إزالة التشكيل.');
+  const retries = opts.retries ?? 3;
+  const tempo = opts.tempo ?? 1.0;
+  // قرآن: نحافظ على التشكيل ومفيش قاموس نطق. غير كده: عامية بدون تشكيل + قاموس.
+  const clean = opts.raw ? text.replace(/\s+/g, ' ').trim() : applyPronunciation(stripTashkeel(text));
+  if (!clean) throw new Error('[voice] نص فاضي.');
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS.voiceId}?output_format=mp3_44100_128`;
   const body = JSON.stringify({
@@ -97,7 +102,17 @@ export async function synthesize(
       const buf = Buffer.from(await res.arrayBuffer());
       if (buf.length < 500) throw new Error(`صوت صغير/فاسد (${buf.length}B)`);
       fs.mkdirSync(path.dirname(outPath), { recursive: true });
-      fs.writeFileSync(outPath, buf);
+
+      if (tempo && Math.abs(tempo - 1.0) > 0.001) {
+        // اكتب مؤقت ثم طبّق السرعة
+        const raw = outPath + '.raw.mp3';
+        fs.writeFileSync(raw, buf);
+        await execFileAsync('ffmpeg', ['-y', '-i', raw, '-filter:a', `atempo=${tempo}`, '-c:a', 'libmp3lame', '-q:a', '2', outPath]);
+        try { fs.unlinkSync(raw); } catch {}
+      } else {
+        fs.writeFileSync(outPath, buf);
+      }
+
       const durationSeconds = await ffprobeDuration(outPath);
       return { filePath: outPath, durationSeconds };
     } catch (err) {
