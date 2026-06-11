@@ -174,18 +174,27 @@ async function normalizeOutro(workDir: string): Promise<string | null> {
   if (!fs.existsSync(OUTRO_PATH)) return null;
   const out = path.join(workDir, 'outro_norm.mp4');
   const audio = await hasAudio(OUTRO_PATH);
+
+  // خلفية مموّهة من الفيديو نفسه تملا الجوانب (بدل الأسود) + الفيديو في النص
+  const vfilter =
+    `[0:v]split=2[bg][fg];` +
+    `[bg]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=22:4,eq=brightness=-0.06,setsar=1[bgb];` +
+    `[fg]scale=${W}:${H}:force_original_aspect_ratio=decrease,setsar=1[fgs];` +
+    `[bgb][fgs]overlay=(W-w)/2:(H-h)/2,fps=${FPS}[v]`;
+
   const args = audio
     ? [
         '-i', OUTRO_PATH,
-        '-vf', `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=${FPS}`,
+        '-filter_complex', vfilter,
+        '-map', '[v]', '-map', '0:a',
         '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(FPS),
         '-c:a', 'aac', '-ar', '44100', '-b:a', '192k', out,
       ]
     : [
         '-i', OUTRO_PATH,
         '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
-        '-vf', `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=${FPS}`,
-        '-map', '0:v', '-map', '1:a',
+        '-filter_complex', vfilter,
+        '-map', '[v]', '-map', '1:a',
         '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(FPS),
         '-c:a', 'aac', '-ar', '44100', '-b:a', '192k', '-shortest', out,
       ];
@@ -231,15 +240,12 @@ export async function assembleEpisode(input: AssemblyInput): Promise<string> {
   console.log('[video] الختام');
   clips.push(await makeClip(gridImage, closingAudio, path.join(workDir, 'c_closing.mp4'), workDir, 'closing', {}));
 
-  console.log('[video] التلاوة الثانية (مراجعة)');
-  clips.push(await makeClip(gridImage, recitationPath, path.join(workDir, 'c_recite2.mp4'), workDir, 'recite2', {}));
-
   const outro = await normalizeOutro(workDir);
   if (outro) clips.push(outro);
   else console.warn('[video] تحذير: مفيش outro.mp4 — هيتمّ التجميع بدون أوترو.');
 
-  // تشخيص: تأكد إن كل مقطع موجود وله مدة (يكشف لو التلاوة الثانية مثلًا طلعت صفر)
-  const labels = ['intro', 'recite1', ...ideas.map((_, i) => `idea${i}`), 'closing', 'recite2', ...(outro ? ['outro'] : [])];
+  // تشخيص: تأكد إن كل مقطع موجود وله مدة
+  const labels = ['intro', 'recite1', ...ideas.map((_, i) => `idea${i}`), 'closing', ...(outro ? ['outro'] : [])];
   for (let i = 0; i < clips.length; i++) {
     if (!fs.existsSync(clips[i]) || fs.statSync(clips[i]).size < 1000) {
       throw new Error(`[video] المقطع "${labels[i]}" مفقود/فاضي: ${clips[i]}`);
