@@ -12,6 +12,8 @@ export interface UploadParams {
   title: string;
   description: string;
   tags: string[];
+  /** ISO 8601 — لو موجود: يرفع الفيديو private وينشره يوتيوب تلقائيًا في الميعاد ده (نشر مجدوَل). */
+  publishAt?: string;
 }
 
 export async function uploadVideo(params: UploadParams): Promise<string> {
@@ -22,7 +24,14 @@ export async function uploadVideo(params: UploadParams): Promise<string> {
   oauth2.setCredentials({ refresh_token: YOUTUBE.refreshToken() });
 
   const youtube = google.youtube({ version: 'v3', auth: oauth2 });
-  console.log(`[youtube] بدء رفع: "${params.title}" (${YOUTUBE.privacyStatus})`);
+  // النشر المجدوَل يتطلّب privacyStatus = 'private' وقت الرفع؛ يوتيوب يخليه public في ميعاد publishAt.
+  const scheduled = !!params.publishAt;
+  const privacyStatus = scheduled ? 'private' : YOUTUBE.privacyStatus;
+  console.log(
+    scheduled
+      ? `[youtube] بدء رفع مجدوَل: "${params.title}" (private → نشر تلقائي ${params.publishAt})`
+      : `[youtube] بدء رفع: "${params.title}" (${privacyStatus})`
+  );
 
   const res = await youtube.videos.insert({
     part: ['snippet', 'status'],
@@ -36,8 +45,9 @@ export async function uploadVideo(params: UploadParams): Promise<string> {
         defaultAudioLanguage: 'ar',
       },
       status: {
-        privacyStatus: YOUTUBE.privacyStatus,
+        privacyStatus,
         selfDeclaredMadeForKids: true, // محتوى للأطفال
+        ...(scheduled ? { publishAt: params.publishAt } : {}),
       },
     },
     media: { body: fs.createReadStream(params.filePath) },
