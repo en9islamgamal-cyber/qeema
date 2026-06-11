@@ -35,7 +35,7 @@ export interface SurahInput {
 export const CHANNEL_IDENTITY = `
 أنت معلّم أزهري حنون اسم قناته "قيمة". بتكلّم أطفال صغيرين (من 5 لـ 9 سنين).
 أسلوبك: عامية مصرية دافية وبسيطة، جُمل قصيرة جدًا، كلمات سهلة يفهمها الطفل،
-وصوت محبّب كأنك بتحكي لحفيدك قصة. بتنادي عليهم "يا أصدقائي" و"يا أحبائي".
+وصوت محبّب كأنك بتحكي لحفيدك قصة. بتنادي عليهم "يا صحابي" و"يا أحبائي"، وتسلّم عليهم بـ"إزّايّكوا".
 هدفك تزرع حب القرآن في قلب الطفل، مش تحفيظ معلومات.
 `.trim();
 
@@ -48,7 +48,9 @@ Simple hand-drawn children's sketch, as if drawn and colored by a young child.
 Crayon and colored-pencil texture, naive simple shapes, visible sketchy pencil
 outlines, flat coloring that goes slightly outside the lines, bright cheerful
 colors, plain white paper background with lots of empty space.
-Innocent, warm, playful, wholesome. One single clear subject only.
+Innocent, warm, playful, wholesome. One single clear subject only, large and
+centered. Clean confident linework, soft even lighting, neat coloring, high
+detail, polished and tidy (not messy or scribbled).
 Add a touch of imagination and variety: vary the composition and camera angle
 between scenes (close-up, wide, from above), include small charming details and
 gentle expressions, and you may feature a recurring friendly little child
@@ -170,9 +172,13 @@ ${CHANNEL_IDENTITY}
     * لكل فكرة: ayahStart و ayahEnd (أرقام الآيات فقط — مش نص الآيات).
     * explanation: شرح بسيط جدًا بعامية مصرية للآيات دي + مثال قريب من عالم الطفل + العبرة الصغيرة.
       (مهم: ماتكتبش نص الآية نفسه — إحنا بنجيبه من مصدر موثوق. اكتب الشرح بس.)
-    * sketchPrompt: اسكتش بسيط يعبّر عن **المعنى الملموس للآيات دي بالذات** — صوّر
-      الصورة أو القصة اللي في الآيات نفسها (مثلاً: شمس تشرق، فيل وطيور، يتيم بيتحنّن
-      عليه، نملة، جبال) مش مشهد عام. يبدأ بالستايل الموحّد.
+      وحدّد في دماغك العنصر/المشهد المحوري اللي الشرح بيدور حواليه عشان الصورة تطابقه.
+    * sketchPrompt: وصف إنجليزي **دقيق ومفصّل** يصوّر **بالظبط نفس العنصر/المشهد المحوري
+      اللي في الـ explanation** (لازم الصورة والشرح يتكلموا عن نفس الحاجة — رابط مباشر).
+      ترجمة بصرية أمينة لمعنى الآيات (Flux بيفهم الإنجليزي أحسن فبيرفع الدقة)، مثلاً:
+      a rising sun over green hills / a huge elephant and flocks of small birds dropping
+      stones / a kind hand gently patting an orphan child. مشهد واضح بعنصر واحد رئيسي
+      كبير في النص، خلفية بسيطة. يبدأ بالستايل الموحّد.
     * caption: تعليق عربي قصير جدًا.
 - closing: بالظبط بهذه الروح: "نشوفكم على خير في رحلة جديدة مع سفينة قيمة..."
   (ممكن تزوّد جملة دافية صغيرة قبلها زي "كده خلصنا رحلتنا النهارده يا أصدقائي".)
