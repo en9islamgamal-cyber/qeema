@@ -71,6 +71,20 @@ export const YOUTUBE = {
   privacyStatus: optional('YOUTUBE_PRIVACY', 'unlisted') as 'private' | 'public' | 'unlisted',
 };
 
+/* ---------- الشورتس (توليد من الكاش + رفع مجدول تلقائي) ---------- */
+export const SHORTS = {
+  // توليد الشورتس العمودية من كاش الحلقة (صفر API).
+  enabled: optional('SHORTS_ENABLED', 'true').toLowerCase() !== 'false',
+  // رفعها تلقائيًا على يوتيوب (private + نشر مجدوَل).
+  upload: optional('SHORTS_UPLOAD', 'true').toLowerCase() !== 'false',
+  // أول شورت ينشر بعد كام يوم من نشر الحلقة.
+  firstDelayDays: parseInt(optional('SHORTS_FIRST_DELAY_DAYS', '1'), 10),
+  // المسافة بالأيام بين كل شورت والتاني (تنقيط بدل دفعة واحدة).
+  intervalDays: parseInt(optional('SHORTS_INTERVAL_DAYS', '2'), 10),
+  // ساعة النشر بتوقيت UTC (15 UTC ≈ 6 مساءً بتوقيت الكويت / 5 مساءً مصر).
+  publishHourUtc: parseInt(optional('SHORTS_PUBLISH_HOUR_UTC', '15'), 10),
+};
+
 /* ---------- مجلدات العمل + أبعاد الفيديو ---------- */
 export const VIDEO = { width: 1920, height: 1080, fps: 30 };
 export const WORK_ROOT = optional('WORK_DIR', path.join(process.cwd(), 'data', 'renders'));
