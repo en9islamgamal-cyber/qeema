@@ -8,13 +8,14 @@ import * as path from 'path';
 import { DB } from './db.ts';
 import { WORK_ROOT } from './config.ts';
 import { Episode, episodeToSurah } from './types.ts';
-import { fetchRecitation } from './reciter.ts';
+import { fetchRecitation, getAyahCount } from './reciter.ts';
 import { generateEpisodePlan, generateTitle } from './llm.ts';
 import { synthesize } from './voice.ts';
 import { generateImage } from './images.ts';
-import { buildGrid, assembleEpisode } from './video.ts';
+import { buildGrid, assembleEpisode, cellLayout } from './video.ts';
 import { uploadVideo } from './youtube.ts';
 import { buildThumbnailPrompt } from './prompts.ts';
+import { fetchSurahAyat, ayahRangeForTts } from './quran.ts';
 
 export async function runEpisode(idOrNumber: string): Promise<void> {
   const episode = await DB.getEpisodeById(idOrNumber);
@@ -28,30 +29,39 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
   await DB.log(ep.id, 'scheduler', 'info', `بدء معالجة الحلقة ${ep.episodeNumber}: سورة ${ep.surahName} (حالة: ${ep.status})`);
 
   try {
-    /* 1) الخطة (LLM) */
+    /* 1) الخطة (LLM) — الـ LLM يحدد أرقام الآيات فقط */
     await DB.setStatus(ep.id, 'scripting');
-    await DB.log(ep.id, 'scripting', 'info', 'توليد خطة الحلقة (تفسير + أفكار + اسكتشات)…');
-    const plan = await generateEpisodePlan(surah, ep.id);
+    await DB.log(ep.id, 'scripting', 'info', 'توليد خطة الحلقة (تفسير + نطاقات آيات + اسكتشات)…');
+    const totalAyat = getAyahCount(surah.surahNumber);
+    const plan = await generateEpisodePlan(surah, ep.id, totalAyat);
     await DB.savePlan(ep.id, plan);
     const titleInfo = await generateTitle(plan, surah, ep.id);
     await DB.setTitle(ep.id, titleInfo.title);
     await DB.log(ep.id, 'scripting', 'success', `الخطة جاهزة: ${plan.ideas.length} أفكار — العنوان: ${titleInfo.title}`);
+
+    /* نص الآيات بالتشكيل من مصدر موثوق (مش من الـ LLM) */
+    await DB.log(ep.id, 'scripting', 'info', 'جلب نص الآيات بالتشكيل من مصدر موثوق…');
+    const ayatMap = await fetchSurahAyat(surah.surahNumber);
 
     /* 2) التلاوة (everyayah) */
     await DB.setStatus(ep.id, 'asset_generation');
     await DB.log(ep.id, 'asset_generation', 'info', 'تنزيل ودمج التلاوة…');
     const recitation = await fetchRecitation(surah, workDir);
 
-    /* 3) الصوت (ElevenLabs) — مقدمة + كل فكرة + ختام */
-    await DB.log(ep.id, 'asset_generation', 'info', 'توليد التعليق الصوتي…');
+    /* 3) الصوت (ElevenLabs) — لكل فكرة: [الآية بصوت الشرح] ثم [الشرح] */
+    await DB.log(ep.id, 'asset_generation', 'info', 'توليد التعليق الصوتي (الآية + الشرح)…');
     const introAudio = (await synthesize(plan.intro, path.join(workDir, 'narr_intro.mp3'))).filePath;
     const ideaAudios: string[] = [];
     for (let i = 0; i < plan.ideas.length; i++) {
-      ideaAudios.push((await synthesize(plan.ideas[i].explanation, path.join(workDir, `narr_idea${i}.mp3`))).filePath);
+      const idea = plan.ideas[i];
+      const ayahText = ayahRangeForTts(ayatMap, idea.ayahStart, idea.ayahEnd);
+      // الآية الأول (بالتشكيل من المصدر) وبعدها الشرح — كله بصوت الشرح
+      const segmentText = ayahText ? `${ayahText} ... ${idea.explanation}` : idea.explanation;
+      ideaAudios.push((await synthesize(segmentText, path.join(workDir, `narr_idea${i}.mp3`))).filePath);
     }
     const closingAudio = (await synthesize(plan.closing, path.join(workDir, 'narr_closing.mp3'))).filePath;
 
-    /* 4) الصور (Leonardo): اسكتش لكل فكرة + ثمبنايل */
+    /* 4) الصور: اسكتش لكل فكرة + ثمبنايل */
     await DB.log(ep.id, 'asset_generation', 'info', 'توليد الاسكتشات والثمبنايل…');
     const sketchPaths: string[] = [];
     for (let i = 0; i < plan.ideas.length; i++) {
@@ -63,11 +73,12 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
     );
     const gridImage = await buildGrid(sketchPaths, workDir);
 
-    /* 5) التجميع (FFmpeg) */
+    /* 5) التجميع (FFmpeg) — التخطيط يتأقلم مع عدد الأفكار */
     await DB.setStatus(ep.id, 'rendering');
     await DB.log(ep.id, 'rendering', 'info', 'تجميع الفيديو النهائي…');
+    const layout = cellLayout(plan.ideas.length);
     const ideasForVideo = plan.ideas.map((idea, i) => ({
-      quadrant: i,                 // الترتيب نفسه = موضع الربع في الشبكة
+      focus: layout[i],            // خلية الفكرة في الشبكة (للزوم)
       audioPath: ideaAudios[i],
       caption: idea.caption,
     }));
