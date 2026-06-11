@@ -37,30 +37,47 @@ async function hasAudio(file: string): Promise<boolean> {
   }
 }
 
-/** يبني شبكة 2×2 من الاسكتشات (المفروض دايمًا 4؛ أي فراغ يتملّى أبيض مش أسود). */
-export async function buildGrid(sketchPaths: string[], workDir: string): Promise<string> {
-  const cell = { w: Math.floor(W / 2), h: Math.floor(H / 2) };
-  // لو (لأي سبب) أقل من 4، جهّز خلية بيضا بدل اللوجو على خلفية سودا
-  let whiteCell = '';
-  if (sketchPaths.length < 4) {
-    whiteCell = path.join(workDir, 'white_cell.png');
-    await ff(['-f', 'lavfi', '-i', `color=white:s=${cell.w}x${cell.h}`, '-frames:v', '1', whiteCell]);
+/** تخطيط الخلايا حسب العدد. كل خلية 16:9 (نصف العرض × نصف الطول) عشان الزوم يملأها بـ zoom=2. */
+export function cellLayout(n: number): { x: number; y: number; w: number; h: number }[] {
+  const cw = Math.floor(W / 2), ch = Math.floor(H / 2);
+  if (n <= 3) {
+    // 2 فوق + 1 تحت في النص
+    return [
+      { x: 0, y: 0, w: cw, h: ch },
+      { x: cw, y: 0, w: cw, h: ch },
+      { x: Math.floor(W / 4), y: ch, w: cw, h: ch },
+    ].slice(0, n);
   }
-  const cells = [...sketchPaths];
-  while (cells.length < 4) cells.push(whiteCell);
-  const inputs: string[] = [];
-  cells.slice(0, 4).forEach((p) => inputs.push('-i', p));
-  const scaled = cells
-    .slice(0, 4)
-    .map((_, i) => `[${i}:v]scale=${cell.w}:${cell.h}:force_original_aspect_ratio=increase,crop=${cell.w}:${cell.h},setsar=1[c${i}]`)
-    .join(';');
+  // 4: شبكة 2×2
+  return [
+    { x: 0, y: 0, w: cw, h: ch },
+    { x: cw, y: 0, w: cw, h: ch },
+    { x: 0, y: ch, w: cw, h: ch },
+    { x: cw, y: ch, w: cw, h: ch },
+  ];
+}
+
+/** يبني الصورة الكاملة من الاسكتشات على خلفية بيضا (تخطيط متأقلم 3 أو 4). */
+export async function buildGrid(sketchPaths: string[], workDir: string): Promise<string> {
+  const n = sketchPaths.length;
+  const layout = cellLayout(n);
+  const inputs: string[] = ['-f', 'lavfi', '-i', `color=white:s=${W}x${H}`];
+  sketchPaths.forEach((p) => inputs.push('-i', p));
+
+  const parts: string[] = [];
+  sketchPaths.forEach((_, i) => {
+    parts.push(`[${i + 1}:v]scale=${layout[i].w}:${layout[i].h}:force_original_aspect_ratio=increase,crop=${layout[i].w}:${layout[i].h},setsar=1[s${i}]`);
+  });
+  // overlay متسلسل فوق الخلفية البيضا
+  let last = '[0:v]';
+  sketchPaths.forEach((_, i) => {
+    const out = i === sketchPaths.length - 1 ? '[grid]' : `[o${i}]`;
+    parts.push(`${last}[s${i}]overlay=${layout[i].x}:${layout[i].y}${out}`);
+    last = `[o${i}]`;
+  });
+
   const grid = path.join(workDir, 'grid.png');
-  await ff([
-    ...inputs,
-    '-filter_complex',
-    `${scaled};[c0][c1]hstack=inputs=2[top];[c2][c3]hstack=inputs=2[bot];[top][bot]vstack=inputs=2[grid]`,
-    '-map', '[grid]', '-frames:v', '1', grid,
-  ]);
+  await ff([...inputs, '-filter_complex', parts.join(';'), '-map', '[grid]', '-frames:v', '1', grid]);
   return grid;
 }
 
@@ -88,8 +105,9 @@ Dialogue: 0,0:00:00.00,9:59:59.00,Q,,${safe}
 
 const escFilter = (p: string) => p.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
 
+interface Rect { x: number; y: number; w: number; h: number; }
 interface ClipOpts {
-  quadrant?: number;       // 0..3 -> زوم على ربع الشبكة
+  focus?: Rect;            // الخلية اللي نعمل عليها زوم
   caption?: string;        // تعليق عربي محروق
 }
 
@@ -108,16 +126,13 @@ async function makeClip(
 
   const chain: string[] = [];
   // 1) القاعدة:
-  //    - فكرة: زوم إن على الركن (سريع) ← ثبات ← زوم أوت للصورة الكاملة في الآخر.
-  //      كده كل مقطع يبدأ وينتهي على "الصورة الكاملة" فالقطع بين المقاطع غير محسوس.
+  //    - فكرة: زوم إن على الخلية (سريع) ← ثبات ← زوم أوت للصورة الكاملة في الآخر.
   //    - غير كده: الصورة الكاملة ثابتة.
-  if (opts.quadrant !== undefined) {
-    const col = opts.quadrant % 2, row = Math.floor(opts.quadrant / 2);
-    const cw = Math.floor(W / 2), ch = Math.floor(H / 2);
-    const cx = col * cw + cw / 2;   // مركز الركن في الشبكة
-    const cy = row * ch + ch / 2;
-    let inF = Math.round(1.2 * FPS);   // مدة الزوم إن
-    let outF = Math.round(1.0 * FPS);  // مدة الزوم أوت
+  if (opts.focus) {
+    const cx = opts.focus.x + opts.focus.w / 2;   // مركز الخلية في الشبكة
+    const cy = opts.focus.y + opts.focus.h / 2;
+    let inF = Math.round(1.2 * FPS);
+    let outF = Math.round(1.0 * FPS);
     if (frames < inF + outF + FPS) { inF = Math.round(0.8 * FPS); outF = Math.round(0.6 * FPS); }
     const outStart = Math.max(inF + 1, frames - outF);
     const z = `if(lt(on,${inF}),1+on/${inF},if(lt(on,${outStart}),2,max(1,2-(on-${outStart})/${outF})))`;
@@ -191,7 +206,7 @@ export interface AssemblyInput {
   recitationPath: string;
   introAudio: string;
   closingAudio: string;
-  ideas: { quadrant: number; audioPath: string; caption: string }[];
+  ideas: { focus: Rect; audioPath: string; caption: string }[];
   introCaption: string; // عادةً عنوان الحلقة
 }
 
@@ -207,9 +222,9 @@ export async function assembleEpisode(input: AssemblyInput): Promise<string> {
   clips.push(await makeClip(gridImage, recitationPath, path.join(workDir, 'c_recite1.mp4'), workDir, 'recite1', {}));
 
   for (let i = 0; i < ideas.length; i++) {
-    console.log(`[video] فكرة ${i + 1}/${ideas.length} (زوم على الربع ${ideas[i].quadrant})`);
+    console.log(`[video] فكرة ${i + 1}/${ideas.length}`);
     clips.push(await makeClip(gridImage, ideas[i].audioPath, path.join(workDir, `c_idea${i}.mp4`), workDir, `idea${i}`, {
-      quadrant: ideas[i].quadrant, caption: ideas[i].caption,
+      focus: ideas[i].focus, caption: ideas[i].caption,
     }));
   }
 
