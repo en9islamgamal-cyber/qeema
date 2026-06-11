@@ -34,10 +34,12 @@ export async function fetchSurahAyat(surahNumber: number, retries = 3): Promise<
  * - يحافظ على الحركات الأساسية (فتحة/ضمة/كسرة/شدة/سكون) عشان النطق يطلع صح.
  */
 export function cleanAyahForTts(text: string): string {
+  // نحافظ على التشكيل الكامل (الحركات) عشان النطق يطلع فصيح صحيح.
+  // نشيل فقط: علامات الوقف/التجويد الصغيرة، رمز نهاية الآية، وأرقام الآيات.
   return text
-    .replace(/[\u06D6-\u06ED]/g, '') // علامات الوقف والتجويد والسجدة
-    .replace(/[\u0660-\u0669\u06F0-\u06F9]/g, '') // أرقام الآيات العربية لو وجدت
-    .replace(/\u06DD/g, '')
+    .replace(/[\u06D6-\u06DC\u06DE-\u06E4\u06E7-\u06ED]/g, '') // علامات وقف/تجويد (مش الحركات)
+    .replace(/\u06DD/g, '')                 // رمز نهاية الآية ۝
+    .replace(/[\u0660-\u0669\u06F0-\u06F9]/g, '') // أرقام عربية
     .replace(/\s+/g, ' ')
     .trim();
 }
