@@ -50,8 +50,8 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
 
     /* 3) الصوت (ElevenLabs) — لكل فكرة: [الآية بصوت الشرح] ثم [الشرح] */
     await DB.log(ep.id, 'asset_generation', 'info', 'توليد التعليق الصوتي (الآية + الشرح)…');
-    // المقدمة = الانترو الثابت (لو موجود) + الجزء المتغيّر المولّد
-    const introVar = (await synthesize(plan.intro, path.join(workDir, 'narr_intro_var.mp3'))).filePath;
+    // المقدمة = الانترو الثابت (لو موجود) + الجزء المتغيّر المولّد (سرعة كلام 1.05)
+    const introVar = (await synthesize(plan.intro, path.join(workDir, 'narr_intro_var.mp3'), { tempo: 1.05 })).filePath;
     let introAudio = introVar;
     if (fs.existsSync(INTRO_AUDIO_PATH)) {
       introAudio = await concatAudio([INTRO_AUDIO_PATH, introVar], path.join(workDir, 'narr_intro.mp3'));
@@ -59,15 +59,22 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
     } else {
       await DB.log(ep.id, 'asset_generation', 'warn', 'مفيش assets/intro.mp3 — هيتمّ استخدام الجزء المتغيّر فقط. (شغّل make_intro.ts)');
     }
+
     const ideaAudios: string[] = [];
     for (let i = 0; i < plan.ideas.length; i++) {
       const idea = plan.ideas[i];
       const ayahText = ayahRangeForTts(ayatMap, idea.ayahStart, idea.ayahEnd);
-      // الآية الأول (بالتشكيل من المصدر) وبعدها الشرح — كله بصوت الشرح
-      const segmentText = ayahText ? `${ayahText} ... ${idea.explanation}` : idea.explanation;
-      ideaAudios.push((await synthesize(segmentText, path.join(workDir, `narr_idea${i}.mp3`))).filePath);
+      // الشرح: عامية، سرعة 1.05
+      const explAudio = (await synthesize(idea.explanation, path.join(workDir, `narr_idea${i}_expl.mp3`), { tempo: 1.05 })).filePath;
+      if (ayahText) {
+        // الآية: قرآن بتشكيل كامل، بدون قاموس نطق، سرعة أبطأ 0.95 (أوضح وأفصح)
+        const ayahAudio = (await synthesize(ayahText, path.join(workDir, `narr_idea${i}_ayah.mp3`), { raw: true, tempo: 0.95 })).filePath;
+        ideaAudios.push(await concatAudio([ayahAudio, explAudio], path.join(workDir, `narr_idea${i}.mp3`)));
+      } else {
+        ideaAudios.push(explAudio);
+      }
     }
-    const closingAudio = (await synthesize(plan.closing, path.join(workDir, 'narr_closing.mp3'))).filePath;
+    const closingAudio = (await synthesize(plan.closing, path.join(workDir, 'narr_closing.mp3'), { tempo: 1.05 })).filePath;
 
     /* 4) الصور: اسكتش لكل فكرة + ثمبنايل */
     await DB.log(ep.id, 'asset_generation', 'info', 'توليد الاسكتشات والثمبنايل…');
