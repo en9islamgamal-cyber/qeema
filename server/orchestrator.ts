@@ -6,11 +6,11 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { DB } from './db.ts';
-import { WORK_ROOT } from './config.ts';
+import { WORK_ROOT, INTRO_AUDIO_PATH } from './config.ts';
 import { Episode, episodeToSurah } from './types.ts';
 import { fetchRecitation, getAyahCount } from './reciter.ts';
 import { generateEpisodePlan, generateTitle } from './llm.ts';
-import { synthesize } from './voice.ts';
+import { synthesize, concatAudio } from './voice.ts';
 import { generateImage } from './images.ts';
 import { buildGrid, assembleEpisode, cellLayout } from './video.ts';
 import { uploadVideo } from './youtube.ts';
@@ -50,7 +50,15 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
 
     /* 3) الصوت (ElevenLabs) — لكل فكرة: [الآية بصوت الشرح] ثم [الشرح] */
     await DB.log(ep.id, 'asset_generation', 'info', 'توليد التعليق الصوتي (الآية + الشرح)…');
-    const introAudio = (await synthesize(plan.intro, path.join(workDir, 'narr_intro.mp3'))).filePath;
+    // المقدمة = الانترو الثابت (لو موجود) + الجزء المتغيّر المولّد
+    const introVar = (await synthesize(plan.intro, path.join(workDir, 'narr_intro_var.mp3'))).filePath;
+    let introAudio = introVar;
+    if (fs.existsSync(INTRO_AUDIO_PATH)) {
+      introAudio = await concatAudio([INTRO_AUDIO_PATH, introVar], path.join(workDir, 'narr_intro.mp3'));
+      await DB.log(ep.id, 'asset_generation', 'info', 'تمّ لزق الانترو الثابت قبل الجزء المتغيّر.');
+    } else {
+      await DB.log(ep.id, 'asset_generation', 'warn', 'مفيش assets/intro.mp3 — هيتمّ استخدام الجزء المتغيّر فقط. (شغّل make_intro.ts)');
+    }
     const ideaAudios: string[] = [];
     for (let i = 0; i < plan.ideas.length; i++) {
       const idea = plan.ideas[i];
