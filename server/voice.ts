@@ -9,6 +9,7 @@ import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { ELEVENLABS } from './config.ts';
+import { normalizeArabicForTts } from './arabicTtsNormalizer.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -72,7 +73,9 @@ export async function synthesize(
   const retries = opts.retries ?? 3;
   const tempo = opts.tempo ?? 1.0;
   // قرآن: نحافظ على التشكيل ومفيش قاموس نطق. غير كده: عامية بدون تشكيل + قاموس.
-  const clean = opts.raw ? text.replace(/\s+/g, ' ').trim() : applyPronunciation(stripTashkeel(text));
+  // وفي الحالتين: تطبيع اللام الشمسية ولفظ الجلالة قبل الإرسال.
+  const base = opts.raw ? text.replace(/\s+/g, ' ').trim() : applyPronunciation(stripTashkeel(text));
+  const clean = normalizeArabicForTts(base);
   if (!clean) throw new Error('[voice] نص فاضي.');
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS.voiceId}?output_format=mp3_44100_128`;
