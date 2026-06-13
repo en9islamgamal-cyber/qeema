@@ -6,17 +6,21 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { DB } from './db.ts';
-import { WORK_ROOT, INTRO_AUDIO_PATH, SHORTS } from './config.ts';
+import { WORK_ROOT, SHORTS } from './config.ts';
 import { Episode, episodeToSurah } from './types.ts';
-import { fetchRecitation, getAyahCount } from './reciter.ts';
+import { fetchRecitation, fetchAyahClip, getAyahCount } from './reciter.ts';
 import { generateEpisodePlan, generateTitle } from './llm.ts';
 import { synthesize, concatAudio } from './voice.ts';
 import { generateImage } from './images.ts';
-import { buildGrid, assembleEpisode, cellLayout } from './video.ts';
+import { buildGrid, assembleEpisode, cellLayout, renderThumbnailText } from './video.ts';
 import { generateShorts } from './shorts.ts';
 import { uploadVideo } from './youtube.ts';
 import { buildThumbnailPrompt } from './prompts.ts';
 import { fetchSurahAyat, ayahRangeForTts } from './quran.ts';
+
+/** تحويل الأرقام لعربية-هندية (١٢٣) للثمبنايل. */
+const toArabicDigits = (n: number): string =>
+  String(n).replace(/[0-9]/g, (d) => '٠١٢٣٤٥٦٧٨٩'[Number(d)]);
 
 export async function runEpisode(idOrNumber: string): Promise<void> {
   const episode = await DB.getEpisodeById(idOrNumber);
@@ -49,29 +53,27 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
     await DB.log(ep.id, 'asset_generation', 'info', 'تنزيل ودمج التلاوة…');
     const recitation = await fetchRecitation(surah, workDir);
 
-    /* 3) الصوت (ElevenLabs) — لكل فكرة: [الآية بصوت الشرح] ثم [الشرح] */
-    await DB.log(ep.id, 'asset_generation', 'info', 'توليد التعليق الصوتي (الآية + الشرح)…');
-    // المقدمة = الانترو الثابت (لو موجود) + الجزء المتغيّر المولّد (سرعة كلام 1.05)
-    const introVar = (await synthesize(plan.intro, path.join(workDir, 'narr_intro_var.mp3'), { tempo: 1.05 })).filePath;
-    let introAudio = introVar;
-    if (fs.existsSync(INTRO_AUDIO_PATH)) {
-      introAudio = await concatAudio([INTRO_AUDIO_PATH, introVar], path.join(workDir, 'narr_intro.mp3'));
-      await DB.log(ep.id, 'asset_generation', 'info', 'تمّ لزق الانترو الثابت قبل الجزء المتغيّر.');
-    } else {
-      await DB.log(ep.id, 'asset_generation', 'warn', 'مفيش assets/intro.mp3 — هيتمّ استخدام الجزء المتغيّر فقط. (شغّل make_intro.ts)');
-    }
+    /* 3) الصوت (ElevenLabs للشرح + الحصري للآيات) */
+    await DB.log(ep.id, 'asset_generation', 'info', 'توليد التعليق الصوتي (الآية بصوت الحصري + الشرح بالعامية)…');
+    // المقدمة المتغيّرة فقط (اسم السورة + "نسمع الآيات الأول").
+    // الانترو الثابت البراند بيتركّب كمقطع منفصل في البداية جوّه video.ts (زي الاوترو).
+    const introAudio = (await synthesize(plan.intro, path.join(workDir, 'narr_intro_var.mp3'), { tempo: 1.05 })).filePath;
 
     const ideaAudios: string[] = [];
     for (let i = 0; i < plan.ideas.length; i++) {
       const idea = plan.ideas[i];
-      const ayahText = ayahRangeForTts(ayatMap, idea.ayahStart, idea.ayahEnd);
-      // الشرح: عامية، سرعة 1.05
+      // الشرح: عامية مصرية، سرعة 1.05
       const explAudio = (await synthesize(idea.explanation, path.join(workDir, `narr_idea${i}_expl.mp3`), { tempo: 1.05 })).filePath;
-      if (ayahText) {
-        // الآية: قرآن بتشكيل كامل، بدون قاموس نطق، سرعة أبطأ 0.95 (أوضح وأفصح)
-        const ayahAudio = (await synthesize(ayahText, path.join(workDir, `narr_idea${i}_ayah.mp3`), { raw: true, tempo: 0.95 })).filePath;
-        ideaAudios.push(await concatAudio([ayahAudio, explAudio], path.join(workDir, `narr_idea${i}.mp3`)));
-      } else {
+      // الآية بصوت الحصري الحقيقي (مش ElevenLabs) — ده اللي بيضمن النطق السليم 100%.
+      // fetchAyahClip بيحط جاب صغير بعد التلاوة (RECITATION_END_GAP_MS) قبل الشرح،
+      // وسكتة أمان أول/آخر الآية عشان ميتقصّش أول/آخر حرف.
+      try {
+        const ayahClip = await fetchAyahClip(surah.surahNumber, idea.ayahStart, workDir, idea.ayahEnd);
+        ideaAudios.push(await concatAudio([ayahClip.filePath, explAudio], path.join(workDir, `narr_idea${i}.mp3`)));
+      } catch (err: any) {
+        // لو فشل تنزيل آية الفكرة، نكمّل بالشرح بس (مانكسرش الحلقة).
+        await DB.log(ep.id, 'asset_generation', 'warn',
+          `تعذّر جلب تلاوة آية الفكرة ${i + 1} (${idea.ayahStart}-${idea.ayahEnd}): ${String(err?.message || err)} — هنكمّل بالشرح بس.`);
         ideaAudios.push(explAudio);
       }
     }
@@ -83,10 +85,24 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
     for (let i = 0; i < plan.ideas.length; i++) {
       sketchPaths.push(await generateImage(plan.ideas[i].sketchPrompt, path.join(workDir, `sketch${i}.png`)));
     }
-    const thumbnailPath = await generateImage(
-      buildThumbnailPrompt(surah, titleInfo.theme),
-      path.join(workDir, 'thumbnail.png')
-    );
+    // الثمبنايل: نكتب العنوان على خلفية ثابتة (assets/thumbnail.png).
+    // السور الكبيرة (نطاق آيات جزئي) بنزوّد سطر "الآيات من كذا إلى كذا".
+    const totalAyatForThumb = getAyahCount(surah.surahNumber);
+    const tStart = surah.ayahStart || 1;
+    const tEnd = surah.ayahEnd && surah.ayahEnd > 0 ? surah.ayahEnd : totalAyatForThumb;
+    const isFullSurah = tStart <= 1 && tEnd >= totalAyatForThumb;
+    const thumbLines = isFullSurah
+      ? [`رحلة في معاني سورة ${surah.surahName}`]
+      : [`رحلة في معاني سورة ${surah.surahName}`, `الآيات من ${toArabicDigits(tStart)} إلى ${toArabicDigits(tEnd)}`];
+
+    let thumbnailPath = await renderThumbnailText(thumbLines, workDir);
+    if (!thumbnailPath) {
+      await DB.log(ep.id, 'asset_generation', 'warn', 'مفيش assets/thumbnail.png — هيتولّد ثمبنايل بالـ AI كاحتياطي. (حط الصورة في assets/thumbnail.png)');
+      thumbnailPath = await generateImage(
+        buildThumbnailPrompt(surah, titleInfo.theme),
+        path.join(workDir, 'thumbnail.png')
+      );
+    }
     const gridImage = await buildGrid(sketchPaths, workDir);
 
     /* 5) التجميع (FFmpeg) — التخطيط يتأقلم مع عدد الأفكار */
