@@ -10,10 +10,18 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { VIDEO, LOGO_PATH, OUTRO_PATH, ARABIC_FONT } from './config.ts';
+import { VIDEO, LOGO_PATH, OUTRO_PATH, ARABIC_FONT, ASSETS_DIR, INTRO_AUDIO_PATH } from './config.ts';
 
 const execFileAsync = promisify(execFile);
 const W = VIDEO.width, H = VIDEO.height, FPS = VIDEO.fps;
+const INTRO_VIDEO_PATH = path.join(ASSETS_DIR, 'intro.mp4'); // انترو فيديو اختياري (لو موجود يُستخدم بدل صورة البراند)
+// تركيب لوجو إضافي فوق انترو الفيديو؟ افتراضيًا لأ — لأن انترو الفيديو غالبًا فيه
+// البراند/اللوجو أصلاً. خلّيه INTRO_OVERLAY_LOGO=1 بس لو الفيديو من غير لوجو.
+const INTRO_OVERLAY_LOGO = process.env.INTRO_OVERLAY_LOGO === '1';
+// لوجو الانترو = نفس واترمارك الفيديوهات العادية بالظبط (تحت-يمين، 300px، هامش 40).
+const INTRO_LOGO_SIZE = parseInt(process.env.INTRO_LOGO_SIZE || '300', 10);
+const INTRO_LOGO_MARGIN = parseInt(process.env.INTRO_LOGO_MARGIN || '40', 10);
+const THUMBNAIL_BG_PATH = path.join(ASSETS_DIR, 'thumbnail.png'); // خلفية الثمبنايل الثابتة (لو موجودة)
 
 async function ff(args: string[]): Promise<void> {
   await execFileAsync('ffmpeg', ['-y', '-hide_banner', '-loglevel', 'error', ...args], { maxBuffer: 1024 * 1024 * 64 });
@@ -95,8 +103,8 @@ Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold
 Style: Q,${ARABIC_FONT},58,&H00FFFFFF,&H00303030,&H90000000,1,3,2,2,60,60,70
 
 [Events]
-Format: Layer, Start, End, Style, Text
-Dialogue: 0,0:00:00.00,9:59:59.00,Q,,${safe}
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,9:59:59.00,Q,,0,0,0,,${safe}
 `;
   const p = path.join(workDir, `cap_${tag}.ass`);
   fs.writeFileSync(p, ass, 'utf-8');
@@ -169,6 +177,100 @@ async function makeClip(
   return outPath;
 }
 
+/** يبني/يطبّع مقطع الانترو الثابت اللي يتركّب في بداية كل حلقة (زي الاوترو في الآخر).
+ *  أولوية:
+ *   1) assets/intro.mp4 (انترو Veo احترافي) → دمج عالي المستوى:
+ *      ملء الإطار + اللوجو الحقيقي بظهور ناعم + سرد الانترو (intro.mp3) فوق موسيقى
+ *      الفيديو مع خفضها (ducking). كده الصوت بتاعنا واللوجو دايمًا صح مهما رسم Veo.
+ *   2) assets/intro.mp3 فقط → مقطع براند (خلفية متدرّجة دافية + اللوجو + fade).
+ *   3) ولا واحد → null (الحلقة تكمّل بدون انترو ثابت — مع تحذير). */
+async function normalizeIntro(workDir: string): Promise<string | null> {
+  const hasNar = fs.existsSync(INTRO_AUDIO_PATH);
+
+  // (1) انترو فيديو احترافي (Veo)
+  if (fs.existsSync(INTRO_VIDEO_PATH)) {
+    const out = path.join(workDir, 'intro_norm.mp4');
+    const vDur = await ffprobeDuration(INTRO_VIDEO_PATH);
+    if (vDur <= 0) { console.warn('[video] تحذير: intro.mp4 بلا مدة صالحة — تخطّينا الانترو.'); return null; }
+    const vHasAudio = await hasAudio(INTRO_VIDEO_PATH);
+
+    // ترتيب الإدخالات: 0=الفيديو، [السرد لو موجود]، [اللوجو لو مفعّل]، [صمت لو مفيش أي صوت]
+    const inputs: string[] = ['-i', INTRO_VIDEO_PATH];
+    let idx = 1;
+    let narIdx = -1;
+    if (hasNar) { inputs.push('-i', INTRO_AUDIO_PATH); narIdx = idx++; }
+    let logoIdx = -1;
+    // لو انترو الفيديو فيه البراند/اللوجو أصلاً (الحالة الشائعة)، سيب INTRO_OVERLAY_LOGO
+    // فاضي/0 عشان مانركّبش لوجو زيادة فوقه. خلّيه =1 بس لو الفيديو من غير لوجو.
+    if (INTRO_OVERLAY_LOGO) { inputs.push('-loop', '1', '-i', LOGO_PATH); logoIdx = idx++; }
+
+    // فيديو: خلفية مموّهة تملا الجوانب + الفيديو في النص (+ لوجو سفلي-وسط لو مفعّل).
+    let vchain =
+      `[0:v]split=2[bg][fg];` +
+      `[bg]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=22:4,eq=brightness=-0.05,setsar=1[bgb];` +
+      `[fg]scale=${W}:${H}:force_original_aspect_ratio=decrease,setsar=1[fgs];` +
+      `[bgb][fgs]overlay=(W-w)/2:(H-h)/2[base]`;
+    if (logoIdx >= 0) {
+      // لوجو واحد في نفس مكان وحجم واترمارك الفيديوهات العادية (تحت-يمين).
+      vchain +=
+        `;[${logoIdx}:v]scale=${INTRO_LOGO_SIZE}:-1,format=rgba[lg];` +
+        `[base][lg]overlay=W-w-${INTRO_LOGO_MARGIN}:H-h-${INTRO_LOGO_MARGIN},fps=${FPS}[v]`;
+    } else {
+      vchain += `;[base]fps=${FPS}[v]`;
+    }
+
+    // صوت: 4 حالات (موسيقى الفيديو + سرد / موسيقى بس / سرد بس / مفيش).
+    let achain = '';
+    let amap: string;
+    const extra: string[] = [];
+    if (vHasAudio && hasNar) {
+      achain = `;[0:a]volume=0.28[m];[${narIdx}:a]volume=1.0,apad[n];[m][n]amix=inputs=2:duration=first:normalize=0[a]`;
+      amap = '[a]';
+    } else if (vHasAudio && !hasNar) {
+      amap = '0:a';
+    } else if (!vHasAudio && hasNar) {
+      achain = `;[${narIdx}:a]apad[a]`;
+      amap = '[a]';
+    } else {
+      extra.push('-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100');
+      amap = `${idx}:a`; // الصمت أول إدخال بعد كل الإدخالات الحقيقية
+    }
+
+    await ff([
+      ...inputs, ...extra,
+      '-filter_complex', vchain + achain,
+      '-map', '[v]', '-map', amap, '-t', String(vDur),
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(FPS),
+      '-c:a', 'aac', '-ar', '44100', '-b:a', '192k', out,
+    ]);
+    return out;
+  }
+
+  // (2) صوت انترو ثابت + لوجو على خلفية متدرّجة (مقطع البراند)
+  if (fs.existsSync(INTRO_AUDIO_PATH)) {
+    const dur = await ffprobeDuration(INTRO_AUDIO_PATH);
+    if (dur <= 0) { console.warn('[video] تحذير: intro.mp3 بلا مدة صالحة — تخطّينا الانترو.'); return null; }
+    const out = path.join(workDir, 'intro_norm.mp4');
+    const fadeOut = Math.max(0, dur - 0.6).toFixed(2);
+    await ff([
+      '-f', 'lavfi', '-t', String(dur),
+      '-i', `gradients=s=${W}x${H}:c0=0x0f2a4a:c1=0x2f7fb5:x0=0:y0=0:x1=${W}:y1=${H}`,
+      '-i', INTRO_AUDIO_PATH,
+      '-loop', '1', '-t', String(dur), '-i', LOGO_PATH,
+      '-filter_complex',
+        `[2:v]scale=520:-1[lg];` +
+        `[0:v]format=yuv420p,fps=${FPS}[bg];` +
+        `[bg][lg]overlay=(W-w)/2:(H-h)/2-40,fade=t=in:st=0:d=0.5,fade=t=out:st=${fadeOut}:d=0.6[v]`,
+      '-map', '[v]', '-map', '1:a',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(FPS),
+      '-c:a', 'aac', '-ar', '44100', '-b:a', '192k', '-shortest', out,
+    ]);
+    return out;
+  }
+
+  return null;
+}
+
 /** يعيد ترميز الأوترو لنفس مواصفات المقاطع (مع صوت صامت لو ملوش صوت). */
 async function normalizeOutro(workDir: string): Promise<string | null> {
   if (!fs.existsSync(OUTRO_PATH)) return null;
@@ -209,6 +311,66 @@ async function concat(clips: string[], outPath: string, workDir: string): Promis
   await ff(['-f', 'concat', '-safe', '0', '-i', list, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(FPS), '-c:a', 'aac', '-ar', '44100', outPath]);
 }
 
+/**
+ * يكتب عنوان الحلقة على خلفية الثمبنايل الثابتة (assets/thumbnail.png) ويرجّع مسار PNG.
+ * لو مفيش assets/thumbnail.png يرجّع null (والـ orchestrator يرجع للتوليد بالـ AI).
+ * النص بيتكتب في شريط سفلي شبه شفاف عشان يبان واضح فوق أي خلفية.
+ * @param lines سطر أو سطرين (مثلاً ['رحلة في معاني سورة الفيل'] أو [..., 'الآيات من 1 إلى 5'])
+ */
+export async function renderThumbnailText(lines: string[], workDir: string): Promise<string | null> {
+  if (!fs.existsSync(THUMBNAIL_BG_PATH)) return null;
+  const out = path.join(workDir, 'thumbnail.png');
+
+  const clean = lines.map((s) => s.replace(/[{}\n]/g, ' ').trim()).filter(Boolean);
+  if (clean.length === 0) return null;
+
+  // أحجام الخطوط (قابلة للتعديل من البيئة)
+  const titleSize = parseInt(process.env.THUMB_TITLE_SIZE || '104', 10);
+  const subSize = Math.round(titleSize * 0.6);
+  const opacity = process.env.THUMB_BAND_OPACITY || '0.70';
+
+  // الشريط السفلي + توسيط النص رأسيًا داخله
+  const bandTop = Math.round(H * 0.74);
+  const bandH = H - bandTop;
+  const hasSub = clean.length >= 2;
+  const blockH = hasSub ? titleSize * 1.25 + subSize * 1.3 : titleSize * 1.25;
+  const marginV = Math.max(20, Math.round((bandH - blockH) / 2));
+
+  // السطر الأول ذهبي عريض، والسطر الثاني (نطاق الآيات) أبيض أصغر.
+  const sub = hasSub ? `\\N{\\fs${subSize}\\c&H00FFFFFF&}${clean[1]}` : '';
+  const dialogueText = `${clean[0]}${sub}`;
+
+  const ass = `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${W}
+PlayResY: ${H}
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV
+Style: T,${ARABIC_FONT},${titleSize},&H0066D9FF,&H003C1E0F,&H00000000,1,5,3,2,90,90,${marginV}
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:05.00,T,,0,0,0,,${dialogueText}
+`;
+  const assPath = path.join(workDir, 'thumb.ass');
+  fs.writeFileSync(assPath, ass, 'utf-8');
+
+  await ff([
+    '-i', THUMBNAIL_BG_PATH,
+    '-filter_complex',
+      `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1[bg];` +
+      `[bg]drawbox=x=0:y=${bandTop}:w=${W}:h=${bandH}:color=0x0F1E3C@${opacity}:t=fill,` +
+      `drawbox=x=0:y=${bandTop}:w=${W}:h=7:color=0xF5C85A:t=fill[bb];` +
+      `[bb]subtitles='${escFilter(assPath)}'[v]`,
+    '-map', '[v]', '-frames:v', '1', out,
+  ]);
+
+  if (!fs.existsSync(out)) throw new Error('[video] فشل إنتاج الثمبنايل.');
+  return out;
+}
+
 export interface AssemblyInput {
   workDir: string;
   gridImage: string;
@@ -224,7 +386,16 @@ export async function assembleEpisode(input: AssemblyInput): Promise<string> {
   const { workDir, gridImage, recitationPath, introAudio, closingAudio, ideas } = input;
   const clips: string[] = [];
 
-  console.log('[video] مقطع المقدمة');
+  // مقطع الانترو الثابت (البراند) في البداية — زي الاوترو بالظبط بس أول الفيديو.
+  const introSeg = await normalizeIntro(workDir);
+  if (introSeg) {
+    console.log('[video] مقطع الانترو الثابت');
+    clips.push(introSeg);
+  } else {
+    console.warn('[video] تحذير: مفيش انترو ثابت (assets/intro.mp4 أو assets/intro.mp3) — شغّل make_intro.ts.');
+  }
+
+  console.log('[video] مقطع المقدمة (المتغيّر)');
   clips.push(await makeClip(gridImage, introAudio, path.join(workDir, 'c_intro.mp4'), workDir, 'intro', { caption: input.introCaption }));
 
   console.log('[video] التلاوة الأولى');
@@ -245,7 +416,7 @@ export async function assembleEpisode(input: AssemblyInput): Promise<string> {
   else console.warn('[video] تحذير: مفيش outro.mp4 — هيتمّ التجميع بدون أوترو.');
 
   // تشخيص: تأكد إن كل مقطع موجود وله مدة
-  const labels = ['intro', 'recite1', ...ideas.map((_, i) => `idea${i}`), 'closing', ...(outro ? ['outro'] : [])];
+  const labels = [...(introSeg ? ['intro_fixed'] : []), 'intro', 'recite1', ...ideas.map((_, i) => `idea${i}`), 'closing', ...(outro ? ['outro'] : [])];
   for (let i = 0; i < clips.length; i++) {
     if (!fs.existsSync(clips[i]) || fs.statSync(clips[i]).size < 1000) {
       throw new Error(`[video] المقطع "${labels[i]}" مفقود/فاضي: ${clips[i]}`);
