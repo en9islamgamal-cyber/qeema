@@ -31,11 +31,10 @@ async function main() {
   const raw = path.join(assetsDir, 'intro.raw.mp3');
   const out = path.join(assetsDir, 'intro.mp3');
 
-  console.log('بولّد صوت الانترو الثابت…');
+  console.log('بولّد صوت الانترو الثابت بنفس إعدادات الصوت للراوية…');
   const r = await synthesize(FIXED_INTRO_TEXT, raw, { tempo: 1.0 });
   console.log(`صوت الكلام: ${r.durationSeconds.toFixed(1)}s — بضيف ${LEAD}s سكوت أول و${TAIL}s آخر…`);
 
-  // ثانيتين سكوت في الأول (adelay) + ثانيتين سكوت في الآخر (apad pad_dur).
   await execFileAsync('ffmpeg', [
     '-y', '-hide_banner', '-loglevel', 'error',
     '-i', raw,
@@ -47,6 +46,5 @@ async function main() {
   const total = LEAD + r.durationSeconds + TAIL;
   console.log(`✅ اتعمل: ${out}`);
   console.log(`⏱️  الطول الكلي ≈ ${total.toFixed(1)}s  → خلّي مدة assets/intro.mp4 بنفس الرقم ده تقريبًا.`);
-  console.log('اسمعه! لو "قيمة" والنطق صح، ارفعه على الريبو في assets/intro.mp3.');
 }
 main().catch((e) => { console.error('فشل:', e?.message || e); process.exit(1); });
