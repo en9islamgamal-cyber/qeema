@@ -157,6 +157,15 @@ async function normalizeIntro(workDir: string): Promise<string | null> {
     if (vDur <= 0) { console.warn('[video] تحذير: intro.mp4 بلا مدة صالحة — تخطّينا الانترو.'); return null; }
     const vHasAudio = await hasAudio(INTRO_VIDEO_PATH);
 
+    // مستوى صوت موسيقى الانترو (اللي جوّه intro.mp4) — متحكَّم فيه من البيئة (كان 0.28 = شبه مكتوم).
+    const bgVol = parseFloat(process.env.INTRO_BG_VOLUME || '0.4');
+    // لو التعليق أطول من فيديو الانترو نمدّ المقطع (نثبّت آخر فريم) عشان الصوت ما يتقصّش.
+    const narDur = hasNar ? await ffprobeDuration(INTRO_AUDIO_PATH) : 0;
+    const segDur = Math.max(vDur, narDur);
+    const vpad = Math.max(0, segDur - vDur);
+    const tpadF = vpad > 0.05 ? `,tpad=stop_mode=clone:stop_duration=${vpad.toFixed(3)}` : '';
+    console.log(`[video] انترو: فيديو=${vDur.toFixed(1)}s تعليق=${narDur.toFixed(1)}s -> مقطع=${segDur.toFixed(1)}s`);
+
     const inputs: string[] = ['-i', INTRO_VIDEO_PATH];
     let idx = 1;
     let narIdx = -1;
@@ -172,13 +181,13 @@ async function normalizeIntro(workDir: string): Promise<string | null> {
       `[fg]scale=${W}:${H}:force_original_aspect_ratio=decrease,setsar=1[fgs];` +
       `[bgb][fgs]overlay=(W-w)/2:(H-h)/2[base];` +
       `[${logoIdx}:v]scale=300:-1,format=rgba[lg];` +
-      `[base][lg]overlay=W-w-40:H-h-40,fps=${FPS}[v]`;
+      `[base][lg]overlay=W-w-40:H-h-40,fps=${FPS}${tpadF}[v]`;
 
     let achain = '';
     let amap: string;
     const extra: string[] = [];
     if (vHasAudio && hasNar) {
-      achain = `;[0:a]volume=0.28[m];[${narIdx}:a]volume=1.0,apad[n];[m][n]amix=inputs=2:duration=first:normalize=0[a]`;
+      achain = `;[0:a]volume=${bgVol},apad[m];[${narIdx}:a]volume=1.0,apad[n];[m][n]amix=inputs=2:duration=longest:normalize=0[a]`;
       amap = '[a]';
     } else if (vHasAudio && !hasNar) {
       amap = '0:a';
@@ -193,7 +202,7 @@ async function normalizeIntro(workDir: string): Promise<string | null> {
     await ff([
       ...inputs, ...extra,
       '-filter_complex', vchain + achain,
-      '-map', '[v]', '-map', amap, '-t', String(vDur),
+      '-map', '[v]', '-map', amap, '-t', segDur.toFixed(3),
       '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(FPS),
       '-c:a', 'aac', '-ar', '44100', '-b:a', '192k', out,
     ]);
