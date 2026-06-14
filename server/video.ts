@@ -142,7 +142,7 @@ async function makeClip(visual: string, audio: string, outPath: string, workDir:
     '-filter_complex', chain.join(';'),
     '-map', lastV, '-map', '1:a',
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(FPS),
-    '-c:a', 'aac', '-ar', '44100', '-b:a', '192k',
+    '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '192k',
     '-shortest', outPath,
   ]);
   return outPath;
@@ -265,9 +265,31 @@ async function normalizeOutro(workDir: string): Promise<string | null> {
 }
 
 async function concat(clips: string[], outPath: string, workDir: string): Promise<void> {
-  const list = path.join(workDir, 'concat_clips.txt');
-  fs.writeFileSync(list, clips.map((c) => `file '${path.resolve(c).replace(/'/g, "'\\''")}'`).join('\n'));
-  await ff(['-f', 'concat', '-safe', '0', '-i', list, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(FPS), '-c:a', 'aac', '-ar', '44100', outPath]);
+  // ⚠️ الـ concat demuxer كان بيسقّط الصوت بعد أول مقطع (تايمستامب غير متّسق + اختلاف قنوات).
+  // الحل: concat filter — بنطبّع فيديو وصوت كل مقطع (ستيريو 44100) وبنعيد بناء تايملاين نظيف.
+  const n = clips.length;
+  const inputs: string[] = [];
+  for (const c of clips) inputs.push('-i', c);
+
+  let pre = '';
+  let pads = '';
+  for (let i = 0; i < n; i++) {
+    pre +=
+      `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
+      `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=${FPS},format=yuv420p[v${i}];` +
+      `[${i}:a]aresample=44100:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo[a${i}];`;
+    pads += `[v${i}][a${i}]`;
+  }
+  const filter = `${pre}${pads}concat=n=${n}:v=1:a=1[v][a]`;
+
+  await ff([
+    ...inputs,
+    '-filter_complex', filter,
+    '-map', '[v]', '-map', '[a]',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(FPS),
+    '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '192k',
+    outPath,
+  ]);
 }
 
 export async function renderThumbnailText(lines: string[], workDir: string): Promise<string | null> {
@@ -382,4 +404,3 @@ export async function assembleEpisode(input: AssemblyInput): Promise<string> {
   console.log(`[video] جاهز: ${finalPath}`);
   return finalPath;
 }
-
