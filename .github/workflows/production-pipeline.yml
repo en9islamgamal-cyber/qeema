@@ -9,6 +9,14 @@ on:
         description: 'رقم الحلقة أو الـ UUID (سيب فاضي لتشغيل التالية المجدولة)'
         required: false
         type: string
+      mode:
+        description: 'وضع التشغيل: normal = نشر عادي | test = صوت كامل + صور ثابتة + رفع unlisted بدون شورتس'
+        required: false
+        type: choice
+        default: 'normal'
+        options:
+          - normal
+          - test
 
 jobs:
   run-pipeline:
@@ -55,6 +63,14 @@ jobs:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          # ---------- وضع الاختبار ----------
+          # بياخد 'true' بس لما تختار mode=test من قايمة Run workflow.
+          # على الجدول (cron) بيفضل 'false' دايمًا (مفيش inputs).
+          TEST_MODE: ${{ github.event.inputs.mode == 'test' && 'true' || 'false' }}
+          # ---------- مستوى موسيقى الانترو (اختياري) ----------
+          INTRO_BG_VOLUME: ${{ secrets.INTRO_BG_VOLUME }}                  # افتراضي 0.4
+          # ---------- سرعة التلاوة (اختياري) ----------
+          RECITATION_TEMPO: ${{ secrets.RECITATION_TEMPO }}               # افتراضي 1.12
           # ---------- إعدادات الشورتس (كلها اختيارية — بتـ default لو الـ secret مش موجود) ----------
           SHORTS_ENABLED: ${{ secrets.SHORTS_ENABLED }}                    # true/false (افتراضي true)
           SHORTS_UPLOAD: ${{ secrets.SHORTS_UPLOAD }}                      # true/false (افتراضي true)
