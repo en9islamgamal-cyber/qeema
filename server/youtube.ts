@@ -14,6 +14,8 @@ export interface UploadParams {
   tags: string[];
   /** ISO 8601 — لو موجود: يرفع الفيديو private وينشره يوتيوب تلقائيًا في الميعاد ده (نشر مجدوَل). */
   publishAt?: string;
+  /** صورة الثمبنايل المخصّصة (اختياري) — تتطلّب قناة موثّقة بالهاتف. */
+  thumbnailPath?: string;
 }
 
 export async function uploadVideo(params: UploadParams): Promise<string> {
@@ -56,5 +58,22 @@ export async function uploadVideo(params: UploadParams): Promise<string> {
   const videoId = res.data.id;
   if (!videoId) throw new Error('[youtube] الرد مفهوش Video ID.');
   console.log(`[youtube] تم الرفع: https://youtube.com/watch?v=${videoId}`);
+
+  // ضبط الثمبنايل المخصّص (لو متوفّر). فشلُه مايوقّفش البايب لاين.
+  if (params.thumbnailPath && fs.existsSync(params.thumbnailPath)) {
+    try {
+      await youtube.thumbnails.set({
+        videoId,
+        media: { mimeType: 'image/png', body: fs.createReadStream(params.thumbnailPath) },
+      });
+      console.log(`[youtube] ✅ اتظبط الثمبنايل المخصّص للفيديو ${videoId}`);
+    } catch (err: any) {
+      console.warn(
+        `[youtube] ⚠️ فشل ضبط الثمبنايل (${String(err?.message || err)}). ` +
+        `غالبًا القناة لسه مش موثّقة بالهاتف — الثمبنايل المخصّص بيتطلب توثيق. الفيديو اترفع عادي.`
+      );
+    }
+  }
+
   return videoId;
 }
