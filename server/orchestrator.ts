@@ -6,7 +6,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { DB } from './db.ts';
-import { WORK_ROOT, SHORTS } from './config.ts';
+import { WORK_ROOT, SHORTS, ASSETS_DIR, LOGO_PATH } from './config.ts';
 import { Episode, episodeToSurah } from './types.ts';
 import { fetchRecitation, fetchAyahClip, getAyahCount } from './reciter.ts';
 import { generateEpisodePlan, generateTitle } from './llm.ts';
@@ -22,6 +22,23 @@ import { fetchSurahAyat, ayahRangeForTts } from './quran.ts';
 const toArabicDigits = (n: number): string =>
   String(n).replace(/[0-9]/g, (d) => '٠١٢٣٤٥٦٧٨٩'[Number(d)]);
 
+/** وضع الاختبار: TEST_MODE=true (أو 1) بيشغّل الصوت كامل بدون استهلاك credits صور. */
+const isTestMode = (): boolean => {
+  const v = (process.env.TEST_MODE || '').toLowerCase();
+  return v === 'true' || v === '1' || v === 'yes';
+};
+
+/** بيختار صورة ثابتة من assets للاستخدام في وضع الاختبار (بدل توليد بالـ AI). */
+function pickTestStill(): string {
+  const candidates = [
+    path.join(ASSETS_DIR, 'test.png'),
+    path.join(ASSETS_DIR, 'thumbnail.png'),
+    LOGO_PATH,
+  ];
+  for (const c of candidates) if (fs.existsSync(c)) return c;
+  throw new Error('[orchestrator] وضع الاختبار محتاج صورة ثابتة في assets/ (test.png أو thumbnail.png أو logo.png).');
+}
+
 export async function runEpisode(idOrNumber: string): Promise<void> {
   const episode = await DB.getEpisodeById(idOrNumber);
   if (!episode) throw new Error(`[orchestrator] الحلقة "${idOrNumber}" غير موجودة في جدول episodes.`);
@@ -30,6 +47,12 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
   const surah = episodeToSurah(ep);
   const workDir = path.join(WORK_ROOT, ep.id);
   fs.mkdirSync(workDir, { recursive: true });
+
+  const TEST = isTestMode();
+  const testStill = TEST ? pickTestStill() : '';
+  if (TEST) {
+    await DB.log(ep.id, 'scheduler', 'info', `🧪 وضع الاختبار مُفعّل: صوت كامل + صور ثابتة من assets (${path.basename(testStill)}) + بدون شورتس + رفع unlisted.`);
+  }
 
   await DB.log(ep.id, 'scheduler', 'info', `بدء معالجة الحلقة ${ep.episodeNumber}: سورة ${ep.surahName} (حالة: ${ep.status})`);
 
@@ -78,7 +101,13 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
     await DB.log(ep.id, 'asset_generation', 'info', 'توليد الاسكتشات والثمبنايل…');
     const sketchPaths: string[] = [];
     for (let i = 0; i < plan.ideas.length; i++) {
-      sketchPaths.push(await generateImage(plan.ideas[i].sketchPrompt, path.join(workDir, `sketch${i}.png`)));
+      const sp = path.join(workDir, `sketch${i}.png`);
+      if (TEST) {
+        fs.copyFileSync(testStill, sp); // وضع الاختبار: صورة ثابتة بدل توليد بالـ AI (صفر credits)
+      } else {
+        await generateImage(plan.ideas[i].sketchPrompt, sp);
+      }
+      sketchPaths.push(sp);
     }
     
     // إعداد نص الثمبنايل بناءً على طلبك
@@ -93,11 +122,17 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
 
     let thumbnailPath = await renderThumbnailText(thumbLines, workDir);
     if (!thumbnailPath) {
-      await DB.log(ep.id, 'asset_generation', 'warn', 'مفيش assets/thumbnail.png — هيتولّد ثمبنايل بالـ AI كاحتياطي.');
-      thumbnailPath = await generateImage(
-        buildThumbnailPrompt(surah, titleInfo.theme),
-        path.join(workDir, 'thumbnail.png')
-      );
+      if (TEST) {
+        thumbnailPath = path.join(workDir, 'thumbnail.png');
+        fs.copyFileSync(testStill, thumbnailPath); // وضع الاختبار: صورة الثمبنايل من الاسيتس بدون AI
+        await DB.log(ep.id, 'asset_generation', 'info', `وضع الاختبار: ثمبنايل من الاسيتس (${path.basename(testStill)}).`);
+      } else {
+        await DB.log(ep.id, 'asset_generation', 'warn', 'مفيش assets/thumbnail.png — هيتولّد ثمبنايل بالـ AI كاحتياطي.');
+        thumbnailPath = await generateImage(
+          buildThumbnailPrompt(surah, titleInfo.theme),
+          path.join(workDir, 'thumbnail.png')
+        );
+      }
     }
     const gridImage = await buildGrid(sketchPaths, workDir);
 
@@ -117,11 +152,11 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
       ideas: ideasForVideo,
       introCaption: titleInfo.title,
     });
-    await DB.saveFinalVideoUrl(ep.id, finalVideo);
+    if (!TEST) await DB.saveFinalVideoUrl(ep.id, finalVideo);
 
     /* 5.5) توليد الشورتس */
     let shorts: string[] = [];
-    if (SHORTS.enabled) {
+    if (!TEST && SHORTS.enabled) {
       await DB.log(ep.id, 'rendering', 'info', 'توليد الشورتس العمودية من الكاش…');
       shorts = await generateShorts(
         plan.ideas.map((idea, i) => ({
@@ -139,13 +174,21 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
 
     /* 6) الرفع (YouTube) */
     await DB.setStatus(ep.id, 'publishing');
-    await DB.log(ep.id, 'publishing', 'info', 'رفع الفيديو على يوتيوب…');
+    await DB.log(ep.id, 'publishing', 'info', TEST ? '🧪 وضع الاختبار: رفع نسخة unlisted للمراجعة…' : 'رفع الفيديو على يوتيوب…');
     const videoId = await uploadVideo({
       filePath: finalVideo,
-      title: titleInfo.title,
-      description: `${titleInfo.description}\n\nقناة قيمة — تفسير القرآن للأطفال.\nالثمبنايل: ${path.basename(thumbnailPath)}`,
+      title: TEST ? `[TEST] ${titleInfo.title}` : titleInfo.title,
+      description: `${titleInfo.description}\n\nقناة قيمة — تفسير القرآن للأطفال.`,
       tags: titleInfo.tags,
+      thumbnailPath,
     });
+
+    if (TEST) {
+      await DB.setStatus(ep.id, ep.status); // رجّع الحالة الأصلية — الاختبار مايغيّرش حالة الحلقة
+      await DB.log(ep.id, 'publishing', 'success', `🧪 وضع الاختبار خلص — نسخة مراجعة (مش منشورة رسميًا، ومفيش تغيير في حالة الحلقة): https://youtube.com/watch?v=${videoId}`);
+      console.log('[orchestrator] TEST PIPELINE COMPLETE');
+      return;
+    }
 
     await DB.setPublished(ep.id, videoId);
     await DB.log(ep.id, 'publishing', 'success', `✅ اكتملت الحلقة ${ep.episodeNumber}. https://youtube.com/watch?v=${videoId}`);
@@ -189,8 +232,13 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
   } catch (err: any) {
     const msg = String(err?.message || err);
     console.error(`[orchestrator] PIPELINE FAILED للحلقة ${ep.episodeNumber}: ${msg}`);
-    await DB.markFailed(ep.id, msg, (ep.retryCount || 0) + 1);
-    await DB.log(ep.id, 'scheduler', 'error', `فشل التشغيل: ${msg}`);
+    if (TEST) {
+      try { await DB.setStatus(ep.id, ep.status); } catch {} // رجّع الحالة — متعلّمش الحلقة كـ failed بسبب اختبار
+      await DB.log(ep.id, 'scheduler', 'error', `🧪 فشل تشغيل الاختبار (الحالة اترجّعت زي ما كانت): ${msg}`);
+    } else {
+      await DB.markFailed(ep.id, msg, (ep.retryCount || 0) + 1);
+      await DB.log(ep.id, 'scheduler', 'error', `فشل التشغيل: ${msg}`);
+    }
     throw err;
   }
 }
