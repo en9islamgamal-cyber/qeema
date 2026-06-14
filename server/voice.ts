@@ -127,12 +127,27 @@ export async function synthesize(
   throw new Error(`[voice] فشل توليد الصوت بعد ${retries} محاولات: ${String((lastErr as Error)?.message || lastErr)}`);
 }
 
-/** يدمج عدة ملفات صوت في ملف واحد (للانترو الثابت + المتغيّر). */
+/** يدمج عدة ملفات صوت في ملف واحد (تلاوة + شرح / الانترو الثابت + المتغيّر). */
 export async function concatAudio(parts: string[], outPath: string): Promise<string> {
-  const fs = await import('fs');
-  const path = await import('path');
-  const listPath = path.join(path.dirname(outPath), 'audio_concat.txt');
-  fs.writeFileSync(listPath, parts.map((f) => `file '${path.resolve(f).replace(/'/g, "'\\''")}'`).join('\n'));
-  await execFileAsync('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c:a', 'libmp3lame', '-q:a', '2', outPath]);
+  // ⚠️ الـ concat demuxer كان بيسكّت التلاوة عشان اختلاف القنوات (تلاوة ستيريو + شرح mono).
+  // الحل: concat filter — نطبّع كل جزء (ستيريو 44100) قبل الدمج.
+  const inputs: string[] = [];
+  for (const p of parts) inputs.push('-i', p);
+
+  let pre = '';
+  let ins = '';
+  parts.forEach((_, i) => {
+    pre += `[${i}:a]aresample=44100:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo[a${i}];`;
+    ins += `[a${i}]`;
+  });
+  const filter = `${pre}${ins}concat=n=${parts.length}:v=0:a=1[a]`;
+
+  await execFileAsync('ffmpeg', [
+    '-y', '-hide_banner', '-loglevel', 'error',
+    ...inputs,
+    '-filter_complex', filter,
+    '-map', '[a]',
+    '-c:a', 'libmp3lame', '-q:a', '2', outPath,
+  ]);
   return outPath;
 }
