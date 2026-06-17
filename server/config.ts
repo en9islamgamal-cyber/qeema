@@ -53,8 +53,8 @@ export const LEONARDO = {
 
 /* ---------- التلاوة (everyayah) ---------- */
 export const EVERYAYAH_BASE = 'https://everyayah.com/data';
-export const RECITER = optional('RECITER', 'Husary_Muallim_128kbps');
-export const RECITATION_TEMPO = parseFloat(optional('RECITATION_TEMPO', '1.2'));
+export const RECITER = optional('RECITER', 'MaherAlMuaiqly128kbps');
+export const RECITATION_TEMPO = parseFloat(optional('RECITATION_TEMPO', '1.0'));
 
 /* ---------- قاعدة البيانات (Supabase) ---------- */
 export const SUPABASE = {
