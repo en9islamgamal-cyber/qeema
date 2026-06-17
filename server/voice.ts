@@ -42,9 +42,59 @@ const PRONUNCIATION: [RegExp, string][] = [
   [/إزيكوا|ازيكوا|إزيكم|ازيكم/g, 'إزّايّكوا'],
 ];
 
+// ===== محرّك النطق المصري =====
+// خريطة فصحى→مصري (كلمات وظيفية آمنة). مُطفأة افتراضيًا — شغّلها بـ EGY_DIALECT_MAP=true.
+const DIALECT_MAP: Record<string, string> = {
+  'هذا': 'ده', 'هذه': 'دي', 'هؤلاء': 'دول', 'ذلك': 'ده', 'تلك': 'دي',
+  'الذي': 'اللي', 'التي': 'اللي', 'الذين': 'اللي',
+  'ماذا': 'إيه', 'لماذا': 'ليه', 'كيف': 'إزاي', 'متى': 'إمتى', 'أين': 'فين',
+  'الآن': 'دلوقتي', 'ليس': 'مش', 'ليست': 'مش',
+  'يريد': 'عايز', 'نريد': 'عايزين', 'أريد': 'عايز',
+  'كثيرا': 'كتير', 'جدا': 'قوي', 'أيضا': 'كمان', 'فقط': 'بس',
+};
+
+// كلمات دينية/فصحى ممنوع المسّ بيها نهائيًا (لا من الخريطة ولا القاموس).
+const PROTECTED = new Set<string>([
+  'الله', 'اللهم', 'لله', 'بالله', 'والله', 'تالله', 'الرحمن', 'الرحيم', 'القرآن', 'قرآن',
+  'الكريم', 'الرسول', 'النبي', 'الآية', 'الآيات', 'سبحان', 'سبحانه', 'تعالى', 'الجنة', 'النار',
+  'الصلاة', 'الزكاة', 'الذكر', 'ذكر', 'الحمد', 'بسم',
+]);
+
+function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// استبدال على مستوى الكلمة الكاملة فقط (مش جزء من كلمة).
+function replaceWord(text: string, from: string, to: string): string {
+  if (!from || PROTECTED.has(from)) return text;
+  const re = new RegExp(`(^|[^\\p{L}\\p{N}_])(${escapeRe(from)})(?=$|[^\\p{L}\\p{N}_])`, 'gu');
+  return text.replace(re, (_m, pre) => `${pre}${to}`);
+}
+
+// قاموس المستخدم: assets/pronunciation.json + متغيّر EGY_DICT (JSON). بيتحمّل مرة واحدة.
+let _userDict: Record<string, string> | null = null;
+function userDict(): Record<string, string> {
+  if (_userDict) return _userDict;
+  const d: Record<string, string> = {};
+  try {
+    const p = path.join(process.cwd(), 'assets', 'pronunciation.json');
+    if (fs.existsSync(p)) Object.assign(d, JSON.parse(fs.readFileSync(p, 'utf8')));
+  } catch { console.warn('[voice] تحذير: assets/pronunciation.json مش JSON صالح — اتساب.'); }
+  try { if (process.env.EGY_DICT) Object.assign(d, JSON.parse(process.env.EGY_DICT)); } catch {}
+  _userDict = d;
+  const n = Object.keys(d).length;
+  if (n) console.log(`[voice] قاموس النطق المصري: ${n} كلمة محمّلة.`);
+  return d;
+}
+
 function applyPronunciation(text: string): string {
   let t = text;
+  // ١) قواعد مدمجة (regex) — تصحيحات نطق ثابتة
   for (const [re, rep] of PRONUNCIATION) t = t.replace(re, rep);
+  // ٢) خريطة فصحى→مصري (اختيارية، محمية للكلمات الدينية)
+  if (process.env.EGY_DIALECT_MAP === 'true') {
+    for (const [from, to] of Object.entries(DIALECT_MAP)) t = replaceWord(t, from, to);
+  }
+  // ٣) قاموس المستخدم (أعلى أولوية — للكلمات اللي بتطلع غلط؛ ممكن تحط نطقها بالتشكيل)
+  for (const [from, to] of Object.entries(userDict())) t = replaceWord(t, from, to);
   return t;
 }
 
