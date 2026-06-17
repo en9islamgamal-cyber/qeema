@@ -349,6 +349,7 @@ export interface AssemblyInput {
   recitationPath: string;
   introAudio: string;
   closingAudio: string;
+  bridgeAudio?: string;
   ideas: { focus: Rect; audioPath: string; caption: string }[];
   introCaption: string;
 }
@@ -371,6 +372,11 @@ export async function assembleEpisode(input: AssemblyInput): Promise<string> {
   console.log('[video] التلاوة الأولى');
   clips.push(await makeClip(gridImage, recitationPath, path.join(workDir, 'c_recite1.mp4'), workDir, 'recite1', {}));
 
+  if (input.bridgeAudio) {
+    console.log('[video] الفاصل (تمهيد للتلاوة المقطّعة)');
+    clips.push(await makeClip(gridImage, input.bridgeAudio, path.join(workDir, 'c_bridge.mp4'), workDir, 'bridge', {}));
+  }
+
   for (let i = 0; i < ideas.length; i++) {
     console.log(`[video] فكرة ${i + 1}/${ideas.length}`);
     clips.push(await makeClip(gridImage, ideas[i].audioPath, path.join(workDir, `c_idea${i}.mp4`), workDir, `idea${i}`, {
@@ -385,7 +391,7 @@ export async function assembleEpisode(input: AssemblyInput): Promise<string> {
   if (outro) clips.push(outro);
   else console.warn('[video] تحذير: مفيش outro.mp4 — هيتمّ التجميع بدون أوترو.');
 
-  const labels = [...(introSeg ? ['intro_fixed'] : []), 'intro', 'recite1', ...ideas.map((_, i) => `idea${i}`), 'closing', ...(outro ? ['outro'] : [])];
+  const labels = [...(introSeg ? ['intro_fixed'] : []), 'intro', 'recite1', ...(input.bridgeAudio ? ['bridge'] : []), ...ideas.map((_, i) => `idea${i}`), 'closing', ...(outro ? ['outro'] : [])];
   for (let i = 0; i < clips.length; i++) {
     if (!fs.existsSync(clips[i]) || fs.statSync(clips[i]).size < 1000) {
       throw new Error(`[video] المقطع "${labels[i]}" مفقود/فاضي: ${clips[i]}`);
