@@ -25,10 +25,10 @@ const num = (k: string, d: number) => {
   const n = v ? parseInt(v, 10) : NaN;
   return Number.isFinite(n) && n >= 0 ? n : d;
 };
-const AYAH_LEAD_MS = num('AYAH_LEAD_MS', 80);   // سكوت أمان قبل كل آية (يحمي أول حرف)
-const AYAH_TAIL_MS = num('AYAH_TAIL_MS', 130);  // جاب طبيعي بعد كل آية (بين الآيات)
-const HEAD_MS = num('RECITATION_HEAD_MS', 150);  // سكوت في أول التلاوة كلها
-const END_GAP_MS = num('RECITATION_END_GAP_MS', 350); // جاب بعد التلاوة وقبل الشرح
+const AYAH_LEAD_MS = num('AYAH_LEAD_MS', 50);   // سكوت أمان قبل كل آية (يحمي أول حرف)
+const AYAH_TAIL_MS = num('AYAH_TAIL_MS', 60);  // جاب طبيعي بعد كل آية (بين الآيات)
+const HEAD_MS = num('RECITATION_HEAD_MS', 120);  // سكوت في أول التلاوة كلها
+const END_GAP_MS = num('RECITATION_END_GAP_MS', 250); // جاب بعد التلاوة وقبل الشرح
 
 /** عدد آيات كل سورة (عدّ حفص) للفاتحة + جزء عمّ. */
 const AYAH_COUNTS: Record<number, number> = {
