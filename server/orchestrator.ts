@@ -78,12 +78,12 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
 
     /* 3) الصوت (ElevenLabs للشرح + الحصري للآيات المفصلة) */
     await DB.log(ep.id, 'asset_generation', 'info', 'توليد التعليق الصوتي وتقسيم التلاوة قبل كل شرح…');
-    const introAudio = (await synthesize(plan.intro, path.join(workDir, 'narr_intro_var.mp3'), { tempo: 1.05 })).filePath;
+    const introAudio = (await synthesize(plan.intro, path.join(workDir, 'narr_intro_var.mp3'), { tempo: 1.0 })).filePath;
 
     const ideaAudios: string[] = [];
     for (let i = 0; i < plan.ideas.length; i++) {
       const idea = plan.ideas[i];
-      const explAudio = (await synthesize(idea.explanation, path.join(workDir, `narr_idea${i}_expl.mp3`), { tempo: 1.05 })).filePath;
+      const explAudio = (await synthesize(idea.explanation, path.join(workDir, `narr_idea${i}_expl.mp3`), { tempo: 0.92 })).filePath;
       
       try {
         // جلب تلاوة الآيات المحددة للفكرة دي عشان تتشرح
@@ -95,7 +95,11 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
         ideaAudios.push(explAudio);
       }
     }
-    const closingAudio = (await synthesize(plan.closing, path.join(workDir, 'narr_closing.mp3'), { tempo: 1.05 })).filePath;
+    const closingAudio = (await synthesize(plan.closing, path.join(workDir, 'narr_closing.mp3'), { tempo: 1.0 })).filePath;
+
+    // فاصل منطوق بين التلاوة المتواصلة وبداية التلاوة المقطّعة مع الشرح
+    const bridgeText = `يلا بينا يا أصحابي نسمع آيات ${surah.surahName} ونفهمها مع بعض، آية آية.`;
+    const bridgeAudio = (await synthesize(bridgeText, path.join(workDir, 'narr_bridge.mp3'), { tempo: 1.0 })).filePath;
 
     /* 4) الصور: اسكتش لكل فكرة + ثمبنايل بالنص الديناميكي */
     await DB.log(ep.id, 'asset_generation', 'info', 'توليد الاسكتشات والثمبنايل…');
@@ -148,7 +152,7 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
     const finalVideo = await assembleEpisode({
       workDir, gridImage,
       recitationPath: recitation.filePath,
-      introAudio, closingAudio,
+      introAudio, closingAudio, bridgeAudio,
       ideas: ideasForVideo,
       introCaption: titleInfo.title,
     });
