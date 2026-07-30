@@ -12,7 +12,7 @@ import { fetchRecitation, fetchAyahClip, getAyahCount } from './reciter.ts';
 import { generateEpisodePlan, generateTitle } from './llm.ts';
 import { synthesize, concatAudio } from './voice.ts';
 import { generateImage } from './images.ts';
-import { buildGrid, assembleEpisode, cellLayout, renderThumbnailText } from './video.ts';
+import { buildGrid, assembleEpisode, cellLayout, renderThumbnailText, compressThumbnail, ffprobeDuration } from './video.ts';
 import { generateShorts } from './shorts.ts';
 import { uploadVideo } from './youtube.ts';
 import { buildThumbnailPrompt } from './prompts.ts';
@@ -62,6 +62,18 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
     await DB.log(ep.id, 'scripting', 'info', 'توليد خطة الحلقة (تفسير + نطاقات آيات + اسكتشات)…');
     const totalAyat = getAyahCount(surah.surahNumber);
     const plan = await generateEpisodePlan(surah, ep.id, totalAyat);
+
+    // ضمان ترتيب الآيات تصاعديًا (يمنع لخبطة الترتيب مهما رجّع الموديل) + تحذير على الفجوات/التداخل
+    plan.ideas.sort((a: any, b: any) => (a.ayahStart - b.ayahStart) || (a.ayahEnd - b.ayahEnd));
+    for (let i = 1; i < plan.ideas.length; i++) {
+      const prev: any = plan.ideas[i - 1], cur: any = plan.ideas[i];
+      if (cur.ayahStart <= prev.ayahEnd) {
+        await DB.log(ep.id, 'scripting', 'warn', `⚠️ تداخل في ترتيب الآيات: فكرة تنتهي عند ${prev.ayahEnd} والتالية تبدأ من ${cur.ayahStart}.`);
+      } else if (cur.ayahStart > prev.ayahEnd + 1) {
+        await DB.log(ep.id, 'scripting', 'warn', `⚠️ فجوة في تغطية الآيات: من ${prev.ayahEnd + 1} لـ ${cur.ayahStart - 1} مش مغطّاة.`);
+      }
+    }
+
     await DB.savePlan(ep.id, plan);
     const titleInfo = await generateTitle(plan, surah, ep.id);
     await DB.setTitle(ep.id, titleInfo.title);
@@ -81,6 +93,7 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
     const introAudio = (await synthesize(plan.intro, path.join(workDir, 'narr_intro_var.mp3'), { tempo: 1.0 })).filePath;
 
     const ideaAudios: string[] = [];
+    const ideaRecStart: number[] = []; // مدة التلاوة المقطّعة في أول كل مقطع (الرسم يبدأ بعدها)
     for (let i = 0; i < plan.ideas.length; i++) {
       const idea = plan.ideas[i];
       const explAudio = (await synthesize(idea.explanation, path.join(workDir, `narr_idea${i}_expl.mp3`), { tempo: 0.92 })).filePath;
@@ -88,10 +101,13 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
       try {
         // جلب تلاوة الآيات المحددة للفكرة دي عشان تتشرح
         const ayahClip = await fetchAyahClip(surah.surahNumber, idea.ayahStart, workDir, idea.ayahEnd);
+        const ayahDur = await ffprobeDuration(ayahClip.filePath);
+        ideaRecStart.push(ayahDur > 0 ? ayahDur : 0);
         ideaAudios.push(await concatAudio([ayahClip.filePath, explAudio], path.join(workDir, `narr_idea${i}.mp3`)));
       } catch (err: any) {
         await DB.log(ep.id, 'asset_generation', 'warn',
           `تعذّر جلب تلاوة آية الفكرة ${i + 1} (${idea.ayahStart}-${idea.ayahEnd}): ${String(err?.message || err)} — هنكمّل بالشرح بس.`);
+        ideaRecStart.push(0); // مفيش تلاوة → الرسم من بداية المقطع
         ideaAudios.push(explAudio);
       }
     }
@@ -138,6 +154,8 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
         );
       }
     }
+    // ضغط الثمبنايل لـ JPEG 1280×720 (<2MB) عشان رفع يوتيوب ما يفشلش بسبب الحجم
+    thumbnailPath = await compressThumbnail(thumbnailPath, workDir);
     const gridImage = await buildGrid(sketchPaths, workDir);
 
     /* 5) التجميع (FFmpeg) */
@@ -148,6 +166,8 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
       focus: layout[i],
       audioPath: ideaAudios[i],
       caption: idea.caption,
+      sketch: sketchPaths[i],
+      revealStart: ideaRecStart[i],
     }));
     const finalVideo = await assembleEpisode({
       workDir, gridImage,
