@@ -13,6 +13,7 @@ import {
   buildEpisodePlanPrompt,
   buildTitlePrompt,
 } from './prompts.ts';
+import { fetchTafsir } from './tafsir.ts';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -97,7 +98,12 @@ async function generateJSON<T>(
 }
 
 export async function generateEpisodePlan(surah: SurahInput, episodeId: string, totalAyat: number): Promise<EpisodePlan> {
-  const p = buildEpisodePlanPrompt(surah, totalAyat);
+  // نجيب التفسير الموثوق الأول (الميسّر + السعدي) عشان يبقى مصدر الشرح الوحيد
+  const start = surah.ayahStart || 1;
+  const end = surah.ayahEnd || totalAyat;
+  const tafsir = await fetchTafsir(surah.surahNumber, start, end);
+
+  const p = buildEpisodePlanPrompt(surah, totalAyat, tafsir);
   const plan = await generateJSON<EpisodePlan>(p, p.schema, episodeId);
   if (!plan?.intro || !Array.isArray(plan.ideas) || plan.ideas.length < 3) {
     throw new Error('[llm] الخطة المرجّعة ناقصة (لازم intro + 3 ideas على الأقل).');
