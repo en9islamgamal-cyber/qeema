@@ -10,7 +10,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { VIDEO, LOGO_PATH, OUTRO_PATH, ARABIC_FONT, ASSETS_DIR, INTRO_AUDIO_PATH } from './config.ts';
+import { VIDEO, LOGO_PATH, OUTRO_PATH, ARABIC_FONT, ASSETS_DIR, INTRO_AUDIO_PATH, DRAW_REVEAL, REVEAL_SECS, PENCIL_VOLUME, PENCIL_IMG, PENCIL_SND } from './config.ts';
 
 const execFileAsync = promisify(execFile);
 const W = VIDEO.width, H = VIDEO.height, FPS = VIDEO.fps;
@@ -20,7 +20,7 @@ const THUMBNAIL_BG_PATH = path.join(ASSETS_DIR, 'thumbnail.png');
 async function ff(args: string[]): Promise<void> {
   await execFileAsync('ffmpeg', ['-y', '-hide_banner', '-loglevel', 'error', ...args], { maxBuffer: 1024 * 1024 * 64 });
 }
-async function ffprobeDuration(file: string): Promise<number> {
+export async function ffprobeDuration(file: string): Promise<number> {
   const { stdout } = await execFileAsync('ffprobe', [
     '-v', 'error', '-show_entries', 'format=duration',
     '-of', 'default=noprint_wrappers=1:nokey=1', file,
@@ -102,15 +102,45 @@ Dialogue: 0,0:00:00.00,9:59:59.00,Q,,0,0,0,,${safe}
 const escFilter = (p: string) => p.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
 
 interface Rect { x: number; y: number; w: number; h: number; }
-interface ClipOpts { focus?: Rect; caption?: string; }
+interface ClipOpts { focus?: Rect; caption?: string; reveal?: boolean; revealStart?: number; }
 
 async function makeClip(visual: string, audio: string, outPath: string, workDir: string, tag: string, opts: ClipOpts = {}): Promise<string> {
   const dur = await ffprobeDuration(audio);
   if (dur <= 0) throw new Error(`[video] صوت بلا مدة: ${audio}`);
   const frames = Math.ceil(dur * FPS);
 
+  // هل نطبّق تأثير الرسم؟ (بس لو مفعّل، والمقطع طويل كفاية)
+  const wantReveal = !!opts.reveal && DRAW_REVEAL;
+  const off = Math.max(0, opts.revealStart || 0);          // الرسم يبدأ بعد التلاوة المقطّعة
+  const R = Math.min(REVEAL_SECS, Math.max(0.8, dur - off - 0.3));
+  const doReveal = wantReveal && R >= 0.8 && off + R < dur;
+
+  const inputs: string[] = [
+    '-framerate', String(FPS), '-loop', '1', '-t', String(dur), '-i', visual, // 0: الصورة
+    '-i', audio,                                                                // 1: الصوت
+    '-loop', '1', '-t', String(dur), '-i', LOGO_PATH,                          // 2: اللوجو
+  ];
+  let idx = 3;
+  let penImgIdx = -1, penSndIdx = -1;
+  const hasPenImg = doReveal && fs.existsSync(PENCIL_IMG);
+  const hasPenSnd = doReveal && fs.existsSync(PENCIL_SND);
+  if (hasPenImg) { inputs.push('-loop', '1', '-t', String(dur), '-i', PENCIL_IMG); penImgIdx = idx++; }
+  if (hasPenSnd) { inputs.push('-i', PENCIL_SND); penSndIdx = idx++; }
+
   const chain: string[] = [];
-  if (opts.focus) {
+
+  // ===== بناء الفيديو =====
+  if (doReveal) {
+    // اسكتش قلم رصاص -> تلوين، مع كشف من فوق لتحت (wipedown) يبدأ عند off
+    const A = (off + R).toFixed(2);          // مدة طبقة الاسكتش
+    const B = (dur - off).toFixed(2);        // مدة طبقة الألوان
+    chain.push(`[0:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:white,setsar=1,fps=${FPS},split=2[base][toedge]`);
+    chain.push(`[toedge]edgedetect=low=0.1:high=0.3,negate,eq=saturation=0,format=yuv420p[sketch]`);
+    chain.push(`[sketch]trim=0:${A},setpts=PTS-STARTPTS[sk]`);
+    chain.push(`[base]trim=0:${B},setpts=PTS-STARTPTS,format=yuv420p[col]`);
+    chain.push(`[sk][col]xfade=transition=wipedown:duration=${R.toFixed(2)}:offset=${off.toFixed(2)}[rev]`);
+    chain.push(`[rev]fade=t=in:st=0:d=0.4[v0]`);
+  } else if (opts.focus) {
     const cx = opts.focus.x + opts.focus.w / 2;
     const cy = opts.focus.y + opts.focus.h / 2;
     let inF = Math.round(1.2 * FPS);
@@ -124,10 +154,19 @@ async function makeClip(visual: string, audio: string, outPath: string, workDir:
   } else {
     chain.push(`[0:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:white,setsar=1,fps=${FPS}[v0]`);
   }
-  
+
+  // قلم بيتحرك على خط الكشف أثناء الرسم
+  let vCur = '[v0]';
+  if (hasPenImg) {
+    chain.push(`[${penImgIdx}:v]scale=150:-1[pen]`);
+    chain.push(`${vCur}[pen]overlay=x=${W}*0.72:y='((t-${off.toFixed(2)})/${R.toFixed(2)})*${H} - h*0.8':enable='between(t,${off.toFixed(2)},${(off + R).toFixed(2)})'[vpen]`);
+    vCur = '[vpen]';
+  }
+
+  // اللوجو
   chain.push(`[2:v]scale=300:-1[lg]`);
-  chain.push(`[v0][lg]overlay=W-w-40:H-h-40[v1]`);
-  
+  chain.push(`${vCur}[lg]overlay=W-w-40:H-h-40[v1]`);
+
   let lastV = '[v1]';
   if (opts.caption && opts.caption.trim()) {
     const assPath = writeAss(opts.caption.trim(), workDir, tag);
@@ -135,12 +174,22 @@ async function makeClip(visual: string, audio: string, outPath: string, workDir:
     lastV = '[v2]';
   }
 
+  // ===== بناء الصوت =====
+  let audioMap = '1:a';
+  if (hasPenSnd) {
+    // صوت القلم يبدأ عند off (مع بداية الشرم، مش فوق تلاوة القرآن) ويهدا في آخر الرسم
+    const fadeSt = Math.max(0, R - 0.5).toFixed(2);
+    const delayMs = Math.round(off * 1000);
+    chain.push(`[${penSndIdx}:a]atrim=0:${R.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=out:st=${fadeSt}:d=0.5,volume=${PENCIL_VOLUME},adelay=${delayMs}|${delayMs},apad[pa]`);
+    chain.push(`[1:a]apad[ma]`);
+    chain.push(`[ma][pa]amix=inputs=2:duration=first:normalize=0[aout]`);
+    audioMap = '[aout]';
+  }
+
   await ff([
-    '-framerate', String(FPS), '-loop', '1', '-t', String(dur), '-i', visual,
-    '-i', audio,
-    '-loop', '1', '-t', String(dur), '-i', LOGO_PATH,
+    ...inputs,
     '-filter_complex', chain.join(';'),
-    '-map', lastV, '-map', '1:a',
+    '-map', lastV, '-map', audioMap, '-t', String(dur),
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(FPS),
     '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '192k',
     '-shortest', outPath,
@@ -292,6 +341,27 @@ async function concat(clips: string[], outPath: string, workDir: string): Promis
   ]);
 }
 
+/**
+ * يضغط/يحوّل أي صورة ثمبنايل لـ JPEG 1280×720 أقل من 2MB (حد يوتيوب).
+ * بيشتغل لأي مصدر (نص مرسوم / AI / صورة من الاسيتس).
+ */
+export async function compressThumbnail(srcPath: string, workDir: string): Promise<string> {
+  const out = path.join(workDir, 'thumb_final.jpg');
+  await ff([
+    '-i', srcPath,
+    '-vf', `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+    '-frames:v', '1', '-q:v', '3', out,
+  ]);
+  // ضمان إضافي: لو لسه فوق ~2MB (نادر) نعيد بجودة أقل
+  try {
+    const sz = fs.statSync(out).size;
+    if (sz > 2_000_000) {
+      await ff(['-i', srcPath, '-vf', `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`, '-frames:v', '1', '-q:v', '7', out]);
+    }
+  } catch { /* تجاهل */ }
+  return out;
+}
+
 export async function renderThumbnailText(lines: string[], workDir: string): Promise<string | null> {
   if (!fs.existsSync(THUMBNAIL_BG_PATH)) return null;
   const out = path.join(workDir, 'thumbnail.png');
@@ -350,7 +420,7 @@ export interface AssemblyInput {
   introAudio: string;
   closingAudio: string;
   bridgeAudio?: string;
-  ideas: { focus: Rect; audioPath: string; caption: string }[];
+  ideas: { focus: Rect; audioPath: string; caption: string; sketch?: string; revealStart?: number }[];
   introCaption: string;
 }
 
@@ -379,9 +449,17 @@ export async function assembleEpisode(input: AssemblyInput): Promise<string> {
 
   for (let i = 0; i < ideas.length; i++) {
     console.log(`[video] فكرة ${i + 1}/${ideas.length}`);
-    clips.push(await makeClip(gridImage, ideas[i].audioPath, path.join(workDir, `c_idea${i}.mp4`), workDir, `idea${i}`, {
-      focus: ideas[i].focus, caption: ideas[i].caption,
-    }));
+    const it = ideas[i];
+    if (it.sketch) {
+      // صورة الفكرة تترسم تدريجيًا (بعد التلاوة المقطّعة) مع صوت القلم
+      clips.push(await makeClip(it.sketch, it.audioPath, path.join(workDir, `c_idea${i}.mp4`), workDir, `idea${i}`, {
+        caption: it.caption, reveal: true, revealStart: it.revealStart || 0,
+      }));
+    } else {
+      clips.push(await makeClip(gridImage, it.audioPath, path.join(workDir, `c_idea${i}.mp4`), workDir, `idea${i}`, {
+        focus: it.focus, caption: it.caption,
+      }));
+    }
   }
 
   console.log('[video] الختام');
