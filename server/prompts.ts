@@ -1,36 +1,15 @@
 /**
  * QEEMA (قيمة) — Central Prompt System  ("نظام الأوامر")  v2
- * ---------------------------------------------------------------
- * بناء الحلقة المتفق عليه:
- *   1) مقدمة:           "يا أصدقائي، رحلتنا النهارده مع سورة ..."  (الصورة كاملة)
- *   2) التلاوة الأولى:   الحصري المعلّم x1.12 (من everyayah) + الصورة كاملة ثابتة
- *   3) شرح فكرة فكرة:    زوم إن على اسكتش الفكرة ← شرحها ← زوم أوت ... (3 أو 4 أفكار)
- *   4) ختام/مراجعة:      "كده خلصت رحلتنا..." + زوم أوت للصورة كاملة
- *   5) التلاوة الثانية:  نفس التلاوة (تثبيت الحفظ)
- *   6) الأوترو.
- *
- * المخرج الأساسي = "خطة حلقة" مُهيكلة (EpisodePlan) عشان التجميع يقدر:
- *   - يرسم اسكتش لكل فكرة لوحده ويركّبهم شبكة 2×2 (= الصورة الكاملة)
- *   - يولّد صوت كل مقطع لوحده (مقدمة / كل فكرة / ختام) ويزامن الزوم
- *
- * قواعد حاكمة (لا تُكسر):
- *   - ممنوع توليد نص قرآني — التلاوة تأتي من everyayah فقط.
- *   - ممنوع اختراع أحاديث/قصص/أسباب نزول غير ثابتة.
- *   - ممنوع كتابة أي نص داخل الصور — النصوص تُركّب لاحقًا بالـ FFmpeg.
- *   - ممنوع تصوير الأنبياء أو الذات الإلهية أو الملائكة بوجوه.
  */
+import { formatTafsirForPrompt, type AyahTafsir } from './tafsir.ts';
 
 export interface SurahInput {
-  surahNumber: number;        // 1-114
-  surahName: string;          // عربي، مثال: "الفيل"
-  surahNameEn: string;        // لاتيني، مثال: "Al-Fil"
+  surahNumber: number;
+  surahName: string;
+  surahNameEn: string;
   ayahStart: number;
-  ayahEnd: number | null;     // null = السورة كاملة
+  ayahEnd: number | null;
 }
-
-/* ============================================================
- * 0) الهوية الثابتة + ستايل رسم الأطفال
- * ========================================================== */
 
 export const CHANNEL_IDENTITY = `
 أنت معلّم أزهري حنون اسم قناته "قيمة". بتكلّم أطفال صغيرين (من 5 لـ 9 سنين).
@@ -39,19 +18,10 @@ export const CHANNEL_IDENTITY = `
 هدفك تزرع حب القرآن في قلب الطفل، مش تحفيظ معلومات.
 `.trim();
 
-/**
- * نص الانترو الثابت — بيتقال حرفيًا في بداية كل حلقة (صوت ElevenLabs في assets/intro.mp3).
- * مصدر واحد: make_intro.ts بيستخدمه للتوليد، وبرومبت الخطة بيوريه للـ LLM عشان يكمّل عليه
- * بدل ما يكرّره. لو غيّرته، أعد تشغيل make_intro.ts عشان الصوت يتطابق.
- */
 export const FIXED_INTRO_TEXT =
   'يلا بينا! سفينة قيمة جاهزة للانطلاق... ' +
   'في رحلة جديدة لفهم معاني القرآن الكريم.';
 
-/**
- * ستايل الصور الموحّد: اسكتشات يدوية كأن طفل رسمها ولوّنها.
- * (إنجليزي عمدًا — موديلات الصور بتفهمه أحسن.) يُلصق في بداية كل برومبت صورة.
- */
 export const SKETCH_STYLE_TEMPLATE = `
 Simple hand-drawn children's sketch, as if drawn and colored by a young child.
 Crayon and colored-pencil texture, naive simple shapes, visible sketchy pencil
@@ -72,7 +42,6 @@ kneeling tucked under the body, crossed limbs, or complex hand gestures, because
 they often render with distorted limbs.
 `.trim();
 
-/** ما يجب تجنّبه في كل صورة. */
 export const NEGATIVE_STYLE = `
 no text, no letters, no Arabic script, no calligraphy, no numbers, no watermark,
 no human faces of prophets or religious figures, no depiction of God or angels,
@@ -80,22 +49,19 @@ no scary or violent imagery, no dark tones, not photorealistic, no watercolor,
 no smooth digital gradients, no 3D render, no distorted hands, no creepy faces.
 `.trim();
 
-/* ============================================================
- * خطة الحلقة (EpisodePlan) — المخرج الأساسي (JSON)
- * ========================================================== */
-
 export interface EpisodeIdea {
-  ayahStart: number;     // أول آية تغطّيها الفكرة
-  ayahEnd: number;       // آخر آية (نفس ayahStart لو آية واحدة)
-  explanation: string;   // شرح الفكرة (عامية مصرية، بدون تشكيل) — يتحوّل لصوت
-  sketchPrompt: string;  // وصف إنجليزي لاسكتش الفكرة (بدون نص داخل الصورة)
-  caption: string;       // تعليق عربي قصير جدًا يُركّب فوق الركن
+  ayahStart: number;
+  ayahEnd: number;
+  explanation: string;
+  keyword: string;
+  sketchPrompt: string;
+  caption: string;
 }
 
 export interface EpisodePlan {
-  intro: string;         // مقطع المقدمة (يتحوّل لصوت)
-  ideas: EpisodeIdea[];  // 3 أو 4 أفكار حسب طول السورة
-  closing: string;       // جملة الختام/الانتقال للمراجعة
+  intro: string;
+  ideas: EpisodeIdea[];
+  closing: string;
 }
 
 export const EPISODE_PLAN_SCHEMA = {
@@ -111,11 +77,12 @@ export const EPISODE_PLAN_SCHEMA = {
         properties: {
           ayahStart: { type: 'integer', description: 'رقم أول آية في الفكرة' },
           ayahEnd: { type: 'integer', description: 'رقم آخر آية في الفكرة (=ayahStart لو آية واحدة)' },
-          explanation: { type: 'string', description: 'شرح الآيات دي بعامية بسيطة بدون تشكيل وبدون كتابة نص قرآني' },
+          explanation: { type: 'string', description: 'شرح مبني على التفسير المرفق: المعنى مبسّط + الرابط المنطقي بالفكرة اللي بعدها. بدون تشكيل وبدون نص قرآني وبدون تكرار.' },
+          keyword: { type: 'string', description: 'الكلمة/الجملة المفتاحية اللي تلخّص الآية وتثبّتها في ذهن الطفل (كلمتين لأربعة)' },
           sketchPrompt: { type: 'string', description: 'وصف إنجليزي لاسكتش الفكرة (يبدأ بالستايل الموحّد، بدون أي نص)' },
           caption: { type: 'string', description: 'تعليق عربي قصير جدًا (كلمتين/ثلاثة)' },
         },
-        required: ['ayahStart', 'ayahEnd', 'explanation', 'sketchPrompt', 'caption'],
+        required: ['ayahStart', 'ayahEnd', 'explanation', 'keyword', 'sketchPrompt', 'caption'],
       },
     },
     closing: { type: 'string', description: 'جملة ختام تنقل الأطفال للمراجعة' },
@@ -125,12 +92,15 @@ export const EPISODE_PLAN_SCHEMA = {
 
 export function buildEpisodePlanPrompt(
   surah: SurahInput,
-  totalAyat: number
+  totalAyat: number,
+  tafsir: AyahTafsir[]
 ): { system: string; user: string; schema: typeof EPISODE_PLAN_SCHEMA } {
   const range =
     surah.ayahEnd && surah.ayahEnd !== surah.ayahStart
       ? `الآيات من ${surah.ayahStart} إلى ${surah.ayahEnd}`
       : 'السورة كاملة';
+
+  const tafsirBlock = formatTafsirForPrompt(tafsir);
 
   const system = `
 ${CHANNEL_IDENTITY}
@@ -138,8 +108,9 @@ ${CHANNEL_IDENTITY}
 == قواعد لا تُكسر أبدًا ==
 1) ممنوع منعًا باتًا تكتب أي آية قرآنية أو جزء من آية بنصها. التلاوة بتيجي من
    مصدر موثوق منفصل. إنت بتشرح المعنى بكلامك البسيط بس.
-2) ممنوع تخترع أحاديث أو قصص أو أسباب نزول مش ثابتة. لو مش متأكد، اشرح المعنى
-   العام بدون تفاصيل مخترعة. التزم بالتفسير الميسّر المعتمد وابعد عن الخلافيات.
+2) مصدرك الوحيد للمعنى هو "التفسير المعتمد" المرفق في رسالة المستخدم. دورك إنك
+   **تبسّطه وتربطه** للطفل — وممنوع منعًا باتًا تضيف أي معنى أو قصة أو سبب نزول
+   مش موجود في التفسير المرفق. لو التفسير ماذكرش تفصيلة، ماتخترعهاش.
 3) لو السورة فيها ذكر عذاب أو نار، اتكلم بلطف من غير تخويف — ركّز على رحمة الله
    والترغيب في الخير.
 4) من غير تشكيل (حركات) على الحروف خالص — عربي عادي، لأن النص بيتبعت لمحرّك صوت.
@@ -147,6 +118,15 @@ ${CHANNEL_IDENTITY}
 "${SKETCH_STYLE_TEMPLATE}"
    وممنوع أي نص/حروف جوّه الاسكتش، وممنوع وش نبي أو الذات الإلهية أو ملاك.
    استخدم الطبيعة، الأطفال، الحيوانات، المساجد، السماء، النور، رموز لطيفة.
+
+== الحفظ بالفهم (الأهم) ==
+الهدف إن الطفل يحفظ الآيات بترتيبها الصحيح لأنه **فهم الرابط** بينها، مش بالتكرار.
+- ممنوع التكرار الحرفي للمعاني. كل فكرة تضيف معنى جديد.
+- خلّي كل فكرة **نتيجة طبيعية** أو **سبب** للّي بعدها، فتبقى الحلقة سلسلة معنى واحدة
+  متصلة (سبب ← نتيجة ← نتيجة). مثال للربط: "وعشان ربنا رحيم بينا... قال لنا في اللي بعدها...".
+- كل explanation يقفل بجسر بسيط للفكرة اللي بعدها (ما عدا الأخيرة) عشان الطفل يستنى
+  اللي جاي ويربطه.
+- keyword: كلمة/جملة مفتاحية صغيرة تلخّص الآية وتبقى "خطّاف" يثبّت ترتيبها في الذهن.
 
 == الأسلوب (مهم جدًا) ==
 - خلّي الكلام حيّ ومبدع وفيه روح، مش سرد جاف:
@@ -171,6 +151,11 @@ ${CHANNEL_IDENTITY}
 ابنِ خطة حلقة "قيمة" عن سورة ${surah.surahName} (${range}).
 السورة فيها ${totalAyat} آية.
 
+== التفسير المعتمد (مصدرك الوحيد — بسّط منه واربط، وممنوع تضيف من عندك) ==
+"""
+${tafsirBlock}
+"""
+
 - intro: ده الجزء المتغيّر من المقدمة، وبيتقال **بعد** انترو ثابت بيتقال حرفيًا في كل
   الحلقات وهو:
     «${FIXED_INTRO_TEXT}»
@@ -182,17 +167,14 @@ ${CHANNEL_IDENTITY}
 - ideas: قسّم السورة لـ 3 أو 4 أفكار بترتيب الآيات، وكل فكرة تغطّي نطاق آيات:
     * لو الآيات طويلة: ممكن الفكرة = آية واحدة.
     * لو الآيات قصيرة جدًا (كلمة أو كلمتين زي القسم): اجمع 3 أو 4 آيات قصيرة مترابطة في فكرة واحدة.
-    * النطاقات لازم تغطّي كل السورة من الآية 1 إلى الآية ${totalAyat} من غير فجوات ولا تداخل.
+    * النطاقات لازم تغطّي كل السورة من الآية 1 إلى الآية ${totalAyat} من غير فجوات ولا تداخل، وبترتيب صاعد.
     * لكل فكرة: ayahStart و ayahEnd (أرقام الآيات فقط — مش نص الآيات).
-    * explanation: شرح بسيط جدًا بعامية مصرية للآيات دي + مثال قريب من عالم الطفل + العبرة الصغيرة.
-      (مهم: ماتكتبش نص الآية نفسه — إحنا بنجيبه من مصدر موثوق. اكتب الشرح بس.)
+    * explanation: بسّط معنى الآيات دي **من التفسير المرفق فقط** بعامية مصرية + مثال قريب
+      من عالم الطفل + اقفل بجسر يربطها بالفكرة اللي بعدها. (ماتكتبش نص الآية، وماتكررش، وماتضيفش من عندك.)
       وحدّد في دماغك العنصر/المشهد المحوري اللي الشرح بيدور حواليه عشان الصورة تطابقه.
+    * keyword: الكلمة/الجملة المفتاحية اللي تثبّت الآية في ذهن الطفل.
     * sketchPrompt: وصف إنجليزي **دقيق ومفصّل** يصوّر **بالظبط نفس العنصر/المشهد المحوري
-      اللي في الـ explanation** (لازم الصورة والشرح يتكلموا عن نفس الحاجة — رابط مباشر).
-      ترجمة بصرية أمينة لمعنى الآيات (Flux بيفهم الإنجليزي أحسن فبيرفع الدقة)، مثلاً:
-      a rising sun over green hills / a huge elephant and flocks of small birds dropping
-      stones / a kind hand gently patting an orphan child. مشهد واضح بعنصر واحد رئيسي
-      كبير في النص، خلفية بسيطة. يبدأ بالستايل الموحّد.
+      اللي في الـ explanation**. مشهد واضح بعنصر واحد رئيسي كبير في النص، خلفية بسيطة. يبدأ بالستايل الموحّد.
     * caption: تعليق عربي قصير جدًا.
 - closing: بالظبط بهذه الروح: "نشوفكم على خير في رحلة جديدة مع سفينة قيمة..."
   (ممكن تزوّد جملة دافية صغيرة قبلها زي "كده خلصنا رحلتنا النهارده يا أصدقائي".)
@@ -200,10 +182,6 @@ ${CHANNEL_IDENTITY}
 
   return { system, user, schema: EPISODE_PLAN_SCHEMA };
 }
-
-/* ============================================================
- * الثمبنايل (نفس ستايل الاسكتش)
- * ========================================================== */
 
 export function buildThumbnailPrompt(surah: SurahInput, theme: string): string {
   return `
@@ -216,10 +194,6 @@ title to be added later. 16:9 composition, eye-catching but gentle and innocent.
 AVOID: ${NEGATIVE_STYLE}
 `.trim();
 }
-
-/* ============================================================
- * العنوان + الوصف + التاجز (JSON)
- * ========================================================== */
 
 export const TITLE_SCHEMA = {
   type: 'object',
