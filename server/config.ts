@@ -56,6 +56,11 @@ export const EVERYAYAH_BASE = 'https://everyayah.com/data';
 export const RECITER = optional('RECITER', 'MaherAlMuaiqly128kbps');
 export const RECITATION_TEMPO = parseFloat(optional('RECITATION_TEMPO', '1.0'));
 
+/* ---------- مصدر التفسير الموثوق (spa5k/tafsir_api عبر jsDelivr) ---------- */
+export const TAFSIR_BASE = optional('TAFSIR_BASE', 'https://cdn.jsdelivr.net/gh/spa5k/tafsir_api@main/tafsir');
+export const TAFSIR_PRIMARY = optional('TAFSIR_PRIMARY', 'ar-tafsir-muyassar');   // الميسّر (أساسي)
+export const TAFSIR_SECONDARY = optional('TAFSIR_SECONDARY', 'ar-tafseer-al-saddi'); // السعدي (توسّع) — '' لتعطيله
+
 /* ---------- قاعدة البيانات (Supabase) ---------- */
 export const SUPABASE = {
   url: () => required('SUPABASE_URL'),
@@ -92,5 +97,13 @@ export const ASSETS_DIR = path.join(process.cwd(), 'assets');
 export const LOGO_PATH = path.join(ASSETS_DIR, 'logo.png');
 export const OUTRO_PATH = path.join(ASSETS_DIR, 'outro.mp4');
 export const INTRO_AUDIO_PATH = path.join(ASSETS_DIR, 'intro.mp3'); // انترو ثابت (يتولّد مرة واحدة)
+
+/* ---------- تأثير رسم الصور (Draw-in) ---------- */
+export const DRAW_REVEAL = optional('DRAW_REVEAL', 'true') !== 'false'; // شغّال افتراضيًا
+export const REVEAL_SECS = parseFloat(optional('REVEAL_SECS', '2.5'));  // مدة ظهور/رسم الصورة
+export const PENCIL_VOLUME = parseFloat(optional('PENCIL_VOLUME', '0.35')); // مستوى صوت القلم
+export const PENCIL_IMG = path.join(ASSETS_DIR, 'pencil.png'); // صورة القلم (شفافة) — اختياري
+export const PENCIL_SND = path.join(ASSETS_DIR, 'pencil.mp3'); // صوت خربشة القلم — اختياري
+
 // خط عربي للترجمة المحروقة (يُركَّب في الـ workflow عبر apt: fonts-noto)
 export const ARABIC_FONT = optional('ARABIC_FONT', 'Noto Naskh Arabic');
