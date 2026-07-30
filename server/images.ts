@@ -1,87 +1,77 @@
 /**
- * QEEMA — Image Service (Hugging Face — FLUX.1-schnell)
- * - تدوير على 3 مفاتيح HF (حسابات مختلفة = أرصدة منفصلة).
- * - لو مفتاح رجّع خطأ رصيد/حصّة (402/429) -> يجرّب اللي بعده.
- * - 503 (الموديل بيتحمّل) -> يستنى ويعيد على نفس المفتاح.
+ * QEEMA — Image Service (Gemini 2.5 Flash Image)
+ * - بيولّد الصور عبر Gemini بدل Hugging Face (اللي شال موديل FLUX من hf-inference).
+ * - تدوير على مفاتيح Gemini التلاتة (نفس مفاتيح النص = أرصدة منفصلة).
+ * - 429/quota -> المفتاح اللي بعده. 500/503 -> إعادة على نفس المفتاح.
+ * - رد من غير صورة (فلتر محتوى) -> محاولة تانية ثم المفتاح اللي بعده.
  * - يفشل بصوت عالٍ. مفيش mock.
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { HF_KEYS } from './config.ts';
+import { GoogleGenAI } from '@google/genai';
+import { GEMINI_KEYS } from './config.ts';
 
-const HF_MODEL = process.env['HF_IMAGE_MODEL'] || 'black-forest-labs/FLUX.1-schnell';
-const HF_URL = `https://router.huggingface.co/hf-inference/models/${HF_MODEL}`;
+// موديل الصور — قابل للتغيير من secret لو حبيت (مثلاً gemini-2.0-flash-preview-image-generation).
+const IMAGE_MODEL = process.env['GEMINI_IMAGE_MODEL'] || 'gemini-2.5-flash-image';
+const IMAGE_ASPECT = process.env['IMAGE_ASPECT'] || '16:9';
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** خطأ رصيد/حصّة -> المفتاح ده خلص، انتقل للي بعده. */
-function isQuota(status: number, msg: string): boolean {
-  return status === 402 || status === 429 || /quota|credit|limit|exceeded|payment/i.test(msg);
+/** خطأ حصّة -> المفتاح ده خلص، انتقل للي بعده. */
+function isQuota(msg: string): boolean {
+  return /\b429\b|quota|exhaust|resource_exhausted|rate limit/i.test(msg);
+}
+/** خطأ مؤقت (زحام) -> استنى وأعد على نفس المفتاح. */
+function isRetryable(msg: string): boolean {
+  return /\b(500|503)\b|unavailable|overloaded|internal|high demand/i.test(msg);
 }
 
-async function tryOneKey(key: string, prompt: string, dest: string): Promise<'ok' | 'quota' | 'retry'> {
-  const res = await fetch(HF_URL, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${key}`,
-      'content-type': 'application/json',
-      accept: 'image/png',
-    },
-    body: JSON.stringify({
-      inputs: prompt.slice(0, 1900),
-      parameters: { width: 1024, height: 576, num_inference_steps: 12 }, // steps أعلى = تشريح أنضف
-    }),
-  });
-
-  if (res.status === 503) {
-    console.warn('[images] الموديل بيتحمّل (503)…');
-    return 'retry';
-  }
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    if (isQuota(res.status, t)) {
-      console.warn(`[images] المفتاح ده خلص رصيده (HTTP ${res.status}) — تجربة المفتاح اللي بعده.`);
-      return 'quota';
+/** يستخرج أول صورة (base64) من رد Gemini ويحفظها. يرجّع true لو نجح. */
+function saveImageFromResponse(res: any, dest: string): boolean {
+  const parts = res?.candidates?.[0]?.content?.parts || [];
+  for (const part of parts) {
+    const inline = part?.inlineData || part?.inline_data;
+    if (inline?.data) {
+      const buf = Buffer.from(inline.data, 'base64');
+      if (buf.length < 1000) continue;
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, buf);
+      console.log(`[images] جاهزة: ${dest} (${(buf.length / 1024).toFixed(0)}KB)`);
+      return true;
     }
-    throw new Error(`HTTP ${res.status}: ${t.slice(0, 250)}`);
   }
-
-  const ct = res.headers.get('content-type') || '';
-  if (!ct.startsWith('image/')) {
-    const t = await res.text().catch(() => '');
-    if (isQuota(200, t)) return 'quota';
-    throw new Error(`رد مش صورة (${ct}): ${t.slice(0, 200)}`);
-  }
-
-  const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.length < 1000) throw new Error(`صورة صغيرة/فاسدة (${buf.length}B)`);
-  fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.writeFileSync(dest, buf);
-  console.log(`[images] جاهزة: ${dest} (${(buf.length / 1024).toFixed(0)}KB)`);
-  return 'ok';
+  return false;
 }
 
 export async function generateImage(prompt: string, dest: string): Promise<string> {
-  if (HF_KEYS.length === 0) throw new Error('[images] مفيش أي HF_API_KEY متظبّط.');
+  if (GEMINI_KEYS.length === 0) throw new Error('[images] مفيش أي GEMINI_API_KEY متظبّط.');
   let lastErr: unknown = null;
 
-  // جرّب كل مفتاح؛ مع إعادة محاولة للـ 503 (cold start) على كل مفتاح
-  for (let k = 0; k < HF_KEYS.length; k++) {
-    const key = HF_KEYS[k];
-    for (let attempt = 1; attempt <= 4; attempt++) {
+  for (let k = 0; k < GEMINI_KEYS.length; k++) {
+    const key = GEMINI_KEYS[k];
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const result = await tryOneKey(key.value, prompt, dest);
-        if (result === 'ok') return dest;
-        if (result === 'quota') break;           // المفتاح خلص -> المفتاح اللي بعده
-        if (result === 'retry') {                 // 503 -> استنى وأعد على نفس المفتاح
-          await sleep(8000 * attempt);
-          continue;
-        }
-      } catch (err) {
+        const ai = new GoogleGenAI({ apiKey: key.value });
+        const res = await ai.models.generateContent({
+          model: IMAGE_MODEL,
+          contents: prompt.slice(0, 2000),
+          config: {
+            responseModalities: ['IMAGE'],
+            // لو ظهر خطأ عن imageConfig/aspectRatio، امسح السطر ده وبس.
+            imageConfig: { aspectRatio: IMAGE_ASPECT },
+          },
+        });
+        if (saveImageFromResponse(res, dest)) return dest;
+        throw new Error('الرد مفهوش صورة (ممكن فلتر محتوى).');
+      } catch (err: any) {
         lastErr = err;
-        console.warn(`[images] ${key.name} محاولة ${attempt}/4 فشلت: ${String((err as Error)?.message || err).slice(0, 140)}`);
-        await sleep(4000 * attempt);
+        const msg = String(err?.message || err);
+        console.warn(`[images] ${key.name} محاولة ${attempt}/3 فشلت: ${msg.slice(0, 150)}`);
+        if (isQuota(msg)) break;                       // المفتاح خلص -> اللي بعده
+        if (isRetryable(msg)) { await sleep(5000 * attempt); continue; } // زحام -> أعد
+        await sleep(1500 * attempt);                    // خطأ تاني (مثلاً مفيش صورة) -> محاولة تانية
       }
     }
   }
-  throw new Error(`[images] فشل توليد الصورة على كل مفاتيح HF: ${String((lastErr as Error)?.message || lastErr).slice(0, 200)}`);
+  throw new Error(`[images] فشل توليد الصورة على كل مفاتيح Gemini: ${String((lastErr as Error)?.message || lastErr).slice(0, 200)}`);
 }
