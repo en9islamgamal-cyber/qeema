@@ -62,9 +62,11 @@ export async function uploadVideo(params: UploadParams): Promise<string> {
   // ضبط الثمبنايل المخصّص (لو متوفّر). فشلُه مايوقّفش البايب لاين.
   if (params.thumbnailPath && fs.existsSync(params.thumbnailPath)) {
     try {
+      const ext = params.thumbnailPath.toLowerCase();
+      const mimeType = ext.endsWith('.png') ? 'image/png' : 'image/jpeg';
       await youtube.thumbnails.set({
         videoId,
-        media: { mimeType: 'image/png', body: fs.createReadStream(params.thumbnailPath) },
+        media: { mimeType, body: fs.createReadStream(params.thumbnailPath) },
       });
       console.log(`[youtube] ✅ اتظبط الثمبنايل المخصّص للفيديو ${videoId}`);
     } catch (err: any) {
