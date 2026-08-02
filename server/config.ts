@@ -100,7 +100,8 @@ export const INTRO_AUDIO_PATH = path.join(ASSETS_DIR, 'intro.mp3'); // انتر�
 
 /* ---------- تأثير رسم الصور (Draw-in) ---------- */
 export const DRAW_REVEAL = optional('DRAW_REVEAL', 'true') !== 'false'; // شغّال افتراضيًا
-export const REVEAL_SECS = parseFloat(optional('REVEAL_SECS', '2.5'));  // مدة ظهور/رسم الصورة
+export const REVEAL_SECS = parseFloat(optional('REVEAL_SECS', '2.5'));  // (قديم) لم يعد يحدّد المدة
+export const REVEAL_END_BUFFER = parseFloat(optional('REVEAL_END_BUFFER', '2.5')); // الرسم يكتمل قبل نهاية الشرح بكام ثانية
 export const PENCIL_VOLUME = parseFloat(optional('PENCIL_VOLUME', '0.35')); // مستوى صوت القلم
 export const PENCIL_IMG = path.join(ASSETS_DIR, 'pencil.png'); // صورة القلم (شفافة) — اختياري
 export const PENCIL_SND = path.join(ASSETS_DIR, 'pencil.mp3'); // صوت خربشة القلم — اختياري
