@@ -63,6 +63,9 @@ jobs:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          # ---------- الصور (Cloudflare Workers AI — FLUX) ----------
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           # ---------- وضع الاختبار ----------
           # بياخد 'true' بس لما تختار mode=test من قايمة Run workflow.
           # على الجدول (cron) بيفضل 'false' دايمًا (مفيش inputs).
