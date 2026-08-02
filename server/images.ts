@@ -1,77 +1,70 @@
 /**
- * QEEMA — Image Service (Gemini 2.5 Flash Image)
- * - بيولّد الصور عبر Gemini بدل Hugging Face (اللي شال موديل FLUX من hf-inference).
- * - تدوير على مفاتيح Gemini التلاتة (نفس مفاتيح النص = أرصدة منفصلة).
- * - 429/quota -> المفتاح اللي بعده. 500/503 -> إعادة على نفس المفتاح.
- * - رد من غير صورة (فلتر محتوى) -> محاولة تانية ثم المفتاح اللي بعده.
+ * QEEMA — Image Service (Pollinations — Flux مجاني)
+ * - Flux على Pollinations مجاني وبدون مفتاح (HF شال الموديل، وصور Gemini بقت مدفوعة).
+ * - GET على image.pollinations.ai/prompt/{prompt} -> بيرجّع الصورة مباشرة.
+ * - إعادة محاولة على الزحام/الأخطاء المؤقتة مع احترام حد السرعة المجاني.
  * - يفشل بصوت عالٍ. مفيش mock.
+ *
+ * إعدادات اختيارية (secrets):
+ *   IMAGE_MODEL           (افتراضي flux)
+ *   IMAGE_WIDTH/HEIGHT    (افتراضي 1024x576 = 16:9)
+ *   POLLINATIONS_TOKEN    (مفتاح مجاني من enter.pollinations.ai لو حبيت سرعة/موثوقية أعلى)
+ *   POLLINATIONS_BASE     (لو حبيت تغيّر لـ https://gen.pollinations.ai/image)
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { GoogleGenAI } from '@google/genai';
-import { GEMINI_KEYS } from './config.ts';
 
-// موديل الصور — قابل للتغيير من secret لو حبيت (مثلاً gemini-2.0-flash-preview-image-generation).
-const IMAGE_MODEL = process.env['GEMINI_IMAGE_MODEL'] || 'gemini-2.5-flash-image';
-const IMAGE_ASPECT = process.env['IMAGE_ASPECT'] || '16:9';
+const BASE = process.env['POLLINATIONS_BASE'] || 'https://image.pollinations.ai/prompt';
+const MODEL = process.env['IMAGE_MODEL'] || 'flux';
+const TOKEN = process.env['POLLINATIONS_TOKEN'] || '';
+const IMG_W = parseInt(process.env['IMAGE_WIDTH'] || '1024', 10);
+const IMG_H = parseInt(process.env['IMAGE_HEIGHT'] || '576', 10);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** خطأ حصّة -> المفتاح ده خلص، انتقل للي بعده. */
-function isQuota(msg: string): boolean {
-  return /\b429\b|quota|exhaust|resource_exhausted|rate limit/i.test(msg);
-}
-/** خطأ مؤقت (زحام) -> استنى وأعد على نفس المفتاح. */
-function isRetryable(msg: string): boolean {
-  return /\b(500|503)\b|unavailable|overloaded|internal|high demand/i.test(msg);
-}
+export async function generateImage(prompt: string, dest: string): Promise<string> {
+  const clean = prompt.replace(/\s+/g, ' ').trim().slice(0, 1500);
+  const params = new URLSearchParams({
+    model: MODEL,
+    width: String(IMG_W),
+    height: String(IMG_H),
+    seed: String(Math.floor(Math.random() * 1e9)),
+    nologo: 'true',
+    safe: 'true',
+  });
+  const url = `${BASE}/${encodeURIComponent(clean)}?${params.toString()}`;
+  const headers: Record<string, string> = {};
+  if (TOKEN) headers['authorization'] = `Bearer ${TOKEN}`;
 
-/** يستخرج أول صورة (base64) من رد Gemini ويحفظها. يرجّع true لو نجح. */
-function saveImageFromResponse(res: any, dest: string): boolean {
-  const parts = res?.candidates?.[0]?.content?.parts || [];
-  for (const part of parts) {
-    const inline = part?.inlineData || part?.inline_data;
-    if (inline?.data) {
-      const buf = Buffer.from(inline.data, 'base64');
-      if (buf.length < 1000) continue;
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      const res = await fetch(url, { headers });
+      if ([429, 500, 502, 503, 504].includes(res.status)) {
+        console.warn(`[images] Pollinations مشغول (HTTP ${res.status}) — إعادة محاولة ${attempt}/5…`);
+        await sleep(7000 * attempt); // حد السرعة المجاني ~1 كل 15ث
+        continue;
+      }
+      if (!res.ok) {
+        const t = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status}: ${t.slice(0, 150)}`);
+      }
+      const ct = res.headers.get('content-type') || '';
+      if (!ct.startsWith('image/')) {
+        const t = await res.text().catch(() => '');
+        throw new Error(`رد مش صورة (${ct}): ${t.slice(0, 120)}`);
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length < 1500) throw new Error(`صورة صغيرة/فاسدة (${buf.length}B)`);
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       fs.writeFileSync(dest, buf);
       console.log(`[images] جاهزة: ${dest} (${(buf.length / 1024).toFixed(0)}KB)`);
-      return true;
+      return dest;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[images] محاولة ${attempt}/5 فشلت: ${String((err as Error)?.message || err).slice(0, 140)}`);
+      await sleep(5000 * attempt);
     }
   }
-  return false;
-}
-
-export async function generateImage(prompt: string, dest: string): Promise<string> {
-  if (GEMINI_KEYS.length === 0) throw new Error('[images] مفيش أي GEMINI_API_KEY متظبّط.');
-  let lastErr: unknown = null;
-
-  for (let k = 0; k < GEMINI_KEYS.length; k++) {
-    const key = GEMINI_KEYS[k];
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const ai = new GoogleGenAI({ apiKey: key.value });
-        const res = await ai.models.generateContent({
-          model: IMAGE_MODEL,
-          contents: prompt.slice(0, 2000),
-          config: {
-            responseModalities: ['IMAGE'],
-            // لو ظهر خطأ عن imageConfig/aspectRatio، امسح السطر ده وبس.
-            imageConfig: { aspectRatio: IMAGE_ASPECT },
-          },
-        });
-        if (saveImageFromResponse(res, dest)) return dest;
-        throw new Error('الرد مفهوش صورة (ممكن فلتر محتوى).');
-      } catch (err: any) {
-        lastErr = err;
-        const msg = String(err?.message || err);
-        console.warn(`[images] ${key.name} محاولة ${attempt}/3 فشلت: ${msg.slice(0, 150)}`);
-        if (isQuota(msg)) break;                       // المفتاح خلص -> اللي بعده
-        if (isRetryable(msg)) { await sleep(5000 * attempt); continue; } // زحام -> أعد
-        await sleep(1500 * attempt);                    // خطأ تاني (مثلاً مفيش صورة) -> محاولة تانية
-      }
-    }
-  }
-  throw new Error(`[images] فشل توليد الصورة على كل مفاتيح Gemini: ${String((lastErr as Error)?.message || lastErr).slice(0, 200)}`);
+  throw new Error(`[images] فشل توليد الصورة من Pollinations: ${String((lastErr as Error)?.message || lastErr).slice(0, 200)}`);
 }
