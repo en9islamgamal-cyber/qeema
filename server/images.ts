@@ -16,7 +16,7 @@ import * as path from 'path';
 const ACCOUNT = process.env['CLOUDFLARE_ACCOUNT_ID'] || '';
 const TOKEN = process.env['CLOUDFLARE_API_TOKEN'] || '';
 const MODEL = process.env['CF_IMAGE_MODEL'] || '@cf/black-forest-labs/flux-1-schnell';
-const STEPS = Math.min(8, Math.max(1, parseInt(process.env['CF_IMAGE_STEPS'] || '6', 10)));
+const STEPS = Math.min(8, Math.max(1, parseInt(process.env['CF_IMAGE_STEPS'] || '8', 10)));
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
