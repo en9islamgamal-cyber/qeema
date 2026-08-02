@@ -10,7 +10,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { VIDEO, LOGO_PATH, OUTRO_PATH, ARABIC_FONT, ASSETS_DIR, INTRO_AUDIO_PATH, DRAW_REVEAL, REVEAL_SECS, PENCIL_VOLUME, PENCIL_IMG, PENCIL_SND } from './config.ts';
+import { VIDEO, LOGO_PATH, OUTRO_PATH, ARABIC_FONT, ASSETS_DIR, INTRO_AUDIO_PATH, DRAW_REVEAL, REVEAL_END_BUFFER, PENCIL_VOLUME, PENCIL_IMG, PENCIL_SND } from './config.ts';
 
 const execFileAsync = promisify(execFile);
 const W = VIDEO.width, H = VIDEO.height, FPS = VIDEO.fps;
@@ -112,8 +112,9 @@ async function makeClip(visual: string, audio: string, outPath: string, workDir:
   // هل نطبّق تأثير الرسم؟ (بس لو مفعّل، والمقطع طويل كفاية)
   const wantReveal = !!opts.reveal && DRAW_REVEAL;
   const off = Math.max(0, opts.revealStart || 0);          // الرسم يبدأ بعد التلاوة المقطّعة
-  const R = Math.min(REVEAL_SECS, Math.max(0.8, dur - off - 0.3));
-  const doReveal = wantReveal && R >= 0.8 && off + R < dur;
+  // الرسم يمتد على طول الشرح ويكتمل قبل نهاية المقطع بـ REVEAL_END_BUFFER ثانية
+  const R = Math.max(1.5, dur - off - REVEAL_END_BUFFER);
+  const doReveal = wantReveal && R >= 1.0 && off + R <= dur;
 
   const inputs: string[] = [
     '-framerate', String(FPS), '-loop', '1', '-t', String(dur), '-i', visual, // 0: الصورة
@@ -125,7 +126,7 @@ async function makeClip(visual: string, audio: string, outPath: string, workDir:
   const hasPenImg = doReveal && fs.existsSync(PENCIL_IMG);
   const hasPenSnd = doReveal && fs.existsSync(PENCIL_SND);
   if (hasPenImg) { inputs.push('-loop', '1', '-t', String(dur), '-i', PENCIL_IMG); penImgIdx = idx++; }
-  if (hasPenSnd) { inputs.push('-i', PENCIL_SND); penSndIdx = idx++; }
+  if (hasPenSnd) { inputs.push('-stream_loop', '-1', '-i', PENCIL_SND); penSndIdx = idx++; } // -stream_loop: صوت القلم يتكرّر ويملى طول الرسم
 
   const chain: string[] = [];
 
@@ -177,10 +178,10 @@ async function makeClip(visual: string, audio: string, outPath: string, workDir:
   // ===== بناء الصوت =====
   let audioMap = '1:a';
   if (hasPenSnd) {
-    // صوت القلم يبدأ عند off (مع بداية الشرم، مش فوق تلاوة القرآن) ويهدا في آخر الرسم
-    const fadeSt = Math.max(0, R - 0.5).toFixed(2);
+    // صوت القلم يبدأ عند off (مع بداية الشرح، مش فوق تلاوة القرآن) ويمتد طول الرسم ويهدا في آخره
+    const fadeSt = Math.max(0.5, R - 1).toFixed(2);
     const delayMs = Math.round(off * 1000);
-    chain.push(`[${penSndIdx}:a]atrim=0:${R.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=out:st=${fadeSt}:d=0.5,volume=${PENCIL_VOLUME},adelay=${delayMs}|${delayMs},apad[pa]`);
+    chain.push(`[${penSndIdx}:a]atrim=0:${R.toFixed(2)},asetpts=PTS-STARTPTS,volume=${PENCIL_VOLUME},afade=t=in:st=0:d=0.3,afade=t=out:st=${fadeSt}:d=1,adelay=${delayMs}|${delayMs},apad[pa]`);
     chain.push(`[1:a]apad[ma]`);
     chain.push(`[ma][pa]amix=inputs=2:duration=first:normalize=0[aout]`);
     audioMap = '[aout]';
