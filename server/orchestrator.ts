@@ -15,7 +15,7 @@ import { generateImage } from './images.ts';
 import { buildGrid, assembleEpisode, cellLayout, renderThumbnailText, compressThumbnail, ffprobeDuration } from './video.ts';
 import { generateShorts } from './shorts.ts';
 import { uploadVideo } from './youtube.ts';
-import { buildThumbnailPrompt } from './prompts.ts';
+import { buildThumbnailPrompt, buildSketchImagePrompt } from './prompts.ts';
 import { fetchSurahAyat, ayahRangeForTts } from './quran.ts';
 
 /** تحويل الأرقام لعربية-هندية (١٢٣) للثمبنايل. */
@@ -125,7 +125,7 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
       if (TEST) {
         fs.copyFileSync(testStill, sp); // وضع الاختبار: صورة ثابتة بدل توليد بالـ AI (صفر credits)
       } else {
-        await generateImage(plan.ideas[i].sketchPrompt, sp);
+        await generateImage(buildSketchImagePrompt(plan.ideas[i].sketchPrompt), sp);
       }
       sketchPaths.push(sp);
     }
