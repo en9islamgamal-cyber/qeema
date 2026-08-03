@@ -20,9 +20,35 @@ const STEPS = Math.min(8, Math.max(1, parseInt(process.env['CF_IMAGE_STEPS'] || 
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** احتياطي مجاني (Pollinations Flux) لو Cloudflare فشل — البايبلاين مايقعش بسبب مصدر واحد. */
+async function pollinationsFallback(prompt: string, dest: string): Promise<string> {
+  const params = new URLSearchParams({
+    model: 'flux', width: '1024', height: '576',
+    seed: String(Math.floor(Math.random() * 1e9)), nologo: 'true', safe: 'true',
+  });
+  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt.slice(0, 1500))}?${params}`;
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const ct = res.headers.get('content-type') || '';
+      if (!ct.startsWith('image/')) throw new Error(`رد مش صورة (${ct})`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length < 1500) throw new Error(`صورة فاسدة (${buf.length}B)`);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, buf);
+      console.log(`[images] جاهزة (احتياطي Pollinations): ${dest} (${(buf.length / 1024).toFixed(0)}KB)`);
+      return dest;
+    } catch (err) { lastErr = err; await sleep(6000 * attempt); }
+  }
+  throw new Error(`فشل الاحتياطي: ${String((lastErr as Error)?.message || lastErr).slice(0, 120)}`);
+}
+
 export async function generateImage(prompt: string, dest: string): Promise<string> {
   if (!ACCOUNT || !TOKEN) {
-    throw new Error('[images] محتاج secrets: CLOUDFLARE_ACCOUNT_ID و CLOUDFLARE_API_TOKEN.');
+    console.warn('[images] مفيش مفاتيح Cloudflare — التحويل للاحتياطي المجاني مباشرة.');
+    return pollinationsFallback(prompt, dest);
   }
   const url = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}/ai/run/${MODEL}`;
   const clean = prompt.replace(/\s+/g, ' ').trim().slice(0, 2000);
@@ -63,5 +89,6 @@ export async function generateImage(prompt: string, dest: string): Promise<strin
       await sleep(3000 * attempt);
     }
   }
-  throw new Error(`[images] فشل توليد الصورة من Cloudflare: ${String((lastErr as Error)?.message || lastErr).slice(0, 200)}`);
+  console.warn(`[images] Cloudflare فشل نهائيًا (${String((lastErr as Error)?.message || lastErr).slice(0, 120)}) — تجربة الاحتياطي المجاني…`);
+  return pollinationsFallback(prompt, dest);
 }
