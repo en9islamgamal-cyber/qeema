@@ -115,6 +115,7 @@ async function makeClip(visual: string, audio: string, outPath: string, workDir:
   // الرسم يمتد على طول الشرح ويكتمل قبل نهاية المقطع بـ REVEAL_END_BUFFER ثانية
   const R = Math.max(1.5, dur - off - REVEAL_END_BUFFER);
   const doReveal = wantReveal && R >= 1.0 && off + R <= dur;
+  const ease = doReveal && process.env.REVEAL_EASE === 'true'; // إيقاع ناعم قطري (أبطأ+أنعم) بدل الخطّي المقرمش
 
   const inputs: string[] = [
     '-framerate', String(FPS), '-loop', '1', '-t', String(dur), '-i', visual, // 0: الصورة
@@ -132,14 +133,26 @@ async function makeClip(visual: string, audio: string, outPath: string, workDir:
 
   // ===== بناء الفيديو =====
   if (doReveal) {
-    // اسكتش قلم رصاص -> تلوين، مع كشف من فوق لتحت (wipedown) يبدأ عند off
+    // اسكتش قلم رصاص (شبح خفيف = غموض) -> تلوين، بكشف قطري من الركن (top-left) لحركة أقرب لليد
     const A = (off + R).toFixed(2);          // مدة طبقة الاسكتش
     const B = (dur - off).toFixed(2);        // مدة طبقة الألوان
-    chain.push(`[0:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:white,setsar=1,fps=${FPS},split=2[base][toedge]`);
-    chain.push(`[toedge]edgedetect=low=0.1:high=0.3,negate,eq=saturation=0,format=yuv420p[sketch]`);
-    chain.push(`[sketch]trim=0:${A},setpts=PTS-STARTPTS[sk]`);
-    chain.push(`[base]trim=0:${B},setpts=PTS-STARTPTS,format=yuv420p[col]`);
-    chain.push(`[sk][col]xfade=transition=wipedown:duration=${R.toFixed(2)}:offset=${off.toFixed(2)}[rev]`);
+    const sk = `edgedetect=low=0.1:high=0.3,negate,eq=saturation=0:contrast=0.7:brightness=0.18,format=yuv420p`;
+    if (ease) {
+      // إيقاع ناعم (smoothstep: بطيء→سريع→بطيء) — يتحسب على 960x540 (أسرع) ثم يتكبّر
+      chain.push(`[0:v]scale=960:540,setsar=1,fps=${FPS},split=2[base][toedge]`);
+      chain.push(`[toedge]${sk}[sketch]`);
+      chain.push(`[sketch]trim=0:${A},setpts=PTS-STARTPTS[sk]`);
+      chain.push(`[base]trim=0:${B},setpts=PTS-STARTPTS,format=yuv420p[col]`);
+      chain.push(`[sk][col]xfade=transition=custom:duration=${R.toFixed(2)}:offset=${off.toFixed(2)}:expr='if(lt((X/W+Y/H)/2\\,P*P*(3-2*P))\\,B\\,A)'[revS]`);
+      chain.push(`[revS]scale=${W}:${H}:flags=bicubic[rev]`);
+    } else {
+      // قطري خطّي عالي الدقة (سريع ومقرمش)
+      chain.push(`[0:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:white,setsar=1,fps=${FPS},split=2[base][toedge]`);
+      chain.push(`[toedge]${sk}[sketch]`);
+      chain.push(`[sketch]trim=0:${A},setpts=PTS-STARTPTS[sk]`);
+      chain.push(`[base]trim=0:${B},setpts=PTS-STARTPTS,format=yuv420p[col]`);
+      chain.push(`[sk][col]xfade=transition=diagtl:duration=${R.toFixed(2)}:offset=${off.toFixed(2)}[rev]`);
+    }
     chain.push(`[rev]fade=t=in:st=0:d=0.4[v0]`);
   } else if (opts.focus) {
     const cx = opts.focus.x + opts.focus.w / 2;
@@ -178,10 +191,15 @@ async function makeClip(visual: string, audio: string, outPath: string, workDir:
   // ===== بناء الصوت =====
   let audioMap = '1:a';
   if (hasPenSnd) {
-    // صوت القلم يبدأ عند off (مع بداية الشرح، مش فوق تلاوة القرآن) ويمتد طول الرسم ويهدا في آخره
-    const fadeSt = Math.max(0.5, R - 1).toFixed(2);
     const delayMs = Math.round(off * 1000);
-    chain.push(`[${penSndIdx}:a]atrim=0:${R.toFixed(2)},asetpts=PTS-STARTPTS,volume=${PENCIL_VOLUME},afade=t=in:st=0:d=0.3,afade=t=out:st=${fadeSt}:d=1,adelay=${delayMs}|${delayMs},apad[pa]`);
+    if (ease) {
+      // غلاف جرس: يعلى في نص الرسم (لما الكشف يسرّع) ويخف عند الأطراف — متزامن مع الإيقاع
+      chain.push(`[${penSndIdx}:a]atrim=0:${R.toFixed(2)},asetpts=PTS-STARTPTS,volume='${PENCIL_VOLUME}*(0.15+0.85*(1-pow(2*t/${R.toFixed(2)}-1\\,2)))':eval=frame,adelay=${delayMs}|${delayMs},apad[pa]`);
+    } else {
+      // ثابت مع fade لطيف (يطابق الكشف الخطّي)
+      const fadeSt = Math.max(0.5, R - 1).toFixed(2);
+      chain.push(`[${penSndIdx}:a]atrim=0:${R.toFixed(2)},asetpts=PTS-STARTPTS,volume=${PENCIL_VOLUME},afade=t=in:st=0:d=0.3,afade=t=out:st=${fadeSt}:d=1,adelay=${delayMs}|${delayMs},apad[pa]`);
+    }
     chain.push(`[1:a]apad[ma]`);
     chain.push(`[ma][pa]amix=inputs=2:duration=first:normalize=0[aout]`);
     audioMap = '[aout]';
