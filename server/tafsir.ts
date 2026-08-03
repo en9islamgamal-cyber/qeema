@@ -54,15 +54,19 @@ async function fetchEditionAyah(edition: string, surah: number, ayah: number): P
  * والسعدي ثانوي (لو غاب بنكمّل من غيره).
  */
 export async function fetchTafsir(surah: number, ayahStart: number, ayahEnd: number): Promise<AyahTafsir[]> {
-  const out: AyahTafsir[] = [];
-  for (let a = ayahStart; a <= ayahEnd; a++) {
-    const primary = await fetchEditionAyah(TAFSIR_PRIMARY, surah, a);
-    let secondary: string | undefined;
-    if (TAFSIR_SECONDARY) {
-      try { secondary = await fetchEditionAyah(TAFSIR_SECONDARY, surah, a); } catch { /* السعدي ثانوي؛ نتجاهل لو غاب */ }
-    }
-    out.push({ ayah: a, primary, secondary });
-  }
+  const ayahs: number[] = [];
+  for (let a = ayahStart; a <= ayahEnd; a++) ayahs.push(a);
+  // بالتوازي: أسرع بكتير للسور الطويلة (jsDelivr CDN بيستحمل)
+  const out = await Promise.all(
+    ayahs.map(async (a): Promise<AyahTafsir> => {
+      const primary = await fetchEditionAyah(TAFSIR_PRIMARY, surah, a);
+      let secondary: string | undefined;
+      if (TAFSIR_SECONDARY) {
+        try { secondary = await fetchEditionAyah(TAFSIR_SECONDARY, surah, a); } catch { /* ثانوي؛ نتجاهل لو غاب */ }
+      }
+      return { ayah: a, primary, secondary };
+    })
+  );
   if (out.every((t) => !t.primary)) {
     throw new Error('[tafsir] مفيش أي تفسير رجع من المصدر — بلاش نكمّل عشان ما نسيبش الـ AI يجتهد.');
   }
@@ -73,8 +77,8 @@ export async function fetchTafsir(surah: number, ayahStart: number, ayahEnd: num
 export function formatTafsirForPrompt(items: AyahTafsir[]): string {
   return items
     .map((t) => {
-      let s = `【الآية ${t.ayah}】\nالتفسير المعتمد (الميسّر): ${t.primary || '(غير متوفّر)'}`;
-      if (t.secondary) s += `\nتوسّع (السعدي): ${t.secondary}`;
+      let s = `【الآية ${t.ayah}】\nالتفسير المعتمد: ${t.primary || '(غير متوفّر)'}`;
+      if (t.secondary) s += `\nتوسّع من تفسير ثانٍ معتمد: ${t.secondary}`;
       return s;
     })
     .join('\n\n');
