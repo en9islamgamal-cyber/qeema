@@ -59,7 +59,7 @@ export async function generateImage(prompt: string, dest: string): Promise<strin
       const res = await fetch(url, {
         method: 'POST',
         headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: clean, steps: STEPS, seed: Math.floor(Math.random() * 1e9) }),
+        body: JSON.stringify({ prompt: clean, steps: STEPS }),
       });
 
       if ([429, 500, 502, 503, 504].includes(res.status)) {
