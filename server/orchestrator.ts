@@ -17,6 +17,7 @@ import { generateShorts } from './shorts.ts';
 import { uploadVideo } from './youtube.ts';
 import { buildThumbnailPrompt, buildSketchImagePrompt } from './prompts.ts';
 import { fetchSurahAyat, ayahRangeForTts } from './quran.ts';
+import { fetchMushafPage } from './quranpage.ts';
 
 /** تحويل الأرقام لعربية-هندية (١٢٣) للثمبنايل. */
 const toArabicDigits = (n: number): string =>
@@ -156,7 +157,19 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
     }
     // ضغط الثمبنايل لـ JPEG 1280×720 (<2MB) عشان رفع يوتيوب ما يفشلش بسبب الحجم
     thumbnailPath = await compressThumbnail(thumbnailPath, workDir);
-    const gridImage = await buildGrid(sketchPaths, workDir);
+    // اللوحة الحية: نسخة لكل مرحلة (0 = فاضية ... n = كاملة) عشان الزوم أوت يوري التقدم
+    const gridStates: string[] = [];
+    for (let k = 0; k <= plan.ideas.length; k++) {
+      gridStates.push(await buildGrid(sketchPaths, workDir, k, `grid_${k}.png`));
+    }
+    const gridImage = gridStates[plan.ideas.length];
+
+    // صفحة المصحف للتلاوة الأولى (فشلها مش قاتل — بنرجع للوحة)
+    const mushafPath = await fetchMushafPage(surah.surahNumber, workDir);
+
+    // صورة المقدمة: ثمبنايل القناة لو موجود (عشان مانحرقش مفاجأة الرسمات)، وإلا اللوحة الفاضية
+    const introThumb = path.join(ASSETS_DIR, 'thumbnail.png');
+    const introVisual = fs.existsSync(introThumb) ? introThumb : gridStates[0];
 
     /* 5) التجميع (FFmpeg) */
     await DB.setStatus(ep.id, 'rendering');
@@ -170,7 +183,7 @@ export async function runEpisode(idOrNumber: string): Promise<void> {
       revealStart: ideaRecStart[i],
     }));
     const finalVideo = await assembleEpisode({
-      workDir, gridImage,
+      workDir, gridImage, mushafPath, gridStates, introVisual,
       recitationPath: recitation.filePath,
       introAudio, closingAudio, bridgeAudio,
       ideas: ideasForVideo,
