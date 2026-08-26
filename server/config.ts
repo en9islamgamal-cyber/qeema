@@ -61,6 +61,9 @@ export const TAFSIR_BASE = optional('TAFSIR_BASE', 'https://cdn.jsdelivr.net/gh/
 export const TAFSIR_PRIMARY = optional('TAFSIR_PRIMARY', 'ar-tafsir-muyassar');   // الميسّر (أساسي)
 export const TAFSIR_SECONDARY = optional('TAFSIR_SECONDARY', 'ar-tafseer-al-saddi'); // السعدي (توسّع) — '' لتعطيله
 
+/* ---------- صفحات المصحف (مصحف المدينة — quran.com images) ---------- */
+export const MUSHAF_BASE = optional('MUSHAF_BASE', 'https://raw.githubusercontent.com/GovarJabbar/Quran-PNG/master');
+
 /* ---------- قاعدة البيانات (Supabase) ---------- */
 export const SUPABASE = {
   url: () => required('SUPABASE_URL'),
@@ -102,7 +105,7 @@ export const INTRO_AUDIO_PATH = path.join(ASSETS_DIR, 'intro.mp3'); // انتر�
 export const DRAW_REVEAL = optional('DRAW_REVEAL', 'true') !== 'false'; // شغّال افتراضيًا
 export const REVEAL_SECS = parseFloat(optional('REVEAL_SECS', '2.5'));  // (قديم) لم يعد يحدّد المدة
 export const REVEAL_END_BUFFER = parseFloat(optional('REVEAL_END_BUFFER', '2.5')); // الرسم يكتمل قبل نهاية الشرح بكام ثانية
-export const PENCIL_VOLUME = parseFloat(optional('PENCIL_VOLUME', '0.35')); // مستوى صوت القلم
+export const PENCIL_VOLUME = parseFloat(optional('PENCIL_VOLUME', '0.5')); // مستوى صوت القلم (كان 0.35 — هادي زيادة تحت السرد)
 export const PENCIL_IMG = path.join(ASSETS_DIR, 'pencil.png'); // صورة القلم (شفافة) — اختياري
 export const PENCIL_SND = path.join(ASSETS_DIR, 'pencil.mp3'); // صوت خربشة القلم — اختياري
 
