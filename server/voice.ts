@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { vocalizeForTts } from './tts_gate.ts';
 import { ELEVENLABS } from './config.ts';
 
 const execFileAsync = promisify(execFile);
@@ -65,7 +66,9 @@ function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '
 // استبدال على مستوى الكلمة الكاملة فقط (مش جزء من كلمة).
 function replaceWord(text: string, from: string, to: string): string {
   if (!from || PROTECTED.has(from)) return text;
-  const re = new RegExp(`(^|[^\\p{L}\\p{N}_])(${escapeRe(from)})(?=$|[^\\p{L}\\p{N}_])`, 'gu');
+  // متسامح مع التشكيل: بعد بوابة النطق بيبقى النص متشكَّل، فلازم القاموس يلاقي الكلمة برضه.
+  const flex = escapeRe(from).split('').map((c) => `${c}[\\u064B-\\u0652\\u0670\\u0640]*`).join('');
+  const re = new RegExp(`(^|[^\\p{L}\\p{N}_])(${flex})(?=$|[^\\p{L}\\p{N}_])`, 'gu');
   return text.replace(re, (_m, pre) => `${pre}${to}`);
 }
 
@@ -125,7 +128,15 @@ export async function synthesize(
   // غير كده: عامية بدون تشكيل + قاموس نطق مصري بسيط بس.
   // ⚠️ ألغينا طبقة تطبيع اللام الشمسية/لفظ الجلالة لأنها كانت بتبوّظ النطق:
   //    كانت بتعيد كتابة "الرحمن"->"ارّحمن" و"الله"->"اللّاه" وElevenLabs بينطقها غلط.
-  const clean = opts.raw ? text.replace(/\s+/g, ' ').trim() : applyPronunciation(stripTashkeel(text));
+  let clean: string;
+  if (opts.raw) {
+    clean = text.replace(/\s+/g, ' ').trim();
+  } else {
+    // ١) نص سادة  ٢) بوابة النطق (تشكيل مصري تلقائي مع تحقّق)  ٣) قاموس المستخدم (أعلى أولوية)
+    const plain = stripTashkeel(text).replace(/\s+/g, ' ').trim();
+    const voc = await vocalizeForTts(plain);
+    clean = applyPronunciation(voc);
+  }
   if (!clean) throw new Error('[voice] نص فاضي.');
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS.voiceId}?output_format=mp3_44100_128`;
