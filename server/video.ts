@@ -10,7 +10,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { VIDEO, LOGO_PATH, OUTRO_PATH, ARABIC_FONT, ASSETS_DIR, INTRO_AUDIO_PATH, DRAW_REVEAL, REVEAL_END_BUFFER, PENCIL_VOLUME, PENCIL_IMG, PENCIL_SND } from './config.ts';
+import { computeStrokeOrder, runWithDrawMask, MASK_W, MASK_H } from './draw.ts';
+import { VIDEO, LOGO_PATH, OUTRO_PATH, ARABIC_FONT, ASSETS_DIR, INTRO_AUDIO_PATH, DRAW_REVEAL, REVEAL_END_BUFFER, REVEAL_PACE, REVEAL_SKETCH_TR, REVEAL_COLOR_TR, DRAW_REAL, PENCIL_VOLUME, PENCIL_IMG, PENCIL_SND } from './config.ts';
 
 const execFileAsync = promisify(execFile);
 const W = VIDEO.width, H = VIDEO.height, FPS = VIDEO.fps;
@@ -199,9 +200,10 @@ async function makeClip(visual: string, audio: string, outPath: string, workDir:
   // ضمان مساحة كافية للتلوين (1.5 ثانية على الأقل)
   R1 = Math.min(R1, Math.max(1.0, colorEnd - 1.5 - o1));
   const o2 = o1 + R1;                                        // بداية التلوين
-  const R2 = Math.max(1.0, colorEnd - o2);                   // مدة التلوين
+  // التلوين بياخد نسبة من الوقت المتاح (أسرع)، وبعدها الصورة تفضل مكتملة شوية
+  const avail = Math.max(1.0, colorEnd - o2);
+  const R2 = Math.max(1.0, avail * REVEAL_PACE);
   const doReveal = wantReveal && dur >= 6 && R1 >= 1.0 && R2 >= 1.0 && o2 + R2 <= dur;
-  const ease = doReveal && process.env.REVEAL_EASE === 'true'; // إيقاع ناعم قطري (أبطأ+أنعم) بدل الخطّي المقرمش
 
   const inputs: string[] = [
     '-framerate', String(FPS), '-loop', '1', '-t', String(dur), '-i', visual, // 0: الصورة
@@ -209,7 +211,7 @@ async function makeClip(visual: string, audio: string, outPath: string, workDir:
     '-loop', '1', '-t', String(dur), '-i', LOGO_PATH,                          // 2: اللوجو
   ];
   let idx = 3;
-  let penImgIdx = -1, penSndIdx = -1, colIdx = -1;
+  let penImgIdx = -1, penSndIdx = -1, colIdx = -1, maskIdx = -1;
   const hasPenImg = doReveal && fs.existsSync(PENCIL_IMG);
   const hasPenSnd = doReveal && fs.existsSync(PENCIL_SND);
   if (hasPenImg) { inputs.push('-loop', '1', '-t', String(dur), '-i', PENCIL_IMG); penImgIdx = idx++; }
@@ -223,32 +225,44 @@ async function makeClip(visual: string, audio: string, outPath: string, workDir:
 
   const chain: string[] = [];
 
-  // ===== بناء الفيديو =====
-  if (doReveal) {
-    // صفحة بيضا -> خطوط قلم رصاص (تترسم قطريًا مع التلاوة) -> تلوين تدريجي قطري مع الشرح
-    // فرعين من مدخلين مستقلين ([0]=اسكتش، [colIdx]=ألوان) — مفيش split (كان بيسرّب إزالة الألوان).
-    const skF = `edgedetect=low=0.1:high=0.3,negate,eq=saturation=0,format=yuv420p`; // خطوط واضحة (مش شبح)
-    const whLen = (o1 + R1 + 0.3).toFixed(2);
-    const skLen = (o2 + R2 - o1 + 0.3).toFixed(2);   // لازم يعيش لحد نهاية التلوين
-    const colLen = (dur - o2).toFixed(2);
-    if (ease) {
-      // إيقاع ناعم (smoothstep) — يتحسب على 960x540 (أسرع) ثم يتكبّر
-      const expr = `'if(lt((X/W+Y/H)/2\\,P*P*(3-2*P))\\,B\\,A)'`;
-      chain.push(`color=c=white:s=960x540:r=${FPS}:d=${whLen}[wh]`);
-      chain.push(`[0:v]scale=960:540,setsar=1,fps=${FPS},${skF},trim=0:${skLen},setpts=PTS-STARTPTS[skv]`);
-      chain.push(`[${colIdx}:v]scale=960:540,setsar=1,fps=${FPS},format=yuv420p,trim=0:${colLen},setpts=PTS-STARTPTS[colv]`);
-      chain.push(`[wh][skv]xfade=transition=custom:duration=${R1.toFixed(2)}:offset=${o1.toFixed(2)}:expr=${expr}[s1]`);
-      chain.push(`[s1][colv]xfade=transition=custom:duration=${R2.toFixed(2)}:offset=${o2.toFixed(2)}:expr=${expr}[revS]`);
-      chain.push(`[revS]scale=${W}:${H}:flags=bicubic[rev]`);
+  // ===== محرّك الرسم الحقيقي: تحليل الرسمة لضربات قلم =====
+  let strokeOrder: Awaited<ReturnType<typeof computeStrokeOrder>> = null;
+  if (doReveal && DRAW_REAL) {
+    strokeOrder = await computeStrokeOrder(visual);
+    if (strokeOrder) {
+      console.log(`[draw] ${tag}: ${strokeOrder.strokes} ضربة قلم (${strokeOrder.inkCount} نقطة حبر) — رسم حقيقي.`);
+      inputs.push('-f', 'rawvideo', '-pix_fmt', 'gray', '-s', `${MASK_W}x${MASK_H}`, '-r', String(FPS), '-i', 'pipe:0');
+      maskIdx = idx++;
     } else {
-      // قطري خطّي عالي الدقة (سريع ومقرمش)
-      const fit = `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:white,setsar=1,fps=${FPS}`;
-      chain.push(`color=c=white:s=${W}x${H}:r=${FPS}:d=${whLen}[wh]`);
-      chain.push(`[0:v]${fit},${skF},trim=0:${skLen},setpts=PTS-STARTPTS[skv]`);
-      chain.push(`[${colIdx}:v]${fit},format=yuv420p,trim=0:${colLen},setpts=PTS-STARTPTS[colv]`);
-      chain.push(`[wh][skv]xfade=transition=diagtl:duration=${R1.toFixed(2)}:offset=${o1.toFixed(2)}[s1]`);
-      chain.push(`[s1][colv]xfade=transition=diagtl:duration=${R2.toFixed(2)}:offset=${o2.toFixed(2)}[rev]`);
+      console.warn(`[draw] ${tag}: تعذّر تحليل الرسمة لضربات — هنستخدم التأثير العادي.`);
     }
+  }
+
+  // ===== بناء الفيديو =====
+  if (doReveal && strokeOrder) {
+    // رسم حقيقي: الخطوط بتترسم ضربة ورا ضربة (قناع من الكود) ثم التلوين
+    const fit = `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:white,setsar=1,fps=${FPS}`;
+    const skF = `edgedetect=low=0.1:high=0.3,negate,eq=saturation=0`;
+    chain.push(`[0:v]${fit},${skF},format=rgba[skv]`);
+    chain.push(`[${maskIdx}:v]scale=${W}:${H}:flags=bicubic,format=gray[mk]`);
+    chain.push(`[skv][mk]alphamerge[ska]`);
+    chain.push(`color=c=white:s=${W}x${H}:r=${FPS}:d=${dur.toFixed(2)}[bg]`);
+    chain.push(`[bg][ska]overlay=shortest=1,format=yuv420p,trim=0:${dur.toFixed(2)},setpts=PTS-STARTPTS[drawn]`);
+    chain.push(`[${colIdx}:v]${fit},format=yuv420p,trim=0:${(dur - o2 + 0.2).toFixed(2)},setpts=PTS-STARTPTS[colv]`);
+    chain.push(`[drawn][colv]xfade=transition=${REVEAL_COLOR_TR}:duration=${R2.toFixed(2)}:offset=${o2.toFixed(2)},trim=0:${dur.toFixed(2)},setpts=PTS-STARTPTS[rev]`);
+    chain.push(`[rev]fade=t=in:st=0:d=0.3[v0]`);
+  } else if (doReveal) {
+    // صفحة بيضا -> خطوط قلم رصاص تظهر كنقط بتكبر وتتجمّع (dissolve = إحساس الرسم اليدوي)
+    // -> تلوين تدريجي بحافة حادة من الركن (wipetl). الحواف الحادة = الخطوط تظهر زي القلم،
+    //    مش تفتيح تدريجي للصورة (ده كان سبب إحساس "بهتة وبعدين توضح").
+    const skF = `edgedetect=low=0.1:high=0.3,negate,eq=saturation=0,format=yuv420p`;
+    const fit = `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:white,setsar=1,fps=${FPS}`;
+    // قص المصادر لأقل مدة مطلوبة (توفير ذاكرة ووقت رندر)
+    chain.push(`color=c=white:s=${W}x${H}:r=${FPS}:d=${(o1 + R1 + 0.2).toFixed(2)}[wh]`);
+    chain.push(`[0:v]${fit},${skF},trim=0:${(dur - o1 + 0.2).toFixed(2)},setpts=PTS-STARTPTS[skv]`);
+    chain.push(`[${colIdx}:v]${fit},format=yuv420p,trim=0:${(dur - o2 + 0.2).toFixed(2)},setpts=PTS-STARTPTS[colv]`);
+    chain.push(`[wh][skv]xfade=transition=${REVEAL_SKETCH_TR}:duration=${R1.toFixed(2)}:offset=${o1.toFixed(2)},trim=0:${dur.toFixed(2)},setpts=PTS-STARTPTS[s1]`);
+    chain.push(`[s1][colv]xfade=transition=${REVEAL_COLOR_TR}:duration=${R2.toFixed(2)}:offset=${o2.toFixed(2)},trim=0:${dur.toFixed(2)},setpts=PTS-STARTPTS[rev]`);
     chain.push(`[rev]fade=t=in:st=0:d=0.3[v0]`);
   } else if (opts.focus) {
     const cx = opts.focus.x + opts.focus.w / 2;
@@ -289,27 +303,34 @@ async function makeClip(visual: string, audio: string, outPath: string, workDir:
   if (hasPenSnd) {
     // صوت القلم أثناء التلوين فقط (مش فوق التلاوة) — واضح، مع دخول/خروج ناعم
     const delayMs = Math.round(o2 * 1000);
-    if (ease) {
-      // غلاف جرس: يعلى في نص التلوين (لما الكشف يسرّع) ويخف عند الأطراف — متزامن مع الإيقاع
-      chain.push(`[${penSndIdx}:a]atrim=0:${R2.toFixed(2)},asetpts=PTS-STARTPTS,volume='${PENCIL_VOLUME}*(0.2+0.8*(1-pow(2*t/${R2.toFixed(2)}-1\\,2)))':eval=frame,adelay=${delayMs}|${delayMs},apad[pa]`);
-    } else {
-      // ثابت مع fade لطيف (يطابق الكشف الخطّي)
-      const fadeSt = Math.max(0.5, R2 - 1).toFixed(2);
-      chain.push(`[${penSndIdx}:a]atrim=0:${R2.toFixed(2)},asetpts=PTS-STARTPTS,volume=${PENCIL_VOLUME},afade=t=in:st=0:d=0.3,afade=t=out:st=${fadeSt}:d=1,adelay=${delayMs}|${delayMs},apad[pa]`);
-    }
+    const fadeSt = Math.max(0.5, R2 - 1).toFixed(2);
+    chain.push(`[${penSndIdx}:a]atrim=0:${R2.toFixed(2)},asetpts=PTS-STARTPTS,volume=${PENCIL_VOLUME},afade=t=in:st=0:d=0.3,afade=t=out:st=${fadeSt}:d=1,adelay=${delayMs}|${delayMs},apad[pa]`);
     chain.push(`[1:a]apad[ma]`);
     chain.push(`[ma][pa]amix=inputs=2:duration=first:normalize=0[aout]`);
     audioMap = '[aout]';
   }
 
-  await ff([
+  const ffArgs = [
     ...inputs,
     '-filter_complex', chain.join(';'),
     '-map', lastV, '-map', audioMap, '-t', String(dur),
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(FPS),
     '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '192k',
     '-shortest', outPath,
-  ]);
+  ];
+
+  if (strokeOrder) {
+    // الرسم الحقيقي: بنغذّي ffmpeg قناع كل فريم من الكود
+    const totalFrames = Math.ceil(dur * FPS) + 2;
+    const f1 = o1 * FPS, f2 = (o1 + R1) * FPS;
+    await runWithDrawMask(ffArgs, strokeOrder, totalFrames, (f) => {
+      if (f <= f1) return 0;
+      if (f >= f2) return 1;
+      return (f - f1) / Math.max(1, f2 - f1);
+    });
+  } else {
+    await ff(ffArgs);
+  }
   return outPath;
 }
 
