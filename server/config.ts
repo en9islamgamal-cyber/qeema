@@ -56,6 +56,9 @@ export const EVERYAYAH_BASE = 'https://everyayah.com/data';
 export const RECITER = optional('RECITER', 'MaherAlMuaiqly128kbps');
 export const RECITATION_TEMPO = parseFloat(optional('RECITATION_TEMPO', '1.0'));
 
+/* ---------- بوابة النطق (تشكيل تلقائي مصري قبل الصوت) ---------- */
+export const TTS_GATE = optional('TTS_GATE', 'true') !== 'false';
+
 /* ---------- مصدر التفسير الموثوق (spa5k/tafsir_api عبر jsDelivr) ---------- */
 export const TAFSIR_BASE = optional('TAFSIR_BASE', 'https://cdn.jsdelivr.net/gh/spa5k/tafsir_api@main/tafsir');
 export const TAFSIR_PRIMARY = optional('TAFSIR_PRIMARY', 'ar-tafsir-muyassar');   // الميسّر (أساسي)
@@ -105,6 +108,10 @@ export const INTRO_AUDIO_PATH = path.join(ASSETS_DIR, 'intro.mp3'); // انتر�
 export const DRAW_REVEAL = optional('DRAW_REVEAL', 'true') !== 'false'; // شغّال افتراضيًا
 export const REVEAL_SECS = parseFloat(optional('REVEAL_SECS', '2.5'));  // (قديم) لم يعد يحدّد المدة
 export const REVEAL_END_BUFFER = parseFloat(optional('REVEAL_END_BUFFER', '2.5')); // الرسم يكتمل قبل نهاية الشرح بكام ثانية
+export const REVEAL_PACE = parseFloat(optional('REVEAL_PACE', '0.75'));   // نسبة وقت الشرح المستخدمة للتلوين (أقل = أسرع)
+export const DRAW_REAL = optional('DRAW_REAL', 'true') !== 'false'; // رسم حقيقي ضربة-ضربة (تحليل الرسمة في الكود)
+export const REVEAL_SKETCH_TR = optional('REVEAL_SKETCH_TR', 'dissolve'); // ظهور الخطوط: نقط بتكبر وتتجمّع
+export const REVEAL_COLOR_TR = optional('REVEAL_COLOR_TR', 'wipetl');    // التلوين: حافة حادة من الركن
 export const PENCIL_VOLUME = parseFloat(optional('PENCIL_VOLUME', '0.5')); // مستوى صوت القلم (كان 0.35 — هادي زيادة تحت السرد)
 export const PENCIL_IMG = path.join(ASSETS_DIR, 'pencil.png'); // صورة القلم (شفافة) — اختياري
 export const PENCIL_SND = path.join(ASSETS_DIR, 'pencil.mp3'); // صوت خربشة القلم — اختياري
